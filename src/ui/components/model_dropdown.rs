@@ -174,14 +174,22 @@ impl ModelDropdown {
     ) -> Vec<ModelOption> {
         let auto_label = match mode {
             ModelDropdownMode::SettingsDefault => "Auto (Recommended)",
-            ModelDropdownMode::ToolOverride => "Default (Auto)",
+            ModelDropdownMode::ToolOverride => "Auto",
         };
+        let auto_subtitle = models
+            .iter()
+            .find(|m| m.id == "auto")
+            .and_then(|m| m.billing_multiplier.map(|_| m.multiplier_label().into()))
+            .or_else(|| match mode {
+                ModelDropdownMode::SettingsDefault => Some("Default".into()),
+                ModelDropdownMode::ToolOverride => None,
+            });
 
         let mut options = Vec::with_capacity(models.len() + 2);
         options.push(ModelOption {
             id: "auto".to_string(),
             title: auto_label.into(),
-            subtitle: Some("Default".into()),
+            subtitle: auto_subtitle,
         });
 
         let mut found_selected = selected_model == "auto";

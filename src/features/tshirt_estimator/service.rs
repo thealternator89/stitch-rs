@@ -235,7 +235,7 @@ async fn run_estimation_task(
     let session = match copilot
         .create_session(SessionOptions {
             token: req.settings.copilot_token.clone(),
-            model: effective_model,
+            model: Some(effective_model),
             working_directory: Some(effective_repo_path),
             tools: vec![create_report_intent_tool()],
             available_tools: None,
@@ -320,14 +320,27 @@ async fn run_estimation_task(
     }
 }
 
-fn resolve_model(override_model: &str, default_model: &str) -> Option<String> {
+fn resolve_model(override_model: &str, default_model: &str) -> String {
     let over = override_model.trim();
-    if !over.is_empty() && over != "auto" {
-        return Some(over.to_string());
+    if !over.is_empty() {
+        return over.to_string();
     }
     let def = default_model.trim();
-    if !def.is_empty() && def != "auto" {
-        return Some(def.to_string());
+    if !def.is_empty() {
+        return def.to_string();
     }
-    None
+    "auto".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_model;
+
+    #[test]
+    fn resolve_model_preserves_explicit_auto_and_falls_back_cleanly() {
+        assert_eq!(resolve_model("auto", "gpt-5.4"), "auto");
+        assert_eq!(resolve_model("", "gpt-5.4"), "gpt-5.4");
+        assert_eq!(resolve_model("", ""), "auto");
+        assert_eq!(resolve_model("auto", "auto"), "auto");
+    }
 }

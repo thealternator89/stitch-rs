@@ -218,16 +218,8 @@ impl CopilotService {
 
         let mut config = SessionConfig::default()
             .with_streaming(true)
+            .with_model(resolve_session_model(opts.model.as_deref()))
             .approve_all_permissions();
-
-        if let Some(model) = opts
-            .model
-            .as_deref()
-            .map(str::trim)
-            .filter(|m| !m.is_empty() && *m != "auto")
-        {
-            config = config.with_model(model);
-        }
 
         if let Some(dir) = opts.working_directory {
             config = config
@@ -429,6 +421,13 @@ impl CopilotService {
     }
 }
 
+fn resolve_session_model(model: Option<&str>) -> &str {
+    model
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .unwrap_or("auto")
+}
+
 fn resolve_timeout_duration() -> Duration {
     let ms = std::env::var("STITCH_COPILOT_TIMEOUT")
         .ok()
@@ -461,5 +460,21 @@ fn log_prompt_if_configured(prompt: &str) {
         Err(err) => {
             eprintln!("Warning: failed to open STITCH_PROMPT_LOG at {trimmed}: {err}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_session_model;
+
+    #[test]
+    fn resolve_session_model_passes_auto_and_trims_custom_models() {
+        assert_eq!(resolve_session_model(Some("auto")), "auto");
+        assert_eq!(resolve_session_model(None), "auto");
+        assert_eq!(resolve_session_model(Some("  ")), "auto");
+        assert_eq!(
+            resolve_session_model(Some(" claude-sonnet-4.5 ")),
+            "claude-sonnet-4.5"
+        );
     }
 }

@@ -39,6 +39,7 @@ pub struct TShirtEstimatorView {
     branch_input: Entity<InputState>,
     model_dropdown: Entity<ModelDropdown>,
     selected_model: String,
+    user_overrode_model: bool,
     stage: EstimatorStage,
     validation_error: Option<String>,
     status_logs: Vec<String>,
@@ -50,7 +51,18 @@ pub struct TShirtEstimatorView {
 }
 
 impl TShirtEstimatorView {
-    pub fn new(app_state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        app_state: Entity<AppState>,
+        initial_model: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let initial_model = if initial_model.trim().is_empty() {
+            "auto".to_string()
+        } else {
+            initial_model.trim().to_string()
+        };
+
         let description_input = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .placeholder("Describe the feature, bug fix, or refactoring you want to estimate...")
@@ -69,7 +81,7 @@ impl TShirtEstimatorView {
         let model_dropdown = cx.new(|cx| {
             ModelDropdown::new(
                 app_state.clone(),
-                "auto".to_string(),
+                initial_model.clone(),
                 Vec::new(),
                 ModelDropdownMode::ToolOverride,
                 window,
@@ -77,11 +89,23 @@ impl TShirtEstimatorView {
             )
         });
 
-        let state_sub = cx.observe(&app_state, |_, _, cx| cx.notify());
+        let state_sub = cx.observe_in(&app_state, window, |this, app_state, window, cx| {
+            if !this.user_overrode_model {
+                let default_model = app_state.read(cx).settings.copilot_model.clone();
+                if default_model != this.selected_model {
+                    this.selected_model = default_model.clone();
+                    this.model_dropdown.update(cx, |dd, cx| {
+                        dd.set_selected_model(default_model, window, cx);
+                    });
+                }
+            }
+            cx.notify();
+        });
 
         let model_sub = cx.subscribe(&model_dropdown, |this, _, event, cx| {
             let ModelDropdownEvent::Changed(model_id) = event;
             this.selected_model = model_id.clone();
+            this.user_overrode_model = true;
             cx.notify();
         });
 
@@ -91,7 +115,8 @@ impl TShirtEstimatorView {
             repo_path_input,
             branch_input,
             model_dropdown,
-            selected_model: "auto".to_string(),
+            selected_model: initial_model,
+            user_overrode_model: false,
             stage: EstimatorStage::Idle,
             validation_error: None,
             status_logs: Vec::new(),

@@ -140,8 +140,14 @@ impl AppState {
 
             apply_theme(settings.theme, Some(window), cx);
 
-            let tshirt_estimator =
-                cx.new(|cx| TShirtEstimatorView::new(app_state_handle.clone(), window, cx));
+            let tshirt_estimator = cx.new(|cx| {
+                TShirtEstimatorView::new(
+                    app_state_handle.clone(),
+                    settings.copilot_model.clone(),
+                    window,
+                    cx,
+                )
+            });
             let story_writer = cx.new(|_| StoryWriterView::new());
             let test_case_writer = cx.new(|_| TestCaseWriterView::new());
             let story_elaborator = cx.new(|_| StoryElaboratorView::new());
