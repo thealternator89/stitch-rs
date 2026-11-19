@@ -15,6 +15,7 @@ use crate::features::{
     tshirt_estimator::TShirtEstimatorView,
 };
 use crate::infrastructure::copilot::CopilotService;
+use crate::infrastructure::git::GitService;
 use crate::infrastructure::runtime::spawn_tokio;
 use crate::infrastructure::settings::SettingsStore;
 use crate::types::{
@@ -109,6 +110,7 @@ pub struct AppState {
     pub settings_store: Arc<SettingsStore>,
     pub settings: AppSettings,
     pub copilot_service: Arc<CopilotService>,
+    pub git_service: Arc<GitService>,
     pub copilot_auth: CopilotAuthStatus,
     pub copilot_models: Vec<CopilotModelInfo>,
     pub models_loading: bool,
@@ -134,23 +136,27 @@ impl AppState {
             let settings_store = Arc::new(SettingsStore::new());
             let settings = settings_store.load();
             let copilot_service = Arc::new(CopilotService::new());
+            let git_service = Arc::new(GitService::new());
 
             apply_theme(settings.theme, Some(window), cx);
 
-            let tshirt_estimator = cx.new(|_| TShirtEstimatorView::new());
+            let tshirt_estimator =
+                cx.new(|cx| TShirtEstimatorView::new(app_state_handle.clone(), window, cx));
             let story_writer = cx.new(|_| StoryWriterView::new());
             let test_case_writer = cx.new(|_| TestCaseWriterView::new());
             let story_elaborator = cx.new(|_| StoryElaboratorView::new());
             let pr_reviewer = cx.new(|_| PrReviewerView::new());
             let usage_history = cx.new(|_| UsageHistoryView::new());
-            let settings_view =
-                cx.new(|cx| SettingsView::new(app_state_handle, &settings, window, cx));
+            let settings_view = cx.new(|cx| {
+                SettingsView::new(app_state_handle, &settings, git_service.clone(), window, cx)
+            });
 
             Self {
                 active_view: ActiveView::default(),
                 settings_store,
                 settings,
                 copilot_service,
+                git_service,
                 copilot_auth: CopilotAuthStatus::Checking,
                 copilot_models: Vec::new(),
                 models_loading: false,
@@ -202,7 +208,6 @@ impl AppState {
         self.set_theme_mode(next, window, cx);
     }
 
-    #[allow(dead_code)]
     pub fn set_task_status(&mut self, view: ActiveView, status: Option<String>) {
         match status {
             Some(text) => {

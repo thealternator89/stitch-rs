@@ -245,3 +245,51 @@ impl LifecycleGroup {
         }
     }
 }
+
+/// Token and billing usage accumulated across a Copilot session.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CopilotUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cost: f64,
+    pub model: Option<String>,
+    pub phases: Option<Vec<PhaseUsage>>,
+}
+
+/// Per-phase token and billing breakdown (used by multi-phase tools such as PR Reviewer).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct PhaseUsage {
+    pub phase_title: String,
+    pub model: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cost: f64,
+    pub multiplier: f64,
+}
+
+/// Generic wrapper pairing a tool result with token usage and optional database session ID.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct CopilotResult<T> {
+    pub result: T,
+    pub usage: CopilotUsage,
+    pub db_session_id: Option<i64>,
+}
+
+/// Result of scanning the worktree base directory for orphaned worktrees.
+#[derive(Debug, Clone, Default)]
+pub struct WorktreeCheckResult {
+    pub directories: Vec<PathBuf>,
+}
+
+/// Result of cleaning up orphaned worktree directories.
+#[derive(Debug, Clone, Default)]
+pub struct WorktreeCleanResult {
+    pub removed: usize,
+    pub errors: Vec<String>,
+}

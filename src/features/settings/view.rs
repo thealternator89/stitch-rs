@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use gpui_kit::assets::IconName as LucideIcon;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -7,7 +8,7 @@ use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, Sizable as _, Size, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Icon, Sizable as _, Size, WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::{
     App, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement,
@@ -16,6 +17,8 @@ use gpui_kit::{
 };
 
 use crate::app_state::{ActiveView, AppState, refresh_copilot_status};
+use crate::infrastructure::git::GitService;
+use crate::infrastructure::runtime::spawn_tokio;
 use crate::types::{AppSettings, CopilotAuthStatus, ThemeMode};
 use crate::ui::components::{ModelDropdown, ModelDropdownEvent, ModelDropdownMode};
 
@@ -77,11 +80,16 @@ enum TokenFeedback {
 
 pub struct SettingsView {
     app_state: Entity<AppState>,
+    git_service: Arc<GitService>,
     active_tab: SettingsTab,
     worktree_dir_input: Entity<InputState>,
     copilot_token_input: Entity<InputState>,
     default_model_dropdown: Entity<ModelDropdown>,
     token_feedback: Option<TokenFeedback>,
+    orphaned_worktrees: Vec<PathBuf>,
+    scanning_worktrees: bool,
+    cleaning_worktrees: bool,
+    worktree_cleanup_feedback: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -89,11 +97,12 @@ impl SettingsView {
     pub fn new(
         app_state: Entity<AppState>,
         initial_settings: &AppSettings,
+        git_service: Arc<GitService>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let initial_worktree_dir = initial_settings
-            .git_worktree_base_dir
+        let initial_worktree_dir_path = initial_settings.git_worktree_base_dir.clone();
+        let initial_worktree_dir = initial_worktree_dir_path
             .as_ref()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
@@ -127,11 +136,12 @@ impl SettingsView {
 
         let state_sub = cx.observe(&app_state, |_, _, cx| cx.notify());
 
-        let worktree_sub = cx.subscribe_in(&worktree_dir_input, window, |this, _, event, _, cx| {
-            if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
-                this.save_worktree_dir_from_input(cx);
-            }
-        });
+        let worktree_sub =
+            cx.subscribe_in(&worktree_dir_input, window, |this, _, event, window, cx| {
+                if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
+                    this.save_worktree_dir_from_input(window, cx);
+                }
+            });
 
         let token_sub =
             cx.subscribe_in(&copilot_token_input, window, |this, _, event, window, cx| {
@@ -152,22 +162,200 @@ impl SettingsView {
             });
         });
 
-        Self {
+        let mut view = Self {
             app_state,
+            git_service,
             active_tab: SettingsTab::default(),
             worktree_dir_input,
             copilot_token_input,
             default_model_dropdown,
             token_feedback: None,
+            orphaned_worktrees: Vec::new(),
+            scanning_worktrees: false,
+            cleaning_worktrees: false,
+            worktree_cleanup_feedback: None,
             _subscriptions: vec![state_sub, worktree_sub, token_sub, model_sub],
-        }
+        };
+
+        view.scan_worktrees(initial_worktree_dir_path, window, cx);
+        view
     }
 
     pub fn set_tab(&mut self, tab: SettingsTab) {
         self.active_tab = tab;
     }
 
-    fn save_worktree_dir_from_input(&mut self, cx: &mut Context<Self>) {
+    fn scan_worktrees(
+        &mut self,
+        base_dir: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(dir) = base_dir else {
+            self.orphaned_worktrees.clear();
+            self.scanning_worktrees = false;
+            cx.notify();
+            return;
+        };
+
+        self.scanning_worktrees = true;
+        cx.notify();
+
+        let git_service = self.git_service.clone();
+        let view = cx.entity();
+        window
+            .spawn(cx, async move |cx| {
+                let res = spawn_tokio(async move { git_service.check_worktrees(&dir) }).await;
+                let _ = cx.update(|_, cx| {
+                    view.update(cx, |this, cx| {
+                        this.scanning_worktrees = false;
+                        if let Ok(check) = res {
+                            this.orphaned_worktrees = check.directories;
+                        }
+                        cx.notify();
+                    });
+                });
+            })
+            .detach();
+    }
+
+    fn confirm_and_clean_worktrees(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let count = self.orphaned_worktrees.len();
+        if count == 0 {
+            return;
+        }
+        let Some(base_dir) = self.app_state.read(cx).settings.git_worktree_base_dir.clone() else {
+            return;
+        };
+
+        let view = cx.entity();
+        let git_service = self.git_service.clone();
+        let dir_label = base_dir.to_string_lossy().to_string();
+
+        window.open_dialog(cx, move |dialog, _window, cx| {
+            let theme = cx.theme();
+            let amber = hsla(38.0 / 360.0, 0.92, 0.50, 1.0);
+            let view_for_confirm = view.clone();
+            let git_for_confirm = git_service.clone();
+            let dir_for_confirm = base_dir.clone();
+
+            dialog
+                .w(px(460.))
+                .overlay_closable(true)
+                .close_button(true)
+                .title(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            Icon::new(LucideIcon::TriangleAlert)
+                                .with_size(Size::Medium)
+                                .text_color(amber),
+                        )
+                        .child("Clean Up Orphaned Worktrees"),
+                )
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .text_sm()
+                        .text_color(theme.foreground)
+                        .child(format!(
+                            "Remove {count} orphaned worktree directory(s) from:"
+                        ))
+                        .child(
+                            div()
+                                .p_2p5()
+                                .rounded(theme.radius)
+                                .bg(theme.sidebar)
+                                .border_1()
+                                .border_color(theme.border)
+                                .font_family(theme.mono_font_family.clone())
+                                .text_xs()
+                                .child(dir_label.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child("Only inactive Stitch worktrees not attached to running tasks will be removed."),
+                        ),
+                )
+                .footer(
+                    h_flex()
+                        .w_full()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("worktree-cleanup-cancel")
+                                .ghost()
+                                .label("Cancel")
+                                .on_click(|_, window, cx| {
+                                    window.close_dialog(cx);
+                                }),
+                        )
+                        .child(
+                            Button::new("worktree-cleanup-confirm")
+                                .danger()
+                                .icon(Icon::new(LucideIcon::Trash).small())
+                                .label("Clean Up")
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    let view = view_for_confirm.clone();
+                                    let git = git_for_confirm.clone();
+                                    let dir = dir_for_confirm.clone();
+                                    view.update(cx, |this, cx| {
+                                        this.cleaning_worktrees = true;
+                                        this.worktree_cleanup_feedback = None;
+                                        cx.notify();
+                                    });
+                                    window
+                                        .spawn(cx, async move |cx| {
+                                            let res = spawn_tokio(async move {
+                                                git.clean_worktrees(&dir).await
+                                            })
+                                            .await;
+                                            let _ = cx.update(|window, cx| {
+                                                view.update(cx, |this, cx| {
+                                                    this.cleaning_worktrees = false;
+                                                    match res {
+                                                        Ok(clean) if clean.errors.is_empty() => {
+                                                            this.worktree_cleanup_feedback = Some(format!(
+                                                                "Cleaned up {} directory(s).",
+                                                                clean.removed
+                                                            ));
+                                                        }
+                                                        Ok(clean) => {
+                                                            this.worktree_cleanup_feedback = Some(format!(
+                                                                "Removed {} directory(s) with {} error(s): {}",
+                                                                clean.removed,
+                                                                clean.errors.len(),
+                                                                clean.errors.join("; ")
+                                                            ));
+                                                        }
+                                                        Err(err) => {
+                                                            this.worktree_cleanup_feedback = Some(format!(
+                                                                "Cleanup failed: {err}"
+                                                            ));
+                                                        }
+                                                    }
+                                                    let current_dir = this
+                                                        .app_state
+                                                        .read(cx)
+                                                        .settings
+                                                        .git_worktree_base_dir
+                                                        .clone();
+                                                    this.scan_worktrees(current_dir, window, cx);
+                                                });
+                                            });
+                                        })
+                                        .detach();
+                                }),
+                        ),
+                )
+        });
+    }
+
+    fn save_worktree_dir_from_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let raw = self.worktree_dir_input.read(cx).value().to_string();
         let trimmed = raw.trim();
         let next_dir = if trimmed.is_empty() {
@@ -176,15 +364,23 @@ impl SettingsView {
             Some(PathBuf::from(trimmed))
         };
 
-        self.app_state.update(cx, |state, cx| {
+        let changed = self.app_state.update(cx, |state, cx| {
             if state.settings.git_worktree_base_dir != next_dir {
-                state.settings.git_worktree_base_dir = next_dir;
+                state.settings.git_worktree_base_dir = next_dir.clone();
                 if let Err(err) = state.save_settings() {
                     eprintln!("Warning: failed to save worktree directory: {err}");
                 }
                 cx.notify();
+                true
+            } else {
+                false
             }
         });
+
+        if changed {
+            self.worktree_cleanup_feedback = None;
+            self.scan_worktrees(next_dir, window, cx);
+        }
     }
 
     fn browse_worktree_dir(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -207,7 +403,7 @@ impl SettingsView {
                                     input.set_value(path_str, window, cx);
                                 });
                                 this.app_state.update(cx, |state, cx| {
-                                    state.settings.git_worktree_base_dir = Some(selected);
+                                    state.settings.git_worktree_base_dir = Some(selected.clone());
                                     if let Err(err) = state.save_settings() {
                                         eprintln!(
                                             "Warning: failed to save worktree directory: {err}"
@@ -215,7 +411,8 @@ impl SettingsView {
                                     }
                                     cx.notify();
                                 });
-                                cx.notify();
+                                this.worktree_cleanup_feedback = None;
+                                this.scan_worktrees(Some(selected), window, cx);
                             });
                         });
                     }
@@ -235,6 +432,8 @@ impl SettingsView {
             }
             cx.notify();
         });
+        self.worktree_cleanup_feedback = None;
+        self.scan_worktrees(None, window, cx);
     }
 
     fn save_copilot_token(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -508,11 +707,113 @@ impl SettingsView {
                                     }),
                             )
                             .child(
-                                div()
-                                    .pt_1()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child("Orphaned worktree scanning and one-click cleanup will be enabled in Phase 3."),
+                                v_flex()
+                                    .pt_2()
+                                    .gap_2()
+                                    .child(
+                                        h_flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .gap_3()
+                                            .p_3()
+                                            .rounded(theme.radius)
+                                            .bg(theme.background)
+                                            .border_1()
+                                            .border_color(theme.border)
+                                            .child(
+                                                h_flex()
+                                                    .items_center()
+                                                    .gap_2()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .when(self.scanning_worktrees, |row| {
+                                                        row.child(Spinner::new().xsmall())
+                                                    })
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(theme.muted_foreground)
+                                                            .child(if !has_worktree_dir {
+                                                                "Set a Worktree Base Directory to scan for orphaned worktrees.".to_string()
+                                                            } else if self.scanning_worktrees {
+                                                                "Scanning for orphaned worktrees...".to_string()
+                                                            } else if self.orphaned_worktrees.is_empty() {
+                                                                "No orphaned worktrees found.".to_string()
+                                                            } else {
+                                                                format!(
+                                                                    "Found {} directory(s) to clean up",
+                                                                    self.orphaned_worktrees.len()
+                                                                )
+                                                            }),
+                                                    ),
+                                            )
+                                            .child(
+                                                h_flex()
+                                                    .items_center()
+                                                    .gap_1p5()
+                                                    .child(
+                                                        Button::new("rescan-worktrees")
+                                                            .ghost()
+                                                            .small()
+                                                            .disabled(
+                                                                !has_worktree_dir
+                                                                    || self.scanning_worktrees
+                                                                    || self.cleaning_worktrees,
+                                                            )
+                                                            .icon(
+                                                                Icon::new(LucideIcon::RefreshCw)
+                                                                    .xsmall(),
+                                                            )
+                                                            .label("Rescan")
+                                                            .on_click(cx.listener(
+                                                                |this, _, window, cx| {
+                                                                    let dir = this
+                                                                        .app_state
+                                                                        .read(cx)
+                                                                        .settings
+                                                                        .git_worktree_base_dir
+                                                                        .clone();
+                                                                    this.scan_worktrees(
+                                                                        dir, window, cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    )
+                                                    .child(
+                                                        Button::new("clean-worktrees")
+                                                            .small()
+                                                            .disabled(
+                                                                self.orphaned_worktrees.is_empty()
+                                                                    || self.scanning_worktrees
+                                                                    || self.cleaning_worktrees,
+                                                            )
+                                                            .loading(self.cleaning_worktrees)
+                                                            .icon(
+                                                                Icon::new(LucideIcon::Trash)
+                                                                    .xsmall(),
+                                                            )
+                                                            .label("Clean Up")
+                                                            .on_click(cx.listener(
+                                                                |this, _, window, cx| {
+                                                                    this.confirm_and_clean_worktrees(
+                                                                        window, cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    ),
+                                            ),
+                                    )
+                                    .when_some(
+                                        self.worktree_cleanup_feedback.clone(),
+                                        |col, msg| {
+                                            col.child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(theme.muted_foreground)
+                                                    .child(msg),
+                                            )
+                                        },
+                                    ),
                             ),
                     ),
             )

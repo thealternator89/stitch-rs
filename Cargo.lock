@@ -6355,6 +6355,8 @@ name = "stitch-rs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "chrono",
  "directories",
  "github-copilot-sdk",
  "gpui-kit",
