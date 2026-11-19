@@ -89,6 +89,33 @@ pub struct ConnectorsConfig {
     pub github: GitHubConfig,
 }
 
+impl ConnectorsConfig {
+    pub fn is_azure_configured(&self) -> bool {
+        !self.azure_dev_ops.org.trim().is_empty()
+            && self
+                .azure_dev_ops
+                .pat
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+    }
+
+    pub fn is_atlassian_configured(&self) -> bool {
+        !self.atlassian.url.trim().is_empty()
+            && self
+                .atlassian
+                .token
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+    }
+
+    pub fn is_github_configured(&self) -> bool {
+        self.github
+            .token
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AtlassianConfig {
@@ -115,7 +142,7 @@ pub struct GitHubConfig {
     pub token: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct SourcesConfig {
     pub issues: String,
@@ -292,4 +319,34 @@ pub struct WorktreeCheckResult {
 pub struct WorktreeCleanResult {
     pub removed: usize,
     pub errors: Vec<String>,
+}
+
+/// Issue / Work Item payload returned by `IssueTrackerProvider`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TicketData {
+    pub id: Option<String>,
+    pub title: String,
+    pub description: String,
+    pub acceptance_criteria: Option<String>,
+}
+
+/// Documentation page payload returned by `DocumentationProvider`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocPageData {
+    pub id: String,
+    pub title: String,
+    pub body: String,
+}
+
+/// User story payload streamed from Copilot or edited inline in `StoryWriterView`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoryData {
+    pub title: String,
+    pub description: String,
+    pub acceptance_criteria: String,
+    #[serde(default)]
+    pub notes: Option<String>,
 }

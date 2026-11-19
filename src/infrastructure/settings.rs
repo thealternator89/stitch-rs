@@ -6,6 +6,17 @@ use crate::types::AppSettings;
 
 const KEYCHAIN_SERVICE: &str = "stitch-rs";
 const KEY_COPILOT_TOKEN: &str = "copilot_token";
+const KEY_AZURE_PAT: &str = "azure_pat";
+const KEY_GITHUB_TOKEN: &str = "github_token";
+const KEY_CONFLUENCE_TOKEN: &str = "confluence_token";
+
+fn normalize_secret(value: Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
 
 /// Persists non-secret preferences to `settings.json` and secrets to the OS Keychain.
 pub struct SettingsStore {
@@ -69,12 +80,13 @@ impl SettingsStore {
         settings.sources.code = settings.sources.code.trim().to_string();
         settings.sources.docs = settings.sources.docs.trim().to_string();
 
-        settings.copilot_token = settings
-            .copilot_token
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
+        settings.copilot_token = normalize_secret(settings.copilot_token.take());
+        settings.connectors.azure_dev_ops.pat =
+            normalize_secret(settings.connectors.azure_dev_ops.pat.take());
+        settings.connectors.github.token =
+            normalize_secret(settings.connectors.github.token.take());
+        settings.connectors.atlassian.token =
+            normalize_secret(settings.connectors.atlassian.token.take());
 
         settings.git_worktree_base_dir = settings
             .git_worktree_base_dir
@@ -120,6 +132,24 @@ impl SettingsStore {
                     eprintln!("Warning: failed to read copilot_token from OS Keychain: {err}");
                 }
             }
+            match self.load_keychain_secret(KEY_AZURE_PAT) {
+                Ok(pat) => settings.connectors.azure_dev_ops.pat = pat,
+                Err(err) => {
+                    eprintln!("Warning: failed to read azure_pat from OS Keychain: {err}");
+                }
+            }
+            match self.load_keychain_secret(KEY_GITHUB_TOKEN) {
+                Ok(token) => settings.connectors.github.token = token,
+                Err(err) => {
+                    eprintln!("Warning: failed to read github_token from OS Keychain: {err}");
+                }
+            }
+            match self.load_keychain_secret(KEY_CONFLUENCE_TOKEN) {
+                Ok(token) => settings.connectors.atlassian.token = token,
+                Err(err) => {
+                    eprintln!("Warning: failed to read confluence_token from OS Keychain: {err}");
+                }
+            }
         }
 
         Self::trim_settings(&mut settings);
@@ -154,6 +184,12 @@ impl SettingsStore {
 
         if self.use_keychain {
             self.save_keychain_secret(KEY_COPILOT_TOKEN, settings.copilot_token.as_deref())?;
+            self.save_keychain_secret(KEY_AZURE_PAT, settings.connectors.azure_dev_ops.pat.as_deref())?;
+            self.save_keychain_secret(KEY_GITHUB_TOKEN, settings.connectors.github.token.as_deref())?;
+            self.save_keychain_secret(
+                KEY_CONFLUENCE_TOKEN,
+                settings.connectors.atlassian.token.as_deref(),
+            )?;
         }
 
         Ok(())
@@ -222,6 +258,9 @@ mod tests {
             ..Default::default()
         };
         settings.connectors.github.owner = "  octocat  ".to_string();
+        settings.connectors.github.token = Some("  ghp_abc  ".to_string());
+        settings.connectors.azure_dev_ops.pat = Some("   ".to_string());
+        settings.connectors.atlassian.token = Some("  atl_tok\n".to_string());
 
         SettingsStore::trim_settings(&mut settings);
 
@@ -233,10 +272,16 @@ mod tests {
         assert_eq!(settings.copilot_token, None);
         assert_eq!(settings.git_worktree_base_dir, None);
         assert_eq!(settings.connectors.github.owner, "octocat");
+        assert_eq!(settings.connectors.github.token.as_deref(), Some("ghp_abc"));
+        assert_eq!(settings.connectors.azure_dev_ops.pat, None);
+        assert_eq!(
+            settings.connectors.atlassian.token.as_deref(),
+            Some("atl_tok")
+        );
     }
 
     #[test]
-    fn save_and_load_round_trip_skips_copilot_token_in_json() {
+    fn save_and_load_round_trip_skips_all_secrets_in_json() {
         let path = temp_settings_path("roundtrip");
         let store = SettingsStore::with_path_no_keychain(path.clone());
 
@@ -248,6 +293,17 @@ mod tests {
             copilot_token: Some("  ghp_super_secret_token_123  ".to_string()),
             ..Default::default()
         };
+        settings.connectors.azure_dev_ops.org = "  https://dev.azure.com/myorg  ".to_string();
+        settings.connectors.azure_dev_ops.project = "  MyProject  ".to_string();
+        settings.connectors.azure_dev_ops.pat = Some("  azdo_secret_pat_456  ".to_string());
+        settings.connectors.atlassian.url = "  https://example.atlassian.net/wiki  ".to_string();
+        settings.connectors.atlassian.username = "  alice@example.com  ".to_string();
+        settings.connectors.atlassian.token = Some("  confluence_secret_789  ".to_string());
+        settings.connectors.github.owner = "  my-org  ".to_string();
+        settings.connectors.github.token = Some("  ghp_connector_secret_000  ".to_string());
+        settings.sources.issues = "  azureDevOps ".to_string();
+        settings.sources.code = " github ".to_string();
+        settings.sources.docs = " atlassian ".to_string();
 
         store.save(&mut settings).expect("save settings");
 
@@ -255,10 +311,25 @@ mod tests {
             settings.copilot_token.as_deref(),
             Some("ghp_super_secret_token_123")
         );
+        assert_eq!(
+            settings.connectors.azure_dev_ops.pat.as_deref(),
+            Some("azdo_secret_pat_456")
+        );
+        assert_eq!(
+            settings.connectors.atlassian.token.as_deref(),
+            Some("confluence_secret_789")
+        );
+        assert_eq!(
+            settings.connectors.github.token.as_deref(),
+            Some("ghp_connector_secret_000")
+        );
 
         let raw_json = std::fs::read_to_string(&path).expect("read settings.json");
         assert!(!raw_json.contains("ghp_super_secret_token_123"));
         assert!(!raw_json.contains("copilotToken"));
+        assert!(!raw_json.contains("azdo_secret_pat_456"));
+        assert!(!raw_json.contains("confluence_secret_789"));
+        assert!(!raw_json.contains("ghp_connector_secret_000"));
 
         let loaded = store.load();
         assert_eq!(loaded.theme, ThemeMode::Dark);
@@ -269,6 +340,23 @@ mod tests {
         );
         assert_eq!(loaded.copilot_model, "claude-sonnet-4.5");
         assert_eq!(loaded.copilot_token, None);
+        assert_eq!(
+            loaded.connectors.azure_dev_ops.org,
+            "https://dev.azure.com/myorg"
+        );
+        assert_eq!(loaded.connectors.azure_dev_ops.project, "MyProject");
+        assert_eq!(loaded.connectors.azure_dev_ops.pat, None);
+        assert_eq!(
+            loaded.connectors.atlassian.url,
+            "https://example.atlassian.net/wiki"
+        );
+        assert_eq!(loaded.connectors.atlassian.username, "alice@example.com");
+        assert_eq!(loaded.connectors.atlassian.token, None);
+        assert_eq!(loaded.connectors.github.owner, "my-org");
+        assert_eq!(loaded.connectors.github.token, None);
+        assert_eq!(loaded.sources.issues, "azureDevOps");
+        assert_eq!(loaded.sources.code, "github");
+        assert_eq!(loaded.sources.docs, "atlassian");
 
         if let Some(parent) = path.parent() {
             let _ = std::fs::remove_dir_all(parent);

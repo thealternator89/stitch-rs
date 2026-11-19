@@ -17,6 +17,7 @@ use gpui_kit::{
 };
 
 use crate::app_state::{ActiveView, AppState, refresh_copilot_status};
+use crate::features::settings::connectors::ConnectorsSettingsView;
 use crate::infrastructure::git::GitService;
 use crate::infrastructure::runtime::spawn_tokio;
 use crate::types::{AppSettings, CopilotAuthStatus, ThemeMode};
@@ -82,6 +83,7 @@ pub struct SettingsView {
     app_state: Entity<AppState>,
     git_service: Arc<GitService>,
     active_tab: SettingsTab,
+    connectors_view: Entity<ConnectorsSettingsView>,
     worktree_dir_input: Entity<InputState>,
     copilot_token_input: Entity<InputState>,
     default_model_dropdown: Entity<ModelDropdown>,
@@ -162,10 +164,15 @@ impl SettingsView {
             });
         });
 
+        let connectors_view = cx.new(|cx| {
+            ConnectorsSettingsView::new(app_state.clone(), initial_settings, window, cx)
+        });
+
         let mut view = Self {
             app_state,
             git_service,
             active_tab: SettingsTab::default(),
+            connectors_view,
             worktree_dir_input,
             copilot_token_input,
             default_model_dropdown,
@@ -1300,14 +1307,7 @@ impl Render for SettingsView {
 
         let active_content = match self.active_tab {
             SettingsTab::General => self.render_general_tab(cx).into_any_element(),
-            SettingsTab::Connectors => self
-                .render_placeholder_tab(
-                    "Connectors & Source Routing",
-                    "Scheduled for Phase 4",
-                    "Configure Azure DevOps, Atlassian Confluence, and GitHub credentials along with Issues, Code, and Documentation source routing.",
-                    cx,
-                )
-                .into_any_element(),
+            SettingsTab::Connectors => self.connectors_view.clone().into_any_element(),
             SettingsTab::Copilot => self.render_copilot_tab(cx).into_any_element(),
             SettingsTab::Prompts => self
                 .render_placeholder_tab(
