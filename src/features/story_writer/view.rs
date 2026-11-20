@@ -5,6 +5,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::TextView;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Sizable as _, Size, Theme, h_flex, v_flex,
@@ -16,19 +17,21 @@ use gpui_kit::{
 
 use crate::app_state::{ActiveView, AppState};
 use crate::features::settings::SettingsTab;
+use crate::features::story_writer::service::{
+    self, ActiveStoryGenerationHandle, StoryGenerationRequest, StoryGenerationStreamEvent,
+};
 use crate::infrastructure::providers::confluence::strip_html_for_preview;
 use crate::infrastructure::providers::{build_documentation_provider, build_issue_tracker_provider};
 use crate::infrastructure::runtime::spawn_tokio;
-use crate::types::{AppSettings, DocPageData, StoryData, TicketData};
+use crate::types::{AppSettings, CopilotUsage, DocPageData, StoryData, TicketData};
 use crate::ui::components::{
     AutocompleteEvent, AutocompleteInput, AutocompleteOption, DirectIdMode, ModelDropdown,
-    ModelDropdownEvent, ModelDropdownMode,
+    ModelDropdownEvent, ModelDropdownMode, open_timeout_modal,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoryCardStatus {
     Draft,
-    #[allow(dead_code)]
     Creating,
     Created,
     Discarded,
@@ -70,7 +73,12 @@ pub struct StoryWriterView {
     user_overrode_model: bool,
     stories: Vec<StoryCardItem>,
     next_story_id: usize,
-    is_preparing_run: bool,
+    is_generating: bool,
+    generation_id: u64,
+    active_handle: Option<ActiveStoryGenerationHandle>,
+    generation_usage: Option<CopilotUsage>,
+    card_errors: HashMap<usize, String>,
+    created_ticket_ids: HashMap<usize, String>,
     validation_error: Option<String>,
     status_notice: Option<String>,
     _subscriptions: Vec<Subscription>,
@@ -184,14 +192,18 @@ impl StoryWriterView {
             user_overrode_model: false,
             stories: Vec::new(),
             next_story_id: 1,
-            is_preparing_run: false,
+            is_generating: false,
+            generation_id: 0,
+            active_handle: None,
+            generation_usage: None,
+            card_errors: HashMap::new(),
+            created_ticket_ids: HashMap::new(),
             validation_error: None,
             status_notice: None,
             _subscriptions: vec![state_sub, model_sub, page_sub, feature_sub],
         }
     }
 
-    #[allow(dead_code)]
     pub fn upsert_story(&mut self, story: StoryData, cx: &mut Context<Self>) {
         upsert_story_in_list(&mut self.stories, &mut self.next_story_id, story);
         cx.notify();
@@ -461,7 +473,7 @@ impl StoryWriterView {
     }
 
     fn handle_generate_stories(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.is_preparing_run {
+        if self.is_generating {
             return;
         }
 
@@ -492,14 +504,26 @@ impl StoryWriterView {
             return;
         };
 
-        let settings = self.app_state.read(cx).settings.clone();
+        let additional_context = self.additional_context_input.read(cx).value().to_string();
+        let model_override = self.selected_model.clone();
+        let (copilot, settings) = {
+            let state = self.app_state.read(cx);
+            (state.copilot_service.clone(), state.settings.clone())
+        };
+
         self.validation_error = None;
         self.status_notice = None;
-        self.is_preparing_run = true;
+        self.stories.clear();
+        self.card_errors.clear();
+        self.created_ticket_ids.clear();
+        self.generation_usage = None;
+        self.is_generating = true;
         self.fetching_page = true;
         self.fetching_feature = true;
+        self.generation_id = self.generation_id.wrapping_add(1);
         self.page_fetch_gen = self.page_fetch_gen.wrapping_add(1);
         self.feature_fetch_gen = self.feature_fetch_gen.wrapping_add(1);
+        let run_gen = self.generation_id;
         let page_gen = self.page_fetch_gen;
         let feature_gen = self.feature_fetch_gen;
 
@@ -513,16 +537,17 @@ impl StoryWriterView {
             );
             cx.notify();
         });
+        cx.notify();
 
         let view = cx.entity();
         let app_state = self.app_state.clone();
-        let feature_id_display = feature_id.clone();
 
         window
             .spawn(cx, async move |cx| {
+                let settings_for_fetch = settings.clone();
                 let res = spawn_tokio(async move {
-                    let doc_provider = build_documentation_provider(&settings)?;
-                    let issue_provider = build_issue_tracker_provider(&settings)?;
+                    let doc_provider = build_documentation_provider(&settings_for_fetch)?;
+                    let issue_provider = build_issue_tracker_provider(&settings_for_fetch)?;
                     let (page_res, feature_res) = tokio::join!(
                         doc_provider.fetch_page(&page_id),
                         issue_provider.fetch_ticket(&feature_id)
@@ -531,52 +556,205 @@ impl StoryWriterView {
                 })
                 .await;
 
-                let _ = cx.update(|_, cx| {
-                    app_state.update(cx, |state, cx| {
-                        state.set_task_status(ActiveView::StoryWriter, None);
-                        cx.notify();
-                    });
+                let fetched_pair = match res {
+                    Ok(Ok(pair)) => pair,
+                    Ok(Err(err)) => {
+                        let msg = err.to_string();
+                        let _ = cx.update(|_, cx| {
+                            view.update(cx, |this, cx| {
+                                if this.generation_id != run_gen {
+                                    return;
+                                }
+                                this.finish_generation_ui(page_gen, feature_gen, cx);
+                                this.validation_error = Some(msg);
+                                cx.notify();
+                            });
+                        });
+                        return;
+                    }
+                    Err(err) => {
+                        let msg = err.to_string();
+                        let _ = cx.update(|_, cx| {
+                            view.update(cx, |this, cx| {
+                                if this.generation_id != run_gen {
+                                    return;
+                                }
+                                this.finish_generation_ui(page_gen, feature_gen, cx);
+                                this.validation_error = Some(msg);
+                                cx.notify();
+                            });
+                        });
+                        return;
+                    }
+                };
 
+                let (page, feature) = fetched_pair;
+                let mut rx_opt = None;
+                let _ = cx.update(|_, cx| {
                     view.update(cx, |this, cx| {
-                        this.is_preparing_run = false;
+                        if this.generation_id != run_gen {
+                            return;
+                        }
                         if this.page_fetch_gen == page_gen {
                             this.fetching_page = false;
                         }
                         if this.feature_fetch_gen == feature_gen {
                             this.fetching_feature = false;
                         }
-                        this.page_search.update(cx, |input, cx| input.set_disabled(false, cx));
-                        this.feature_search.update(cx, |input, cx| input.set_disabled(false, cx));
-
-                        match res {
-                            Ok(Ok((page, feature))) => {
-                                let page_title = page.title.clone();
-                                let feat_id_label = feature
-                                    .id
-                                    .clone()
-                                    .unwrap_or_else(|| feature_id_display.clone());
-                                this.page_search_cache.insert(page.id.clone(), page.clone());
-                                if let Some(id) = feature.id.clone() {
-                                    this.feature_search_cache.insert(id, feature.clone());
-                                }
-                                this.fetched_page = Some(page);
-                                this.fetched_feature = Some(feature);
-                                this.status_notice = Some(format!(
-                                    "Fetched Confluence page \"{page_title}\" and parent Feature #{feat_id_label} — AI story generation will be wired up in Phase 5."
-                                ));
-                            }
-                            Ok(Err(err)) => {
-                                this.validation_error = Some(err.to_string());
-                            }
-                            Err(err) => {
-                                this.validation_error = Some(err.to_string());
-                            }
+                        this.page_search_cache.insert(page.id.clone(), page.clone());
+                        if let Some(id) = feature.id.clone() {
+                            this.feature_search_cache.insert(id, feature.clone());
                         }
+                        this.fetched_page = Some(page.clone());
+                        this.fetched_feature = Some(feature);
+
+                        app_state.update(cx, |state, cx| {
+                            state.set_task_status(
+                                ActiveView::StoryWriter,
+                                Some("Generating stories with Copilot...".to_string()),
+                            );
+                            cx.notify();
+                        });
+
+                        let (handle, rx) = service::generate_stories(
+                            copilot,
+                            StoryGenerationRequest {
+                                page_data: page,
+                                additional_context,
+                                model_override,
+                                settings,
+                            },
+                        );
+                        this.active_handle = Some(handle);
+                        rx_opt = Some(rx);
                         cx.notify();
                     });
                 });
+
+                let Some(mut rx) = rx_opt else {
+                    return;
+                };
+
+                while let Some(event) = rx.recv().await {
+                    let _ = cx.update(|window, cx| {
+                        let mut open_timeout_secs: Option<u64> = None;
+
+                        view.update(cx, |this, cx| {
+                            if this.generation_id != run_gen {
+                                return;
+                            }
+                            match event {
+                                StoryGenerationStreamEvent::Story(story) => {
+                                    this.upsert_story(story, cx);
+                                    let count = this.stories.len();
+                                    app_state.update(cx, |state, cx| {
+                                        state.set_task_status(
+                                            ActiveView::StoryWriter,
+                                            Some(format!(
+                                                "Generating stories ({count} drafted)..."
+                                            )),
+                                        );
+                                        cx.notify();
+                                    });
+                                }
+                                StoryGenerationStreamEvent::Completed { story_count, usage } => {
+                                    this.finish_generation_ui(page_gen, feature_gen, cx);
+                                    this.generation_usage = Some(usage);
+                                    if story_count == 0 {
+                                        this.validation_error = Some(
+                                            "Copilot completed without returning any structured user stories. Please check the page content and try again."
+                                                .to_string(),
+                                        );
+                                    }
+                                    cx.notify();
+                                }
+                                StoryGenerationStreamEvent::TimedOut { timeout_secs } => {
+                                    this.finish_generation_ui(page_gen, feature_gen, cx);
+                                    this.validation_error = Some(format!(
+                                        "Story generation timed out after {timeout_secs} seconds without Copilot output."
+                                    ));
+                                    open_timeout_secs = Some(timeout_secs);
+                                    cx.notify();
+                                }
+                                StoryGenerationStreamEvent::Cancelled => {
+                                    this.finish_generation_ui(page_gen, feature_gen, cx);
+                                    this.status_notice =
+                                        Some("Story generation cancelled.".to_string());
+                                    cx.notify();
+                                }
+                                StoryGenerationStreamEvent::Error(msg) => {
+                                    this.finish_generation_ui(page_gen, feature_gen, cx);
+                                    this.validation_error = Some(msg);
+                                    cx.notify();
+                                }
+                            }
+                        });
+
+                        if let Some(secs) = open_timeout_secs {
+                            let view_for_retry = view.clone();
+                            open_timeout_modal(
+                                "Story Writer",
+                                secs,
+                                move |window, cx| {
+                                    view_for_retry.update(cx, |this, cx| {
+                                        this.handle_generate_stories(window, cx);
+                                    });
+                                },
+                                window,
+                                cx,
+                            );
+                        }
+                    });
+                }
             })
             .detach();
+    }
+
+    fn finish_generation_ui(
+        &mut self,
+        page_gen: u64,
+        feature_gen: u64,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_handle = None;
+        self.is_generating = false;
+        if self.page_fetch_gen == page_gen {
+            self.fetching_page = false;
+        }
+        if self.feature_fetch_gen == feature_gen {
+            self.fetching_feature = false;
+        }
+        self.page_search.update(cx, |input, cx| input.set_disabled(false, cx));
+        self.feature_search.update(cx, |input, cx| input.set_disabled(false, cx));
+        self.app_state.update(cx, |state, cx| {
+            state.set_task_status(ActiveView::StoryWriter, None);
+            cx.notify();
+        });
+    }
+
+    fn cancel_generation(&mut self, cx: &mut Context<Self>) {
+        if !self.is_generating {
+            return;
+        }
+        if let Some(handle) = self.active_handle.as_ref() {
+            handle.cancel();
+            self.app_state.update(cx, |state, cx| {
+                state.set_task_status(
+                    ActiveView::StoryWriter,
+                    Some("Cancelling generation...".to_string()),
+                );
+                cx.notify();
+            });
+            cx.notify();
+        } else {
+            // Cancelled while still fetching Confluence / Feature context.
+            self.generation_id = self.generation_id.wrapping_add(1);
+            let page_gen = self.page_fetch_gen;
+            let feature_gen = self.feature_fetch_gen;
+            self.finish_generation_ui(page_gen, feature_gen, cx);
+            self.status_notice = Some("Story generation cancelled.".to_string());
+            cx.notify();
+        }
     }
 
     fn toggle_collapse(&mut self, card_id: usize, cx: &mut Context<Self>) {
@@ -662,14 +840,92 @@ impl StoryWriterView {
         }
     }
 
-    fn create_story_placeholder(&mut self, card_id: usize, cx: &mut Context<Self>) {
-        if let Some(item) = self.stories.iter().find(|s| s.id == card_id) {
-            self.status_notice = Some(format!(
-                "Story \"{}\" is ready — creating tickets in Azure DevOps / GitHub will be wired up in Phase 5.",
-                item.story.title
-            ));
+    fn create_story(&mut self, card_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(parent_feature_id) = self
+            .selected_feature_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+        else {
+            self.card_errors.insert(
+                card_id,
+                "Please select or enter a parent Feature ID before creating this story."
+                    .to_string(),
+            );
             cx.notify();
+            return;
+        };
+
+        let Some(item) = self.stories.iter_mut().find(|s| s.id == card_id) else {
+            return;
+        };
+        if matches!(
+            item.status,
+            StoryCardStatus::Creating | StoryCardStatus::Created
+        ) {
+            return;
         }
+
+        let ticket_data = TicketData {
+            id: None,
+            title: item.story.title.clone(),
+            description: item.story.description.clone(),
+            acceptance_criteria: Some(item.story.acceptance_criteria.clone())
+                .filter(|s| !s.trim().is_empty()),
+        };
+        let edited = item.edited;
+        item.status = StoryCardStatus::Creating;
+        self.card_errors.remove(&card_id);
+        cx.notify();
+
+        let settings = self.app_state.read(cx).settings.clone();
+        let story_type = if settings.story_type.trim().is_empty() {
+            "Product Backlog Item".to_string()
+        } else {
+            settings.story_type.trim().to_string()
+        };
+
+        let view = cx.entity();
+        window
+            .spawn(cx, async move |cx| {
+                let res = spawn_tokio(async move {
+                    let provider = build_issue_tracker_provider(&settings)?;
+                    provider
+                        .create_ticket(&story_type, &parent_feature_id, &ticket_data, edited)
+                        .await
+                })
+                .await;
+
+                let _ = cx.update(|_, cx| {
+                    view.update(cx, |this, cx| {
+                        let Some(item) = this.stories.iter_mut().find(|s| s.id == card_id) else {
+                            return;
+                        };
+                        match res {
+                            Ok(Ok(created_id)) => {
+                                item.status = StoryCardStatus::Created;
+                                item.collapsed = true;
+                                item.editing = None;
+                                this.card_errors.remove(&card_id);
+                                if let Some(id) = created_id {
+                                    this.created_ticket_ids.insert(card_id, id);
+                                }
+                            }
+                            Ok(Err(err)) => {
+                                item.status = StoryCardStatus::Draft;
+                                this.card_errors.insert(card_id, err.to_string());
+                            }
+                            Err(err) => {
+                                item.status = StoryCardStatus::Draft;
+                                this.card_errors.insert(card_id, err.to_string());
+                            }
+                        }
+                        cx.notify();
+                    });
+                });
+            })
+            .detach();
     }
 
     fn render_left_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -766,7 +1022,7 @@ impl StoryWriterView {
                                     Button::new("fetch-page-preview")
                                         .ghost()
                                         .xsmall()
-                                        .disabled(self.fetching_page || self.is_preparing_run)
+                                        .disabled(self.fetching_page || self.is_generating)
                                         .loading(self.fetching_page)
                                         .label("Fetch")
                                         .on_click(cx.listener(move |this, _, window, cx| {
@@ -796,7 +1052,7 @@ impl StoryWriterView {
                                     Button::new("fetch-feature-preview")
                                         .ghost()
                                         .xsmall()
-                                        .disabled(self.fetching_feature || self.is_preparing_run)
+                                        .disabled(self.fetching_feature || self.is_generating)
                                         .loading(self.fetching_feature)
                                         .label("Fetch")
                                         .on_click(cx.listener(move |this, _, window, cx| {
@@ -820,7 +1076,7 @@ impl StoryWriterView {
                     .child(
                         Textarea::new(&self.additional_context_input)
                             .h(px(110.))
-                            .disabled(self.is_preparing_run),
+                            .disabled(self.is_generating),
                     ),
             )
             .child(
@@ -868,22 +1124,25 @@ impl StoryWriterView {
                 )
             })
             .child(
-                div().pt_1().child(
+                div().pt_1().child(if self.is_generating {
+                    Button::new("cancel-stories")
+                        .danger()
+                        .w_full()
+                        .icon(Icon::new(LucideIcon::Square).small())
+                        .label("Cancel Generation")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.cancel_generation(cx);
+                        }))
+                } else {
                     Button::new("generate-stories")
                         .primary()
                         .w_full()
-                        .disabled(self.is_preparing_run)
-                        .loading(self.is_preparing_run)
                         .icon(Icon::new(LucideIcon::Sparkles).small())
-                        .label(if self.is_preparing_run {
-                            "Fetching Context..."
-                        } else {
-                            "Generate Stories"
-                        })
+                        .label("Generate Stories")
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.handle_generate_stories(window, cx);
-                        })),
-                ),
+                        }))
+                }),
             )
             .when_some(self.fetched_feature.clone(), |col, feature| {
                 let id_label = feature.id.unwrap_or_default();
@@ -1022,6 +1281,21 @@ impl StoryWriterView {
             .count();
         let green = hsla(152.0 / 360.0, 0.76, 0.40, 1.0);
 
+        let usage_summary = self.generation_usage.as_ref().and_then(|u| {
+            if u.input_tokens == 0 && u.output_tokens == 0 {
+                return None;
+            }
+            let model_suffix = u
+                .model
+                .as_deref()
+                .map(|m| format!(" • {m}"))
+                .unwrap_or_default();
+            Some(format!(
+                "{} in / {} out{model_suffix}",
+                u.input_tokens, u.output_tokens
+            ))
+        });
+
         let mut cards: Vec<AnyElement> = Vec::with_capacity(self.stories.len());
         for item in &self.stories {
             cards.push(self.render_story_card(item, &theme, cx).into_any_element());
@@ -1066,6 +1340,14 @@ impl StoryWriterView {
                         h_flex()
                             .items_center()
                             .gap_2()
+                            .when_some(usage_summary, |row, summary| {
+                                row.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child(summary),
+                                )
+                            })
                             .when(created_count > 0, |row| {
                                 row.child(
                                     div()
@@ -1098,7 +1380,34 @@ impl StoryWriterView {
             )
             .child(
                 div().flex_1().min_h_0().w_full().overflow_hidden().child(
-                    if self.stories.is_empty() {
+                    if self.stories.is_empty() && self.is_generating {
+                        v_flex()
+                            .size_full()
+                            .p_8()
+                            .items_center()
+                            .justify_center()
+                            .gap_3()
+                            .child(Spinner::new().large().color(theme.primary))
+                            .child(
+                                div()
+                                    .text_base()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(if self.fetching_page || self.fetching_feature {
+                                        "Fetching Confluence Page & Feature..."
+                                    } else {
+                                        "Asking Copilot to write user stories..."
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .max_w(px(440.))
+                                    .text_center()
+                                    .text_sm()
+                                    .text_color(theme.muted_foreground)
+                                    .child("Stories will stream in as structured cards as Copilot produces them."),
+                            )
+                            .into_any_element()
+                    } else if self.stories.is_empty() {
                         v_flex()
                             .size_full()
                             .p_8()
@@ -1128,13 +1437,7 @@ impl StoryWriterView {
                                     .text_center()
                                     .text_sm()
                                     .text_color(theme.muted_foreground)
-                                    .child(match &self.fetched_page {
-                                        Some(page) => format!(
-                                            "Loaded Confluence page \"{}\". Click Generate Stories once Phase 5 Copilot streaming is wired up to draft user stories here.",
-                                            page.title
-                                        ),
-                                        None => "Search for a Confluence page and parent Feature on the left, then click Generate Stories to draft user stories.".to_string(),
-                                    }),
+                                    .child("Search for a Confluence page and parent Feature on the left, then click Generate Stories to draft user stories."),
                             )
                             .into_any_element()
                     } else {
@@ -1144,6 +1447,25 @@ impl StoryWriterView {
                             .p_6()
                             .gap_4()
                             .children(cards)
+                            .when(self.is_generating, |col| {
+                                col.child(
+                                    h_flex()
+                                        .p_4()
+                                        .items_center()
+                                        .gap_2p5()
+                                        .rounded(theme.radius_lg)
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .bg(theme.sidebar)
+                                        .child(Spinner::new().small().color(theme.primary))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(theme.muted_foreground)
+                                                .child("Generating next story..."),
+                                        ),
+                                )
+                            })
                             .into_any_element()
                     },
                 ),
@@ -1159,9 +1481,15 @@ impl StoryWriterView {
         let card_id = item.id;
         let green = hsla(152.0 / 360.0, 0.76, 0.40, 1.0);
         let amber = hsla(38.0 / 360.0, 0.92, 0.50, 1.0);
+        let red = hsla(0.0, 0.78, 0.55, 1.0);
         let is_created = item.status == StoryCardStatus::Created;
         let is_creating = item.status == StoryCardStatus::Creating;
         let is_discarded = item.status == StoryCardStatus::Discarded;
+        let created_label = match self.created_ticket_ids.get(&card_id) {
+            Some(id) => format!("Created (#{id})"),
+            None => "Created".to_string(),
+        };
+        let card_error = self.card_errors.get(&card_id).cloned();
 
         if item.collapsed {
             return h_flex()
@@ -1193,7 +1521,7 @@ impl StoryWriterView {
                                 .child(item.story.title.clone()),
                         )
                         .when(is_created, |row| {
-                            row.child(render_status_pill("Created", green, theme))
+                            row.child(render_status_pill(created_label.clone(), green, theme))
                         })
                         .when(is_discarded, |row| {
                             row.child(render_status_pill(
@@ -1269,7 +1597,7 @@ impl StoryWriterView {
                             .items_center()
                             .gap_2()
                             .when(is_created, |row| {
-                                row.child(render_status_pill("Created", green, theme))
+                                row.child(render_status_pill(created_label.clone(), green, theme))
                             })
                             .when(is_discarded, |row| {
                                 row.child(render_status_pill(
@@ -1450,6 +1778,22 @@ impl StoryWriterView {
                                 ),
                         )
                     })
+                    .when_some(card_error, |col, err| {
+                        col.child(
+                            h_flex()
+                                .p_2p5()
+                                .gap_2()
+                                .items_start()
+                                .rounded(theme.radius)
+                                .border_1()
+                                .border_color(red.opacity(0.4))
+                                .bg(red.opacity(0.08))
+                                .text_xs()
+                                .text_color(red)
+                                .child(Icon::new(LucideIcon::CircleAlert).small())
+                                .child(div().flex_1().child(err)),
+                        )
+                    })
                     .child(
                         h_flex()
                             .pt_3()
@@ -1504,8 +1848,8 @@ impl StoryWriterView {
                                             } else {
                                                 "Create Story"
                                             })
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.create_story_placeholder(card_id, cx);
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.create_story(card_id, window, cx);
                                             })),
                                     ),
                             ),
@@ -1624,7 +1968,7 @@ fn feature_id_mode_for(settings: &AppSettings) -> DirectIdMode {
 }
 
 fn render_status_pill(
-    label: &'static str,
+    label: impl Into<gpui_kit::SharedString>,
     color: gpui_kit::Hsla,
     theme: &Theme,
 ) -> impl IntoElement {
@@ -1638,7 +1982,7 @@ fn render_status_pill(
         .text_xs()
         .font_weight(FontWeight::MEDIUM)
         .text_color(color)
-        .child(label)
+        .child(label.into())
 }
 
 pub(crate) fn upsert_story_in_list(

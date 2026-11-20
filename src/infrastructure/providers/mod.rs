@@ -33,6 +33,13 @@ pub trait IssueTrackerProvider: Send + Sync {
         query: &str,
         work_item_type: Option<&str>,
     ) -> anyhow::Result<Vec<TicketData>>;
+    async fn create_ticket(
+        &self,
+        work_item_type: &str,
+        parent_ticket_id: &str,
+        data: &TicketData,
+        edited: bool,
+    ) -> anyhow::Result<Option<String>>;
 }
 
 /// Builds the active `DocumentationProvider` based on `settings.sources.docs`.

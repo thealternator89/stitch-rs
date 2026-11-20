@@ -100,6 +100,47 @@ impl SettingsStore {
                     Some(PathBuf::from(trimmed))
                 }
             });
+
+        settings.prompts.story_writer.general =
+            settings.prompts.story_writer.general.trim().to_string();
+        settings.prompts.story_writer.title =
+            settings.prompts.story_writer.title.trim().to_string();
+        settings.prompts.story_writer.description =
+            settings.prompts.story_writer.description.trim().to_string();
+        settings.prompts.story_writer.acceptance_criteria = settings
+            .prompts
+            .story_writer
+            .acceptance_criteria
+            .trim()
+            .to_string();
+        settings.prompts.story_writer.notes =
+            settings.prompts.story_writer.notes.trim().to_string();
+
+        settings.prompts.test_case_writer.general =
+            settings.prompts.test_case_writer.general.trim().to_string();
+        settings.prompts.test_case_writer.description = settings
+            .prompts
+            .test_case_writer
+            .description
+            .trim()
+            .to_string();
+        settings.prompts.test_case_writer.pre_conditions = settings
+            .prompts
+            .test_case_writer
+            .pre_conditions
+            .trim()
+            .to_string();
+        settings.prompts.test_case_writer.steps =
+            settings.prompts.test_case_writer.steps.trim().to_string();
+        settings.prompts.test_case_writer.expected_result = settings
+            .prompts
+            .test_case_writer
+            .expected_result
+            .trim()
+            .to_string();
+
+        settings.prompts.story_elaborator.general =
+            settings.prompts.story_elaborator.general.trim().to_string();
     }
 
     /// Loads `AppSettings` from disk and reads `copilot_token` from the OS Keychain.
@@ -261,6 +302,13 @@ mod tests {
         settings.connectors.github.token = Some("  ghp_abc  ".to_string());
         settings.connectors.azure_dev_ops.pat = Some("   ".to_string());
         settings.connectors.atlassian.token = Some("  atl_tok\n".to_string());
+        settings.prompts.story_writer.general = "  Focus on APIs  ".to_string();
+        settings.prompts.story_writer.title = "  Concise title\n".to_string();
+        settings.prompts.story_writer.description = "  Standard format ".to_string();
+        settings.prompts.story_writer.acceptance_criteria = "  Bullets ".to_string();
+        settings.prompts.story_writer.notes = "  Risks  ".to_string();
+        settings.prompts.test_case_writer.general = "  Edge cases  ".to_string();
+        settings.prompts.story_elaborator.general = "  Plan steps  ".to_string();
 
         SettingsStore::trim_settings(&mut settings);
 
@@ -278,6 +326,13 @@ mod tests {
             settings.connectors.atlassian.token.as_deref(),
             Some("atl_tok")
         );
+        assert_eq!(settings.prompts.story_writer.general, "Focus on APIs");
+        assert_eq!(settings.prompts.story_writer.title, "Concise title");
+        assert_eq!(settings.prompts.story_writer.description, "Standard format");
+        assert_eq!(settings.prompts.story_writer.acceptance_criteria, "Bullets");
+        assert_eq!(settings.prompts.story_writer.notes, "Risks");
+        assert_eq!(settings.prompts.test_case_writer.general, "Edge cases");
+        assert_eq!(settings.prompts.story_elaborator.general, "Plan steps");
     }
 
     #[test]

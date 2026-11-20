@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use url::Url;
 
+use crate::infrastructure::constants::get_attribution_statement;
 use crate::infrastructure::providers::{
     IssueTrackerProvider, build_http_client, ensure_success_json,
 };
@@ -190,6 +191,113 @@ impl IssueTrackerProvider for GitHubClient {
 
         Ok(results)
     }
+
+    async fn create_ticket(
+        &self,
+        work_item_type: &str,
+        parent_ticket_id: &str,
+        data: &TicketData,
+        edited: bool,
+    ) -> anyhow::Result<Option<String>> {
+        if self.token.is_empty() {
+            anyhow::bail!("GitHub Personal Access Token is required.");
+        }
+        let (owner, repo, parent_number) = self.parse_ticket_id(parent_ticket_id)?;
+        let body = build_create_issue_body(data, parent_number, edited);
+        let clean_label = work_item_type.trim();
+        let labels: Vec<&str> = if clean_label.is_empty() {
+            Vec::new()
+        } else {
+            vec![clean_label]
+        };
+
+        let mut create_url = Url::parse(GITHUB_API_BASE)?;
+        {
+            let mut segs = create_url
+                .path_segments_mut()
+                .map_err(|()| anyhow::anyhow!("Invalid GitHub API base URL"))?;
+            segs.push("repos")
+                .push(&owner)
+                .push(&repo)
+                .push("issues");
+        }
+
+        let headers = self.headers()?;
+        let response = self
+            .client
+            .post(create_url)
+            .headers(headers.clone())
+            .json(&GitHubCreateIssueRequest {
+                title: &data.title,
+                body: &body,
+                labels: &labels,
+            })
+            .send()
+            .await
+            .map_err(|err| anyhow::anyhow!("Failed to create GitHub issue: {err}"))?;
+
+        let created: GitHubCreatedIssue = ensure_success_json(response, "GitHub").await?;
+
+        if let Some(sub_issue_id) = created.id {
+            let parent_str = parent_number.to_string();
+            let mut sub_url = Url::parse(GITHUB_API_BASE)?;
+            {
+                let mut segs = sub_url
+                    .path_segments_mut()
+                    .map_err(|()| anyhow::anyhow!("Invalid GitHub API base URL"))?;
+                segs.push("repos")
+                    .push(&owner)
+                    .push(&repo)
+                    .push("issues")
+                    .push(&parent_str)
+                    .push("sub_issues");
+            }
+            let sub_res = self
+                .client
+                .post(sub_url)
+                .headers(headers)
+                .json(&GitHubSubIssueRequest { sub_issue_id })
+                .send()
+                .await;
+            match sub_res {
+                Ok(resp) if !resp.status().is_success() => {
+                    let status = resp.status();
+                    let err_body = resp.text().await.unwrap_or_default();
+                    eprintln!(
+                        "Warning: failed to link GitHub sub-issue #{0} under #{parent_number} ({status}): {err_body}",
+                        created.number
+                    );
+                }
+                Err(err) => {
+                    eprintln!(
+                        "Warning: failed to link GitHub sub-issue #{0} under #{parent_number}: {err}",
+                        created.number
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Some(format!("{repo}/{}", created.number)))
+    }
+}
+
+pub fn build_create_issue_body(data: &TicketData, parent_number: u64, edited: bool) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if !data.description.trim().is_empty() {
+        parts.push(data.description.clone());
+    }
+    if let Some(ac) = data
+        .acceptance_criteria
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        parts.push(format!("### Acceptance Criteria\n\n{ac}"));
+    }
+    parts.push(get_attribution_statement(edited));
+    parts.push(format!("Parent Issue: #{parent_number}"));
+    parts.join("\n\n")
 }
 
 pub fn build_search_query(default_owner: &str, query: &str, label_type: Option<&str>) -> String {
@@ -206,6 +314,24 @@ pub fn extract_repo_name(repository_url: &str) -> &str {
         .rsplit('/')
         .next()
         .unwrap_or("")
+}
+
+#[derive(Serialize)]
+struct GitHubCreateIssueRequest<'a> {
+    title: &'a str,
+    body: &'a str,
+    labels: &'a [&'a str],
+}
+
+#[derive(Serialize)]
+struct GitHubSubIssueRequest {
+    sub_issue_id: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubCreatedIssue {
+    id: Option<u64>,
+    number: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -299,5 +425,26 @@ mod tests {
             extract_repo_name(&search.items[0].repository_url),
             "platform"
         );
+    }
+
+    #[test]
+    fn build_create_issue_body_and_deserialize_created_issue() {
+        let ticket = TicketData {
+            id: None,
+            title: "Add dark mode".to_string(),
+            description: "As a user, I want dark mode.".to_string(),
+            acceptance_criteria: Some("* Toggle persists".to_string()),
+        };
+        let body = build_create_issue_body(&ticket, 42, true);
+        assert!(body.contains("As a user, I want dark mode."));
+        assert!(body.contains("### Acceptance Criteria\n\n* Toggle persists"));
+        assert!(body.contains("> Assisted by "));
+        assert!(body.ends_with("Parent Issue: #42"));
+
+        let created_json = r#"{"id": 998877, "number": 105}"#;
+        let created: GitHubCreatedIssue =
+            serde_json::from_str(created_json).expect("created issue");
+        assert_eq!(created.id, Some(998877));
+        assert_eq!(created.number, 105);
     }
 }

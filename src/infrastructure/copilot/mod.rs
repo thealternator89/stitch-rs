@@ -35,6 +35,7 @@ pub struct SessionOptions {
     pub working_directory: Option<PathBuf>,
     pub tools: Vec<Tool>,
     pub available_tools: Option<Vec<String>>,
+    pub streaming: bool,
     #[allow(dead_code)]
     pub label: String,
 }
@@ -217,7 +218,7 @@ impl CopilotService {
         let client = self.ensure_client(normalized_token).await?;
 
         let mut config = SessionConfig::default()
-            .with_streaming(true)
+            .with_streaming(opts.streaming)
             .with_model(resolve_session_model(opts.model.as_deref()))
             .approve_all_permissions();
 
@@ -249,159 +250,69 @@ impl CopilotService {
     pub async fn send_and_collect_stream<F>(
         session: &Session,
         prompt: &str,
-        mut cancel_rx: watch::Receiver<bool>,
+        cancel_rx: watch::Receiver<bool>,
         mut on_event: F,
     ) -> Result<CopilotUsage, StreamError>
     where
         F: FnMut(StreamEvent) + Send,
     {
-        if *cancel_rx.borrow() {
-            return Err(StreamError::Cancelled);
-        }
-
-        log_prompt_if_configured(prompt);
-        let timeout_dur = resolve_timeout_duration();
-
-        // Subscribe before sending so no early deltas or tool events are lost.
-        let mut sub = session.subscribe();
-
-        if let Err(err) = session.send(prompt).await {
-            return Err(StreamError::Other(anyhow::anyhow!(
-                "Failed to send prompt to Copilot: {err}"
-            )));
-        }
-
         let mut buffer = String::new();
         let mut received_deltas = false;
-        let mut last_assistant_message: Option<String> = None;
-        let mut active_tool_calls: HashMap<String, String> = HashMap::new();
-        let mut usage = CopilotUsage::default();
 
-        let watchdog = tokio::time::sleep(timeout_dur);
-        tokio::pin!(watchdog);
+        let (last_assistant_message, usage) =
+            collect_session_turn(session, prompt, cancel_rx, |chunk| match chunk {
+                TurnChunk::Delta(delta) => {
+                    received_deltas = true;
+                    buffer.push_str(&delta);
+                    buffer = parse_resilient_jsonl(&buffer, |line| {
+                        on_event(StreamEvent::JsonLine(line.to_string()));
+                    });
+                }
+                TurnChunk::Status(status) => {
+                    on_event(StreamEvent::Status(status));
+                }
+            })
+            .await?;
 
-        loop {
-            tokio::select! {
-                res = cancel_rx.changed() => {
-                    if res.is_err() || *cancel_rx.borrow() {
-                        let _ = session.abort().await;
-                        return Err(StreamError::Cancelled);
-                    }
-                }
-                () = &mut watchdog, if active_tool_calls.is_empty() => {
-                    let _ = session.abort().await;
-                    return Err(StreamError::Timeout(timeout_dur));
-                }
-                ev_res = sub.recv() => {
-                    match ev_res {
-                        Ok(event) => {
-                            match event.event_type.as_str() {
-                                "assistant.message_delta" => {
-                                    if let Ok(data) = serde_json::from_value::<AssistantMessageDeltaData>(event.data) {
-                                        if !data.delta_content.is_empty() {
-                                            received_deltas = true;
-                                            buffer.push_str(&data.delta_content);
-                                            buffer = parse_resilient_jsonl(&buffer, |line| {
-                                                on_event(StreamEvent::JsonLine(line.to_string()));
-                                            });
-                                        }
-                                    }
-                                    watchdog.as_mut().reset(tokio::time::Instant::now() + timeout_dur);
-                                }
-                                "assistant.message" => {
-                                    if let Ok(data) = serde_json::from_value::<AssistantMessageData>(event.data) {
-                                        last_assistant_message = Some(data.content);
-                                    }
-                                }
-                                "assistant.usage" => {
-                                    if let Ok(data) = serde_json::from_value::<AssistantUsageData>(event.data) {
-                                        usage.input_tokens = usage.input_tokens.saturating_add(
-                                            data.input_tokens.and_then(|v| u64::try_from(v).ok()).unwrap_or(0)
-                                        );
-                                        usage.output_tokens = usage.output_tokens.saturating_add(
-                                            data.output_tokens.and_then(|v| u64::try_from(v).ok()).unwrap_or(0)
-                                        );
-                                        usage.cache_read_tokens = usage.cache_read_tokens.saturating_add(
-                                            data.cache_read_tokens.and_then(|v| u64::try_from(v).ok()).unwrap_or(0)
-                                        );
-                                        if let Some(cost) = data.cost {
-                                            usage.cost += cost;
-                                        }
-                                        if !data.model.is_empty() {
-                                            usage.model = Some(data.model);
-                                        }
-                                    }
-                                }
-                                "tool.execution_start" => {
-                                    if let Ok(data) = serde_json::from_value::<ToolExecutionStartData>(event.data) {
-                                        let status = format_tool_start(&data.tool_name, data.arguments.as_ref());
-                                        active_tool_calls.insert(data.tool_call_id, data.tool_name);
-                                        on_event(StreamEvent::Status(status));
-                                    }
-                                }
-                                "tool.execution_complete" => {
-                                    if let Ok(data) = serde_json::from_value::<ToolExecutionCompleteData>(event.data) {
-                                        let tool_name = active_tool_calls
-                                            .remove(&data.tool_call_id)
-                                            .unwrap_or_else(|| "tool".to_string());
-                                        if let Some(err_status) = format_tool_complete(
-                                            &tool_name,
-                                            data.success,
-                                            data.error.as_ref().map(|e| e.message.as_str()),
-                                        ) {
-                                            on_event(StreamEvent::Status(err_status));
-                                        }
-                                        if active_tool_calls.is_empty() {
-                                            watchdog.as_mut().reset(tokio::time::Instant::now() + timeout_dur);
-                                        }
-                                    }
-                                }
-                                "session.idle" => {
-                                    if !buffer.trim().is_empty() {
-                                        let _ = parse_resilient_jsonl(&buffer, |line| {
-                                            on_event(StreamEvent::JsonLine(line.to_string()));
-                                        });
-                                    } else if !received_deltas {
-                                        if let Some(msg) = &last_assistant_message {
-                                            let _ = parse_resilient_jsonl(msg, |line| {
-                                                on_event(StreamEvent::JsonLine(line.to_string()));
-                                            });
-                                        }
-                                    }
-                                    return Ok(usage);
-                                }
-                                "session.error" => {
-                                    if let Ok(data) = serde_json::from_value::<SessionErrorData>(event.data) {
-                                        return Err(StreamError::Other(anyhow::anyhow!(
-                                            "Copilot session error ({}): {}",
-                                            data.error_type,
-                                            data.message
-                                        )));
-                                    }
-                                    return Err(StreamError::Other(anyhow::anyhow!(
-                                        "Copilot session error"
-                                    )));
-                                }
-                                _ => {}
-                            }
-                        }
-                        Err(err) => match err.kind() {
-                            RecvErrorKind::Lagged(_) => continue,
-                            RecvErrorKind::Closed => {
-                                return Err(StreamError::Other(anyhow::anyhow!(
-                                    "Copilot session event stream closed unexpectedly"
-                                )));
-                            }
-                            _ => {
-                                return Err(StreamError::Other(anyhow::anyhow!(
-                                    "Copilot session stream error: {err}"
-                                )));
-                            }
-                        },
-                    }
-                }
+        if !buffer.trim().is_empty() {
+            let _ = parse_resilient_jsonl(&buffer, |line| {
+                on_event(StreamEvent::JsonLine(line.to_string()));
+            });
+        } else if !received_deltas {
+            if let Some(msg) = &last_assistant_message {
+                let _ = parse_resilient_jsonl(msg, |line| {
+                    on_event(StreamEvent::JsonLine(line.to_string()));
+                });
             }
         }
+
+        Ok(usage)
+    }
+
+    /// Sends a prompt to an active Copilot session and collects the plain-text response
+    /// (streaming deltas if enabled, or the final `assistant.message` when `streaming == false`).
+    pub async fn send_and_collect_text(
+        session: &Session,
+        prompt: &str,
+        cancel_rx: watch::Receiver<bool>,
+    ) -> Result<(String, CopilotUsage), StreamError> {
+        let mut accumulated = String::new();
+
+        let (last_assistant_message, usage) =
+            collect_session_turn(session, prompt, cancel_rx, |chunk| {
+                if let TurnChunk::Delta(delta) = chunk {
+                    accumulated.push_str(&delta);
+                }
+            })
+            .await?;
+
+        let text = if !accumulated.is_empty() {
+            accumulated
+        } else {
+            last_assistant_message.unwrap_or_default()
+        };
+
+        Ok((text, usage))
     }
 
     /// Clears cached model listings and stops any active client so future calls reload fresh state.
@@ -419,6 +330,176 @@ impl CopilotService {
     pub async fn shutdown(&self) {
         self.invalidate_cache().await;
     }
+}
+
+enum TurnChunk {
+    Delta(String),
+    Status(String),
+}
+
+async fn collect_session_turn<F>(
+    session: &Session,
+    prompt: &str,
+    mut cancel_rx: watch::Receiver<bool>,
+    mut on_chunk: F,
+) -> Result<(Option<String>, CopilotUsage), StreamError>
+where
+    F: FnMut(TurnChunk) + Send,
+{
+    if *cancel_rx.borrow() {
+        return Err(StreamError::Cancelled);
+    }
+
+    log_prompt_if_configured(prompt);
+    let timeout_dur = resolve_timeout_duration();
+
+    // Subscribe before sending so no early deltas or tool events are lost.
+    let mut sub = session.subscribe();
+
+    if let Err(err) = session.send(prompt).await {
+        return Err(StreamError::Other(anyhow::anyhow!(
+            "Failed to send prompt to Copilot: {err}"
+        )));
+    }
+
+    let mut last_assistant_message: Option<String> = None;
+    let mut active_tool_calls: HashMap<String, String> = HashMap::new();
+    let mut usage = CopilotUsage::default();
+
+    let watchdog = tokio::time::sleep(timeout_dur);
+    tokio::pin!(watchdog);
+
+    loop {
+        tokio::select! {
+            res = cancel_rx.changed() => {
+                if res.is_err() || *cancel_rx.borrow() {
+                    let _ = session.abort().await;
+                    return Err(StreamError::Cancelled);
+                }
+            }
+            () = &mut watchdog, if active_tool_calls.is_empty() => {
+                let _ = session.abort().await;
+                return Err(StreamError::Timeout(timeout_dur));
+            }
+            ev_res = sub.recv() => {
+                match ev_res {
+                    Ok(event) => {
+                        match event.event_type.as_str() {
+                            "assistant.message_delta" => {
+                                if let Ok(data) = serde_json::from_value::<AssistantMessageDeltaData>(event.data) {
+                                    if !data.delta_content.is_empty() {
+                                        on_chunk(TurnChunk::Delta(data.delta_content));
+                                    }
+                                }
+                                watchdog.as_mut().reset(tokio::time::Instant::now() + timeout_dur);
+                            }
+                            "assistant.message" => {
+                                if let Ok(data) = serde_json::from_value::<AssistantMessageData>(event.data) {
+                                    last_assistant_message = Some(data.content);
+                                }
+                            }
+                            "assistant.usage" => {
+                                if let Ok(data) = serde_json::from_value::<AssistantUsageData>(event.data) {
+                                    accumulate_usage(&mut usage, data);
+                                }
+                            }
+                            "tool.execution_start" => {
+                                if let Ok(data) = serde_json::from_value::<ToolExecutionStartData>(event.data) {
+                                    let status = format_tool_start(&data.tool_name, data.arguments.as_ref());
+                                    active_tool_calls.insert(data.tool_call_id, data.tool_name);
+                                    on_chunk(TurnChunk::Status(status));
+                                }
+                            }
+                            "tool.execution_complete" => {
+                                if let Ok(data) = serde_json::from_value::<ToolExecutionCompleteData>(event.data) {
+                                    let tool_name = active_tool_calls
+                                        .remove(&data.tool_call_id)
+                                        .unwrap_or_else(|| "tool".to_string());
+                                    if let Some(err_status) = format_tool_complete(
+                                        &tool_name,
+                                        data.success,
+                                        data.error.as_ref().map(|e| e.message.as_str()),
+                                    ) {
+                                        on_chunk(TurnChunk::Status(err_status));
+                                    }
+                                    if active_tool_calls.is_empty() {
+                                        watchdog.as_mut().reset(tokio::time::Instant::now() + timeout_dur);
+                                    }
+                                }
+                            }
+                            "session.idle" => {
+                                return Ok((last_assistant_message, usage));
+                            }
+                            "session.error" => {
+                                if let Ok(data) = serde_json::from_value::<SessionErrorData>(event.data) {
+                                    return Err(StreamError::Other(anyhow::anyhow!(
+                                        "Copilot session error ({}): {}",
+                                        data.error_type,
+                                        data.message
+                                    )));
+                                }
+                                return Err(StreamError::Other(anyhow::anyhow!(
+                                    "Copilot session error"
+                                )));
+                            }
+                            _ => {}
+                        }
+                    }
+                    Err(err) => match err.kind() {
+                        RecvErrorKind::Lagged(_) => continue,
+                        RecvErrorKind::Closed => {
+                            return Err(StreamError::Other(anyhow::anyhow!(
+                                "Copilot session event stream closed unexpectedly"
+                            )));
+                        }
+                        _ => {
+                            return Err(StreamError::Other(anyhow::anyhow!(
+                                "Copilot session stream error: {err}"
+                            )));
+                        }
+                    },
+                }
+            }
+        }
+    }
+}
+
+fn accumulate_usage(usage: &mut CopilotUsage, data: AssistantUsageData) {
+    usage.input_tokens = usage.input_tokens.saturating_add(
+        data.input_tokens
+            .and_then(|v| u64::try_from(v).ok())
+            .unwrap_or(0),
+    );
+    usage.output_tokens = usage.output_tokens.saturating_add(
+        data.output_tokens
+            .and_then(|v| u64::try_from(v).ok())
+            .unwrap_or(0),
+    );
+    usage.cache_read_tokens = usage.cache_read_tokens.saturating_add(
+        data.cache_read_tokens
+            .and_then(|v| u64::try_from(v).ok())
+            .unwrap_or(0),
+    );
+    if let Some(cost) = data.cost {
+        usage.cost += cost;
+    }
+    if !data.model.is_empty() {
+        usage.model = Some(data.model);
+    }
+}
+
+/// Resolves the effective Copilot model ID, preserving an explicit `"auto"` override
+/// before falling back to `default_model` and finally `"auto"`.
+pub fn resolve_model_override(override_model: &str, default_model: &str) -> String {
+    let over = override_model.trim();
+    if !over.is_empty() {
+        return over.to_string();
+    }
+    let def = default_model.trim();
+    if !def.is_empty() {
+        return def.to_string();
+    }
+    "auto".to_string()
 }
 
 fn resolve_session_model(model: Option<&str>) -> &str {

@@ -239,6 +239,7 @@ async fn run_estimation_task(
             working_directory: Some(effective_repo_path),
             tools: vec![create_report_intent_tool()],
             available_tools: None,
+            streaming: true,
             label: "T-Shirt Size Estimator".to_string(),
         })
         .await

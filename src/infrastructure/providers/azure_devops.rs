@@ -3,8 +3,10 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use url::Url;
 
+use crate::infrastructure::constants::get_attribution_statement;
 use crate::infrastructure::providers::{
     IssueTrackerProvider, build_http_client, ensure_success_json,
 };
@@ -251,6 +253,124 @@ impl IssueTrackerProvider for AzureDevOpsClient {
 
         Ok(results)
     }
+
+    async fn create_ticket(
+        &self,
+        work_item_type: &str,
+        parent_ticket_id: &str,
+        data: &TicketData,
+        edited: bool,
+    ) -> anyhow::Result<Option<String>> {
+        self.validate_credentials()?;
+        let clean_type = work_item_type.trim();
+        if clean_type.is_empty() {
+            anyhow::bail!("Azure DevOps Work Item Type is required to create a ticket.");
+        }
+        let clean_parent = parent_ticket_id.trim();
+        let parent_num: u64 = clean_parent.parse().map_err(|_| {
+            anyhow::anyhow!(
+                "Invalid parent Azure DevOps Work Item ID '{clean_parent}'. Expected a number."
+            )
+        })?;
+
+        let parent = self.fetch_work_item_raw(parent_num).await?;
+        let project = parent
+            .fields
+            .team_project
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("Parent work item #{parent_num} is missing System.TeamProject.")
+            })?;
+        let parent_url = parent
+            .url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("Parent work item #{parent_num} is missing its relation URL.")
+            })?;
+
+        let patch = build_create_work_item_patch(data, parent_url, edited);
+        let type_segment = format!("${clean_type}");
+        let url = self.build_api_url(&[project, "_apis", "wit", "workitems", &type_segment], &[])?;
+        let body_bytes = serde_json::to_vec(&patch)?;
+
+        let response = self
+            .client
+            .post(url)
+            .header(reqwest::header::AUTHORIZATION, self.auth_header())
+            .header(reqwest::header::ACCEPT, "application/json")
+            .header(reqwest::header::CONTENT_TYPE, "application/json-patch+json")
+            .body(body_bytes)
+            .send()
+            .await
+            .map_err(|err| anyhow::anyhow!("Failed to create Azure DevOps work item: {err}"))?;
+
+        let created: AdoWorkItem = ensure_success_json(response, "Azure DevOps").await?;
+        Ok(created.id.map(|id| id.to_string()))
+    }
+}
+
+pub fn build_create_work_item_patch(
+    data: &TicketData,
+    parent_url: &str,
+    edited: bool,
+) -> Vec<serde_json::Value> {
+    let attribution = get_attribution_statement(edited);
+    let description_with_attribution = if data.description.trim().is_empty() {
+        attribution
+    } else {
+        format!("{}\n\n{}", data.description, attribution)
+    };
+
+    let mut ops = vec![
+        json!({
+            "op": "add",
+            "path": "/fields/System.Title",
+            "value": data.title,
+        }),
+        json!({
+            "op": "add",
+            "path": "/fields/System.Description",
+            "value": description_with_attribution,
+        }),
+        json!({
+            "op": "add",
+            "path": "/multilineFieldsFormat/System.Description",
+            "value": "Markdown",
+        }),
+        json!({
+            "op": "add",
+            "path": "/relations/-",
+            "value": {
+                "rel": "System.LinkTypes.Hierarchy-Reverse",
+                "url": parent_url,
+                "attributes": { "comment": "Created via Stitch" }
+            },
+        }),
+    ];
+
+    if let Some(ac) = data
+        .acceptance_criteria
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        ops.push(json!({
+            "op": "add",
+            "path": "/fields/Microsoft.VSTS.Common.AcceptanceCriteria",
+            "value": ac,
+        }));
+        ops.push(json!({
+            "op": "add",
+            "path": "/multilineFieldsFormat/Microsoft.VSTS.Common.AcceptanceCriteria",
+            "value": "Markdown",
+        }));
+    }
+
+    ops
 }
 
 pub fn build_wiql_query(query: &str, work_item_type: Option<&str>) -> String {
@@ -293,6 +413,8 @@ struct AdoBatchWorkItemsResponse {
 struct AdoWorkItem {
     id: Option<u64>,
     #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
     fields: AdoWorkItemFields,
 }
 
@@ -322,6 +444,8 @@ struct AdoWorkItemFields {
     acceptance_criteria: Option<String>,
     #[serde(rename = "System.WorkItemType")]
     work_item_type: Option<String>,
+    #[serde(rename = "System.TeamProject")]
+    team_project: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -405,5 +529,70 @@ mod tests {
         let types: AdoWorkItemTypesResponse = serde_json::from_str(types_json).expect("types");
         let names: Vec<String> = types.value.into_iter().map(|t| t.name).collect();
         assert_eq!(names, vec!["Feature", "Product Backlog Item", "Task"]);
+    }
+
+    #[test]
+    fn build_create_work_item_patch_includes_markdown_fields_and_parent_relation() {
+        let ticket = TicketData {
+            id: None,
+            title: "Add OAuth".to_string(),
+            description: "As a user...\n\nMore details.".to_string(),
+            acceptance_criteria: Some("* AC 1\n* AC 2".to_string()),
+        };
+        let parent_url = "https://dev.azure.com/myorg/_apis/wit/workItems/12";
+        let patch = build_create_work_item_patch(&ticket, parent_url, false);
+
+        assert_eq!(patch.len(), 6);
+        assert_eq!(patch[0]["path"], "/fields/System.Title");
+        assert_eq!(patch[0]["value"], "Add OAuth");
+        let desc = patch[1]["value"].as_str().unwrap();
+        assert!(desc.starts_with("As a user..."));
+        assert!(desc.contains("> Generated with "));
+        assert_eq!(patch[2]["path"], "/multilineFieldsFormat/System.Description");
+        assert_eq!(patch[2]["value"], "Markdown");
+        assert_eq!(patch[3]["path"], "/relations/-");
+        assert_eq!(
+            patch[3]["value"]["rel"],
+            "System.LinkTypes.Hierarchy-Reverse"
+        );
+        assert_eq!(patch[3]["value"]["url"], parent_url);
+        assert_eq!(
+            patch[4]["path"],
+            "/fields/Microsoft.VSTS.Common.AcceptanceCriteria"
+        );
+        assert_eq!(
+            patch[5]["path"],
+            "/multilineFieldsFormat/Microsoft.VSTS.Common.AcceptanceCriteria"
+        );
+
+        let no_ac_ticket = TicketData {
+            id: None,
+            title: "Simple task".to_string(),
+            description: String::new(),
+            acceptance_criteria: Some("   ".to_string()),
+        };
+        let patch_no_ac = build_create_work_item_patch(&no_ac_ticket, parent_url, true);
+        assert_eq!(patch_no_ac.len(), 4);
+        assert!(
+            patch_no_ac[1]["value"]
+                .as_str()
+                .unwrap()
+                .starts_with("> Assisted by ")
+        );
+    }
+
+    #[test]
+    fn create_ticket_url_encodes_spaces_in_project_and_type() {
+        let client = AzureDevOpsClient::new("my-org", "pat");
+        let url = client
+            .build_api_url(
+                &["My Project", "_apis", "wit", "workitems", "$Product Backlog Item"],
+                &[],
+            )
+            .expect("url");
+        assert_eq!(
+            url.as_str(),
+            "https://dev.azure.com/my-org/My%20Project/_apis/wit/workitems/$Product%20Backlog%20Item?api-version=7.1"
+        );
     }
 }

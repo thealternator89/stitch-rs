@@ -18,6 +18,7 @@ use gpui_kit::{
 
 use crate::app_state::{ActiveView, AppState, refresh_copilot_status};
 use crate::features::settings::connectors::ConnectorsSettingsView;
+use crate::features::settings::prompts::PromptsSettingsView;
 use crate::infrastructure::git::GitService;
 use crate::infrastructure::runtime::spawn_tokio;
 use crate::types::{AppSettings, CopilotAuthStatus, ThemeMode};
@@ -84,6 +85,7 @@ pub struct SettingsView {
     git_service: Arc<GitService>,
     active_tab: SettingsTab,
     connectors_view: Entity<ConnectorsSettingsView>,
+    prompts_view: Entity<PromptsSettingsView>,
     worktree_dir_input: Entity<InputState>,
     copilot_token_input: Entity<InputState>,
     default_model_dropdown: Entity<ModelDropdown>,
@@ -167,12 +169,16 @@ impl SettingsView {
         let connectors_view = cx.new(|cx| {
             ConnectorsSettingsView::new(app_state.clone(), initial_settings, window, cx)
         });
+        let prompts_view = cx.new(|cx| {
+            PromptsSettingsView::new(app_state.clone(), initial_settings, window, cx)
+        });
 
         let mut view = Self {
             app_state,
             git_service,
             active_tab: SettingsTab::default(),
             connectors_view,
+            prompts_view,
             worktree_dir_input,
             copilot_token_input,
             default_model_dropdown,
@@ -1309,14 +1315,7 @@ impl Render for SettingsView {
             SettingsTab::General => self.render_general_tab(cx).into_any_element(),
             SettingsTab::Connectors => self.connectors_view.clone().into_any_element(),
             SettingsTab::Copilot => self.render_copilot_tab(cx).into_any_element(),
-            SettingsTab::Prompts => self
-                .render_placeholder_tab(
-                    "Custom Prompts & Validator",
-                    "Scheduled for Phases 5–7",
-                    "Customize Story Writer, Test Case Writer, and Story Elaborator prompt instructions and run the AI Prompt Complexity Validator.",
-                    cx,
-                )
-                .into_any_element(),
+            SettingsTab::Prompts => self.prompts_view.clone().into_any_element(),
             SettingsTab::PrReviewer => self
                 .render_placeholder_tab(
                     "PR Reviewer Settings",

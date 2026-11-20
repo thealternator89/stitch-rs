@@ -158,7 +158,7 @@ pub struct CustomPromptsConfig {
     pub story_elaborator: StoryElaboratorPrompts,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct StoryWriterPrompts {
     pub general: String,
