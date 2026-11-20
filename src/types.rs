@@ -205,10 +205,11 @@ impl Default for PrReviewerSettingsConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ReviewPersona {
     pub name: String,
+    #[serde(alias = "content")]
     pub guidelines: String,
 }
 
@@ -302,7 +303,6 @@ pub struct CopilotUsage {
 /// Per-phase token and billing breakdown (used by multi-phase tools such as PR Reviewer).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)]
 pub struct PhaseUsage {
     pub phase_title: String,
     pub model: String,
@@ -501,4 +501,152 @@ pub struct ReviewPhase {
     pub template: Option<String>,
     pub template_error: Option<String>,
     pub model: Option<String>,
+}
+
+/// Source line slice surrounding a line-specific PR review comment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodeContextLine {
+    pub line: usize,
+    pub text: String,
+    pub is_target: bool,
+}
+
+/// Kind of Pull Request review comment produced by Copilot phases or posted to a PR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReviewCommentType {
+    #[default]
+    General,
+    Line,
+}
+
+/// A draft or posted PR review comment generated during a review phase.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewComment {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub comment_type: ReviewCommentType,
+    pub file: Option<String>,
+    pub line: Option<usize>,
+    pub context: Option<usize>,
+    pub comment: String,
+    pub phase: Option<String>,
+    pub phase_id: Option<String>,
+    pub code_lines: Option<Vec<CodeContextLine>>,
+    pub posted: bool,
+}
+
+/// Payload used when posting a review comment (or reply) to Azure DevOps / GitHub.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostPrCommentRequest {
+    pub comment_type: ReviewCommentType,
+    pub file: Option<String>,
+    pub line: Option<usize>,
+    pub comment: String,
+    pub edited: bool,
+    pub thread_id: Option<u64>,
+}
+
+/// Execution state for an individual PR review phase in the progress checklist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhaseRunStatus {
+    Pending,
+    Running,
+    Completed,
+    Skipped,
+}
+
+/// Live UI progress record for a scheduled PR review phase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhaseProgress {
+    pub id: String,
+    pub title: String,
+    pub group: String,
+    pub status: PhaseRunStatus,
+    pub status_text: Option<String>,
+    pub reason: Option<String>,
+    pub comment_count: usize,
+}
+
+/// Returns the logical CPU count on the host (minimum `1`).
+pub fn system_cpu_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+/// Returns the maximum allowed review agent parallelism for `cpu_count` (`1` when `< 4` cores, else `cpu_count - 2`).
+pub fn max_parallelism_limit(cpu_count: usize) -> usize {
+    if cpu_count < 4 { 1 } else { cpu_count - 2 }
+}
+
+/// Returns the default review agent parallelism (`1` when `< 4` cores, else `(cpu_count / 2).clamp(1, cpu_count - 2)`).
+pub fn default_parallelism(cpu_count: usize) -> usize {
+    if cpu_count < 4 {
+        1
+    } else {
+        (cpu_count / 2).clamp(1, cpu_count - 2)
+    }
+}
+
+/// Resolves effective parallelism from optional override/settings within host limits.
+pub fn resolve_effective_parallelism(
+    preferred: Option<usize>,
+    settings_limit: Option<usize>,
+    cpu_count: usize,
+) -> usize {
+    if cpu_count < 4 {
+        return 1;
+    }
+    let limit = max_parallelism_limit(cpu_count);
+    if let Some(val) = preferred.or(settings_limit) {
+        if (1..=limit).contains(&val) {
+            return val;
+        }
+    }
+    default_parallelism(cpu_count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn concurrency_helpers_enforce_bounds_and_defaults() {
+        assert_eq!(max_parallelism_limit(1), 1);
+        assert_eq!(max_parallelism_limit(2), 1);
+        assert_eq!(max_parallelism_limit(3), 1);
+        assert_eq!(max_parallelism_limit(4), 2);
+        assert_eq!(max_parallelism_limit(12), 10);
+
+        assert_eq!(default_parallelism(2), 1);
+        assert_eq!(default_parallelism(4), 2);
+        assert_eq!(default_parallelism(8), 4);
+        assert_eq!(default_parallelism(9), 4);
+
+        assert_eq!(resolve_effective_parallelism(Some(5), Some(3), 2), 1);
+        assert_eq!(resolve_effective_parallelism(Some(5), Some(3), 8), 5);
+        assert_eq!(resolve_effective_parallelism(Some(0), Some(3), 8), 4);
+        assert_eq!(resolve_effective_parallelism(Some(99), Some(3), 8), 4);
+        assert_eq!(resolve_effective_parallelism(None, Some(3), 8), 3);
+        assert_eq!(resolve_effective_parallelism(None, Some(10), 8), 4);
+        assert_eq!(resolve_effective_parallelism(None, None, 8), 4);
+    }
+
+    #[test]
+    fn review_persona_deserializes_guidelines_and_content_alias() {
+        let with_guidelines: ReviewPersona =
+            serde_json::from_str(r#"{"name":"Security","guidelines":"Check auth boundaries."}"#)
+                .expect("guidelines json");
+        assert_eq!(with_guidelines.name, "Security");
+        assert_eq!(with_guidelines.guidelines, "Check auth boundaries.");
+
+        let with_content: ReviewPersona =
+            serde_json::from_str(r#"{"name":"Perf","content":"Watch allocations."}"#)
+                .expect("content alias json");
+        assert_eq!(with_content.name, "Perf");
+        assert_eq!(with_content.guidelines, "Watch allocations.");
+    }
 }

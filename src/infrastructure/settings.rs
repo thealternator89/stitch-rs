@@ -141,6 +141,15 @@ impl SettingsStore {
 
         settings.prompts.story_elaborator.general =
             settings.prompts.story_elaborator.general.trim().to_string();
+
+        for persona in &mut settings.pr_reviewer.personas {
+            persona.name = persona.name.trim().to_string();
+            persona.guidelines = persona
+                .guidelines
+                .replace(['\r', '\n'], " ")
+                .trim()
+                .to_string();
+        }
     }
 
     /// Loads `AppSettings` from disk and reads `copilot_token` from the OS Keychain.

@@ -11,13 +11,14 @@ use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Sizable as _, Size, WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement,
+    AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement,
     ParentElement as _, PathPromptOptions, Render, StatefulInteractiveElement as _, Styled as _,
     Subscription, Window, div, hsla, prelude::FluentBuilder as _, px,
 };
 
 use crate::app_state::{ActiveView, AppState, refresh_copilot_status};
 use crate::features::settings::connectors::ConnectorsSettingsView;
+use crate::features::settings::pr_reviewer::PrReviewerSettingsView;
 use crate::features::settings::prompts::PromptsSettingsView;
 use crate::infrastructure::git::GitService;
 use crate::infrastructure::runtime::spawn_tokio;
@@ -86,6 +87,7 @@ pub struct SettingsView {
     active_tab: SettingsTab,
     connectors_view: Entity<ConnectorsSettingsView>,
     prompts_view: Entity<PromptsSettingsView>,
+    pr_reviewer_view: Entity<PrReviewerSettingsView>,
     worktree_dir_input: Entity<InputState>,
     copilot_token_input: Entity<InputState>,
     default_model_dropdown: Entity<ModelDropdown>,
@@ -172,6 +174,9 @@ impl SettingsView {
         let prompts_view = cx.new(|cx| {
             PromptsSettingsView::new(app_state.clone(), initial_settings, window, cx)
         });
+        let pr_reviewer_view = cx.new(|cx| {
+            PrReviewerSettingsView::new(app_state.clone(), initial_settings, window, cx)
+        });
 
         let mut view = Self {
             app_state,
@@ -179,6 +184,7 @@ impl SettingsView {
             active_tab: SettingsTab::default(),
             connectors_view,
             prompts_view,
+            pr_reviewer_view,
             worktree_dir_input,
             copilot_token_input,
             default_model_dropdown,
@@ -1250,54 +1256,6 @@ impl SettingsView {
                     }),
             )
     }
-
-    fn render_placeholder_tab(
-        &self,
-        title: &'static str,
-        phase: &'static str,
-        description: &'static str,
-        cx: &App,
-    ) -> impl IntoElement {
-        let theme = cx.theme();
-
-        v_flex()
-            .gap_4()
-            .max_w(px(640.))
-            .p_6()
-            .rounded(theme.radius_lg)
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.sidebar)
-            .child(
-                h_flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_base()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .px_2p5()
-                            .py_1()
-                            .rounded(theme.radius)
-                            .bg(theme.secondary)
-                            .border_1()
-                            .border_color(theme.border)
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(phase),
-                    ),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child(description),
-            )
-    }
 }
 
 impl Render for SettingsView {
@@ -1316,14 +1274,7 @@ impl Render for SettingsView {
             SettingsTab::Connectors => self.connectors_view.clone().into_any_element(),
             SettingsTab::Copilot => self.render_copilot_tab(cx).into_any_element(),
             SettingsTab::Prompts => self.prompts_view.clone().into_any_element(),
-            SettingsTab::PrReviewer => self
-                .render_placeholder_tab(
-                    "PR Reviewer Settings",
-                    "Scheduled for Phase 10",
-                    "Configure up to 5 custom review personas and default parallel review worker concurrency.",
-                    cx,
-                )
-                .into_any_element(),
+            SettingsTab::PrReviewer => self.pr_reviewer_view.clone().into_any_element(),
         };
 
         v_flex()

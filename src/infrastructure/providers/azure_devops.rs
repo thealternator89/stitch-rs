@@ -11,7 +11,10 @@ use crate::infrastructure::providers::{
     CodeReviewProvider, IssueTrackerProvider, build_http_client, ensure_success,
     ensure_success_json, strip_git_suffix,
 };
-use crate::types::{ParsedPrUrl, ParsedRemoteUrl, PrHostType, PrMetadata, PrSearchType, TicketData};
+use crate::types::{
+    ParsedPrUrl, ParsedRemoteUrl, PostPrCommentRequest, PrHostType, PrMetadata, PrSearchType,
+    ReviewCommentType, TicketData,
+};
 
 const API_VERSION: &str = "7.1";
 
@@ -557,6 +560,56 @@ fn build_ado_api_url(
     Ok(url)
 }
 
+/// Formats an Azure DevOps Pull Request comment thread payload (general or right-side file line).
+pub(crate) fn build_ado_pr_thread_payload(comment: &PostPrCommentRequest) -> serde_json::Value {
+    let content_with_disclaimer = format!(
+        "{}\n\n{}",
+        comment.comment,
+        get_attribution_statement(comment.edited)
+    );
+    let mut thread = json!({
+        "comments": [
+            {
+                "parentCommentId": 0,
+                "content": content_with_disclaimer,
+                "commentType": 1
+            }
+        ],
+        "status": 1
+    });
+
+    if comment.comment_type == ReviewCommentType::Line {
+        if let (Some(raw_file), Some(line)) = (
+            comment
+                .file
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty()),
+            comment.line.filter(|&l| l >= 1),
+        ) {
+            let normalized = raw_file.replace('\\', "/");
+            let formatted_path = if normalized.starts_with('/') {
+                normalized
+            } else {
+                format!("/{normalized}")
+            };
+            thread["threadContext"] = json!({
+                "filePath": formatted_path,
+                "rightFileStart": {
+                    "line": line,
+                    "offset": 1
+                },
+                "rightFileEnd": {
+                    "line": line + 1,
+                    "offset": 1
+                }
+            });
+        }
+    }
+
+    thread
+}
+
 /// REST client for Azure DevOps Git Pull Requests (`_apis/git`).
 pub struct AzureDevOpsCodeReviewClient {
     client: reqwest::Client,
@@ -648,6 +701,74 @@ impl AzureDevOpsCodeReviewClient {
             host_type: PrHostType::Azure,
             url: web_url,
         }
+    }
+
+    fn resolve_org_project_pr(
+        &self,
+        pr_url_or_id: &str,
+        remote_url: Option<&str>,
+    ) -> anyhow::Result<(String, String, u64)> {
+        let trimmed = pr_url_or_id.trim();
+        let mut org = self.org.clone();
+        let mut project = self.default_project.clone();
+
+        let pr_number = if let Some(parsed) = self.parse_pr_url(trimmed) {
+            org = parsed.org;
+            project = parsed.project;
+            parsed.pr_number
+        } else {
+            let num: u64 = trimmed.parse().map_err(|_| {
+                anyhow::anyhow!("Invalid Pull Request URL or ID format: \"{trimmed}\"")
+            })?;
+            if let Some(remote) = remote_url.and_then(|u| self.parse_remote_url(u)) {
+                if org.is_empty() {
+                    org = remote.org;
+                }
+                if project.is_empty() {
+                    project = remote.project;
+                }
+            }
+            num
+        };
+
+        if org.trim().is_empty() {
+            anyhow::bail!(
+                "Azure DevOps Organization is not configured in settings and could not be detected from git remote."
+            );
+        }
+        if project.trim().is_empty() {
+            anyhow::bail!(
+                "Azure DevOps Project is not configured in settings and could not be detected from git remote."
+            );
+        }
+
+        Ok((org, project, pr_number))
+    }
+
+    async fn fetch_pr_raw(
+        &self,
+        org_url: &str,
+        project: &str,
+        pr_number: u64,
+    ) -> anyhow::Result<AdoPullRequest> {
+        let pr_str = pr_number.to_string();
+        let url = build_ado_api_url(
+            org_url,
+            &[project, "_apis", "git", "pullrequests", &pr_str],
+            &[],
+            true,
+        )?;
+
+        let response = self
+            .client
+            .get(url)
+            .header(reqwest::header::AUTHORIZATION, self.auth_header())
+            .header(reqwest::header::ACCEPT, "application/json")
+            .send()
+            .await
+            .map_err(|err| anyhow::anyhow!("Failed to fetch PR from Azure DevOps API: {err}"))?;
+
+        ensure_success_json(response, "Azure DevOps PR").await
     }
 }
 
@@ -771,59 +892,12 @@ impl CodeReviewProvider for AzureDevOpsCodeReviewClient {
             anyhow::bail!("Azure DevOps Personal Access Token is required.");
         }
 
-        let trimmed = pr_url_or_id.trim();
-        let mut org = self.org.clone();
-        let mut project = self.default_project.clone();
-
-        let pr_number = if let Some(parsed) = self.parse_pr_url(trimmed) {
-            org = parsed.org;
-            project = parsed.project;
-            parsed.pr_number
-        } else {
-            let num: u64 = trimmed.parse().map_err(|_| {
-                anyhow::anyhow!("Invalid Pull Request URL or ID format: \"{trimmed}\"")
-            })?;
-            if let Some(remote) = remote_url.and_then(|u| self.parse_remote_url(u)) {
-                if org.is_empty() {
-                    org = remote.org;
-                }
-                if project.is_empty() {
-                    project = remote.project;
-                }
-            }
-            num
-        };
-
-        if org.trim().is_empty() {
-            anyhow::bail!(
-                "Azure DevOps Organization is not configured in settings and could not be detected from git remote."
-            );
-        }
-        if project.trim().is_empty() {
-            anyhow::bail!(
-                "Azure DevOps Project is not configured in settings and could not be detected from git remote."
-            );
-        }
-
+        let (org, project, pr_number) = self.resolve_org_project_pr(pr_url_or_id, remote_url)?;
         let org_url = AzureDevOpsClient::normalize_org_url(&org);
-        let pr_str = pr_number.to_string();
-        let url = build_ado_api_url(
-            &org_url,
-            &[project.trim(), "_apis", "git", "pullrequests", &pr_str],
-            &[],
-            true,
-        )?;
+        let pr = self
+            .fetch_pr_raw(&org_url, project.trim(), pr_number)
+            .await?;
 
-        let response = self
-            .client
-            .get(url)
-            .header(reqwest::header::AUTHORIZATION, self.auth_header())
-            .header(reqwest::header::ACCEPT, "application/json")
-            .send()
-            .await
-            .map_err(|err| anyhow::anyhow!("Failed to fetch PR from Azure DevOps API: {err}"))?;
-
-        let pr: AdoPullRequest = ensure_success_json(response, "Azure DevOps PR").await?;
         if pr
             .target_ref_name
             .as_deref()
@@ -955,6 +1029,136 @@ impl CodeReviewProvider for AzureDevOpsCodeReviewClient {
             .map(|id| id.trim().to_string())
             .filter(|id| !id.is_empty())
             .collect())
+    }
+
+    async fn post_pr_comment(
+        &self,
+        pr_url_or_id: &str,
+        comment: &PostPrCommentRequest,
+        remote_url: Option<&str>,
+    ) -> anyhow::Result<()> {
+        if self.pat.is_empty() {
+            anyhow::bail!("Azure DevOps Personal Access Token is required.");
+        }
+
+        let (org, project, pr_number) = self.resolve_org_project_pr(pr_url_or_id, remote_url)?;
+        let org_url = AzureDevOpsClient::normalize_org_url(&org);
+        let project_trimmed = project.trim();
+        let pr_details = self.fetch_pr_raw(&org_url, project_trimmed, pr_number).await?;
+        let repo_id = pr_details
+            .repository
+            .as_ref()
+            .and_then(|r| r.id.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("Pull Request #{pr_number} is missing repository ID.")
+            })?;
+
+        let pr_str = pr_number.to_string();
+
+        if let Some(thread_id) = comment.thread_id {
+            let thread_str = thread_id.to_string();
+            let content_with_disclaimer = format!(
+                "{}\n\n{}",
+                comment.comment,
+                get_attribution_statement(comment.edited)
+            );
+
+            let reply_url = build_ado_api_url(
+                &org_url,
+                &[
+                    project_trimmed,
+                    "_apis",
+                    "git",
+                    "repositories",
+                    repo_id,
+                    "pullRequests",
+                    &pr_str,
+                    "threads",
+                    &thread_str,
+                    "comments",
+                ],
+                &[],
+                true,
+            )?;
+
+            let reply_resp = self
+                .client
+                .post(reply_url)
+                .header(reqwest::header::AUTHORIZATION, self.auth_header())
+                .header(reqwest::header::ACCEPT, "application/json")
+                .json(&json!({
+                    "parentCommentId": 1,
+                    "content": content_with_disclaimer,
+                    "commentType": 1
+                }))
+                .send()
+                .await
+                .map_err(|err| {
+                    anyhow::anyhow!("Failed to reply to comment thread #{thread_id}: {err}")
+                })?;
+            ensure_success(reply_resp, "Azure DevOps PR thread reply").await?;
+
+            let thread_url = build_ado_api_url(
+                &org_url,
+                &[
+                    project_trimmed,
+                    "_apis",
+                    "git",
+                    "repositories",
+                    repo_id,
+                    "pullRequests",
+                    &pr_str,
+                    "threads",
+                    &thread_str,
+                ],
+                &[],
+                true,
+            )?;
+
+            let reactivate_resp = self
+                .client
+                .patch(thread_url)
+                .header(reqwest::header::AUTHORIZATION, self.auth_header())
+                .header(reqwest::header::ACCEPT, "application/json")
+                .json(&json!({ "status": 1 }))
+                .send()
+                .await
+                .map_err(|err| {
+                    anyhow::anyhow!("Failed to reactivate comment thread #{thread_id}: {err}")
+                })?;
+            ensure_success(reactivate_resp, "Azure DevOps PR thread reactivation").await?;
+            return Ok(());
+        }
+
+        let payload = build_ado_pr_thread_payload(comment);
+        let url = build_ado_api_url(
+            &org_url,
+            &[
+                project_trimmed,
+                "_apis",
+                "git",
+                "repositories",
+                repo_id,
+                "pullRequests",
+                &pr_str,
+                "threads",
+            ],
+            &[],
+            true,
+        )?;
+
+        let response = self
+            .client
+            .post(url)
+            .header(reqwest::header::AUTHORIZATION, self.auth_header())
+            .header(reqwest::header::ACCEPT, "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|err| anyhow::anyhow!("Failed to create comment thread: {err}"))?;
+        ensure_success(response, "Azure DevOps PR comment thread").await
     }
 }
 
@@ -1249,5 +1453,43 @@ mod tests {
         let wi: AdoPrWorkItemsResponse = serde_json::from_str(wi_json).expect("workitems");
         let ids: Vec<_> = wi.value.into_iter().filter_map(|w| w.id).collect();
         assert_eq!(ids, vec!["101", "205"]);
+    }
+
+    #[test]
+    fn build_ado_pr_thread_payload_formats_general_and_line_threads() {
+        let general = PostPrCommentRequest {
+            comment_type: ReviewCommentType::General,
+            file: None,
+            line: None,
+            comment: "Consider splitting this module.".to_string(),
+            edited: false,
+            thread_id: None,
+        };
+        let general_json = build_ado_pr_thread_payload(&general);
+        assert_eq!(general_json["status"], 1);
+        assert!(general_json.get("threadContext").is_none());
+        let general_content = general_json["comments"][0]["content"].as_str().unwrap();
+        assert!(general_content.starts_with("Consider splitting this module.\n\n"));
+        assert!(general_content.contains("> Generated with "));
+
+        let line = PostPrCommentRequest {
+            comment_type: ReviewCommentType::Line,
+            file: Some(r"src\auth\login.rs".to_string()),
+            line: Some(42),
+            comment: "Avoid unwrapping token here.".to_string(),
+            edited: true,
+            thread_id: None,
+        };
+        let line_json = build_ado_pr_thread_payload(&line);
+        let line_content = line_json["comments"][0]["content"].as_str().unwrap();
+        assert!(line_content.contains("> Assisted by "));
+        assert_eq!(
+            line_json["threadContext"]["filePath"],
+            "/src/auth/login.rs"
+        );
+        assert_eq!(line_json["threadContext"]["rightFileStart"]["line"], 42);
+        assert_eq!(line_json["threadContext"]["rightFileStart"]["offset"], 1);
+        assert_eq!(line_json["threadContext"]["rightFileEnd"]["line"], 43);
+        assert_eq!(line_json["threadContext"]["rightFileEnd"]["offset"], 1);
     }
 }

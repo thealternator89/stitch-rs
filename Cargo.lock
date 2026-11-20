@@ -6367,6 +6367,7 @@ dependencies = [
  "chrono",
  "directories",
  "github-copilot-sdk",
+ "globset",
  "gpui-kit",
  "keyring",
  "reqwest",

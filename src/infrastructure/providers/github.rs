@@ -10,7 +10,10 @@ use crate::infrastructure::providers::{
     CodeReviewProvider, IssueTrackerProvider, build_http_client, ensure_success,
     ensure_success_json, strip_git_suffix,
 };
-use crate::types::{ParsedPrUrl, ParsedRemoteUrl, PrHostType, PrMetadata, PrSearchType, TicketData};
+use crate::types::{
+    ParsedPrUrl, ParsedRemoteUrl, PostPrCommentRequest, PrHostType, PrMetadata, PrSearchType,
+    ReviewCommentType, TicketData,
+};
 
 const GITHUB_API_BASE: &str = "https://api.github.com";
 const GITHUB_API_VERSION: &str = "2022-11-28";
@@ -428,6 +431,8 @@ struct GitHubPrBranch {
     #[serde(rename = "ref", default)]
     ref_name: String,
     #[serde(default)]
+    sha: Option<String>,
+    #[serde(default)]
     repo: Option<GitHubPrRepo>,
 }
 
@@ -491,6 +496,37 @@ pub fn extract_github_linked_issue_numbers(body: &str) -> Vec<String> {
     }
 
     result
+}
+
+/// Formats a GitHub Pull Request review line-comment payload anchored on the right side.
+pub(crate) fn build_github_line_comment_payload(
+    body: &str,
+    commit_id: &str,
+    file: &str,
+    line: usize,
+) -> serde_json::Value {
+    let normalized = file.trim().replace('\\', "/");
+    let formatted_path = normalized.trim_start_matches('/');
+    serde_json::json!({
+        "body": body,
+        "commit_id": commit_id,
+        "path": formatted_path,
+        "line": line,
+        "side": "RIGHT"
+    })
+}
+
+fn build_github_api_url(segments: &[&str]) -> anyhow::Result<Url> {
+    let mut url = Url::parse(GITHUB_API_BASE)?;
+    {
+        let mut path_segments = url
+            .path_segments_mut()
+            .map_err(|()| anyhow::anyhow!("Invalid GitHub API base URL"))?;
+        for seg in segments {
+            path_segments.push(seg);
+        }
+    }
+    Ok(url)
 }
 
 /// REST client for GitHub Pull Requests (`api.github.com`).
@@ -621,18 +657,7 @@ impl CodeReviewProvider for GitHubCodeReviewClient {
         let (owner, repo_name, pr_number) =
             self.resolve_owner_repo_and_number(pr_url_or_id, remote_url)?;
         let pr_str = pr_number.to_string();
-
-        let mut url = Url::parse(GITHUB_API_BASE)?;
-        {
-            let mut segs = url
-                .path_segments_mut()
-                .map_err(|()| anyhow::anyhow!("Invalid GitHub API base URL"))?;
-            segs.push("repos")
-                .push(&owner)
-                .push(&repo_name)
-                .push("pulls")
-                .push(&pr_str);
-        }
+        let url = build_github_api_url(&["repos", &owner, &repo_name, "pulls", &pr_str])?;
 
         let response = self
             .client
@@ -761,18 +786,7 @@ impl CodeReviewProvider for GitHubCodeReviewClient {
             return Ok(Vec::new());
         };
         let pr_str = pr_number.to_string();
-
-        let mut url = Url::parse(GITHUB_API_BASE)?;
-        {
-            let mut segs = url
-                .path_segments_mut()
-                .map_err(|()| anyhow::anyhow!("Invalid GitHub API base URL"))?;
-            segs.push("repos")
-                .push(&owner)
-                .push(&repo_name)
-                .push("pulls")
-                .push(&pr_str);
-        }
+        let url = build_github_api_url(&["repos", &owner, &repo_name, "pulls", &pr_str])?;
 
         let Ok(response) = self.client.get(url).headers(self.headers()?).send().await else {
             return Ok(Vec::new());
@@ -780,9 +794,118 @@ impl CodeReviewProvider for GitHubCodeReviewClient {
         let Ok(pr) = ensure_success_json::<GitHubPullRequest>(response, "GitHub PR").await else {
             return Ok(Vec::new());
         };
-        Ok(extract_github_linked_issue_numbers(
-            pr.body.as_deref().unwrap_or(""),
-        ))
+        Ok(
+            extract_github_linked_issue_numbers(pr.body.as_deref().unwrap_or(""))
+                .into_iter()
+                .map(|num| format!("{owner}/{repo_name}/{num}"))
+                .collect(),
+        )
+    }
+
+    async fn post_pr_comment(
+        &self,
+        pr_url_or_id: &str,
+        comment: &PostPrCommentRequest,
+        remote_url: Option<&str>,
+    ) -> anyhow::Result<()> {
+        if self.token.is_empty() {
+            anyhow::bail!("GitHub Personal Access Token is required.");
+        }
+
+        let (owner, repo_name, pr_number) =
+            self.resolve_owner_repo_and_number(pr_url_or_id, remote_url)?;
+        let pr_str = pr_number.to_string();
+        let body = format!(
+            "{}\n\n{}",
+            comment.comment,
+            get_attribution_statement(comment.edited)
+        );
+
+        let response = if let Some(thread_id) = comment.thread_id {
+            let thread_str = thread_id.to_string();
+            let url = build_github_api_url(&[
+                "repos",
+                &owner,
+                &repo_name,
+                "pulls",
+                &pr_str,
+                "comments",
+                &thread_str,
+                "replies",
+            ])?;
+            self.client
+                .post(url)
+                .headers(self.headers()?)
+                .json(&serde_json::json!({ "body": body }))
+                .send()
+                .await
+                .map_err(|err| {
+                    anyhow::anyhow!("Failed to reply to GitHub PR comment #{thread_id}: {err}")
+                })?
+        } else if comment.comment_type == ReviewCommentType::Line
+            && comment
+                .file
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|s| !s.is_empty())
+            && comment.line.is_some_and(|l| l >= 1)
+        {
+            let file = comment.file.as_deref().unwrap_or("");
+            let line = comment.line.unwrap_or(1);
+            let pr_url = build_github_api_url(&["repos", &owner, &repo_name, "pulls", &pr_str])?;
+            let pr_resp = self
+                .client
+                .get(pr_url)
+                .headers(self.headers()?)
+                .send()
+                .await
+                .map_err(|err| anyhow::anyhow!("Failed to fetch GitHub PR head SHA: {err}"))?;
+            let pr_details: GitHubPullRequest =
+                ensure_success_json(pr_resp, "GitHub PR").await?;
+            let commit_id = pr_details
+                .head
+                .and_then(|h| h.sha)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Could not resolve latest commit SHA for the PR.")
+                })?;
+
+            let payload = build_github_line_comment_payload(&body, &commit_id, file, line);
+            let url = build_github_api_url(&[
+                "repos",
+                &owner,
+                &repo_name,
+                "pulls",
+                &pr_str,
+                "comments",
+            ])?;
+            self.client
+                .post(url)
+                .headers(self.headers()?)
+                .json(&payload)
+                .send()
+                .await
+                .map_err(|err| anyhow::anyhow!("Failed to post GitHub PR line comment: {err}"))?
+        } else {
+            let url = build_github_api_url(&[
+                "repos",
+                &owner,
+                &repo_name,
+                "issues",
+                &pr_str,
+                "comments",
+            ])?;
+            self.client
+                .post(url)
+                .headers(self.headers()?)
+                .json(&serde_json::json!({ "body": body }))
+                .send()
+                .await
+                .map_err(|err| anyhow::anyhow!("Failed to post GitHub PR comment: {err}"))?
+        };
+
+        ensure_success(response, "GitHub PR comment").await
     }
 }
 
@@ -923,5 +1046,20 @@ mod tests {
             extract_github_linked_issue_numbers(body),
             vec!["12".to_string(), "45".to_string()]
         );
+    }
+
+    #[test]
+    fn build_github_line_comment_payload_strips_leading_slash_and_sets_right_side() {
+        let payload = build_github_line_comment_payload(
+            "Check bounds here.",
+            "abc123def",
+            r"/src\api\handler.rs",
+            19,
+        );
+        assert_eq!(payload["body"], "Check bounds here.");
+        assert_eq!(payload["commit_id"], "abc123def");
+        assert_eq!(payload["path"], "src/api/handler.rs");
+        assert_eq!(payload["line"], 19);
+        assert_eq!(payload["side"], "RIGHT");
     }
 }

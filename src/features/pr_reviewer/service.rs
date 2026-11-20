@@ -1,12 +1,31 @@
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::collections::{HashMap, HashSet};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use tokio::sync::Mutex;
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
+use tokio::sync::{Mutex, mpsc, watch};
+use tokio::task::JoinSet;
 
+use crate::features::pr_reviewer::phase_loader::load_phases_from_disk;
+use crate::features::pr_reviewer::prompts::build_phase_review_prompt;
+use crate::infrastructure::copilot::{
+    CopilotService, SessionOptions, StreamError, StreamEvent, create_report_intent_tool,
+    create_request_documentation_tool, resolve_model_override,
+};
 use crate::infrastructure::git::GitService;
-use crate::infrastructure::providers::CodeReviewProvider;
-use crate::types::{AppSettings, PrDiffFile};
+use crate::infrastructure::providers::{
+    build_code_review_provider, build_documentation_provider, build_issue_tracker_provider,
+    discover_known_docs,
+};
+use crate::infrastructure::sleep_guard::SleepGuard;
+use crate::types::{
+    AppSettings, CodeContextLine, CopilotModelInfo, CopilotUsage, KnownDoc, PhaseUsage,
+    PostPrCommentRequest, PrDiffFile, PrHostType, PrMetadata, ReviewComment, ReviewCommentType,
+    ReviewPhase, TicketData, resolve_effective_parallelism, system_cpu_count,
+};
+
+const MAX_CONTEXT_LINES: usize = 25;
 
 /// Normalized repository path resolved from a user-selected directory or subdirectory.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +57,65 @@ impl std::fmt::Display for CheckoutError {
     }
 }
 
+/// Parameters for executing a parallel multi-phase PR code review.
+#[derive(Debug, Clone)]
+pub struct PrReviewRequest {
+    pub repo_path: PathBuf,
+    pub pr: PrMetadata,
+    pub enabled_phase_ids: Vec<String>,
+    pub model_override: String,
+    pub custom_instructions: String,
+    pub max_parallelism: Option<usize>,
+    pub persona_name: String,
+    pub settings: AppSettings,
+    pub available_models: Vec<CopilotModelInfo>,
+    pub skip_cleanup: bool,
+}
+
+/// Streaming progress, draft comment, and completion events from `PrReviewerService::review_pr`.
+#[derive(Debug, Clone)]
+pub enum PrReviewStreamEvent {
+    PhaseSkipped {
+        phase_id: String,
+        phase_title: String,
+        reason: String,
+    },
+    PhaseStarted {
+        phase_id: String,
+        phase_title: String,
+    },
+    PhaseStatus {
+        phase_id: String,
+        phase_title: String,
+        status: String,
+    },
+    Comment(ReviewComment),
+    PhaseCompleted {
+        phase_id: String,
+        phase_title: String,
+        comment_count: usize,
+    },
+    Finished {
+        comments: Vec<ReviewComment>,
+        usage: CopilotUsage,
+        cleaned_up: bool,
+    },
+    Cancelled {
+        cleaned_up: bool,
+    },
+    Error {
+        message: String,
+        cleaned_up: bool,
+    },
+}
+
+/// Result of parsing a single streamed JSONL line from a PR review phase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParsedReviewLine {
+    Status(String),
+    Comment(ReviewComment),
+}
+
 /// Verifies `selected` is inside a Git repository and normalizes it to the repository top-level root.
 pub async fn verify_repo_path(git: &GitService, selected: &Path) -> VerifiedRepoPath {
     if git.check_git_repo(selected).await {
@@ -65,20 +143,301 @@ fn canonical_or_raw(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// Manages PR repository checkout, worktree isolation, and ref restoration.
+fn build_glob_set(patterns: &[String], label: &str) -> Option<GlobSet> {
+    if patterns.is_empty() {
+        return None;
+    }
+    let mut builder = GlobSetBuilder::new();
+    let mut added = 0usize;
+    for raw in patterns {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match GlobBuilder::new(trimmed).literal_separator(true).build() {
+            Ok(glob) => {
+                builder.add(glob);
+                added += 1;
+            }
+            Err(err) => {
+                eprintln!("Warning: invalid {label} glob '{trimmed}': {err}");
+            }
+        }
+    }
+    if added == 0 {
+        return None;
+    }
+    match builder.build() {
+        Ok(set) => Some(set),
+        Err(err) => {
+            eprintln!("Warning: failed to compile {label} globset: {err}");
+            None
+        }
+    }
+}
+
+/// Filters diff files using optional `include` and `exclude` glob patterns (matching dotfiles).
+pub fn filter_phase_files(
+    files: &[PrDiffFile],
+    include: &[String],
+    exclude: &[String],
+) -> Vec<PrDiffFile> {
+    let include_set = build_glob_set(include, "include");
+    let exclude_set = build_glob_set(exclude, "exclude");
+
+    files
+        .iter()
+        .filter(|file| {
+            let normalized = file.path.replace('\\', "/");
+            if let Some(ref inc) = include_set {
+                if !inc.is_match(&normalized) {
+                    return false;
+                }
+            }
+            if let Some(ref exc) = exclude_set {
+                if exc.is_match(&normalized) {
+                    return false;
+                }
+            }
+            true
+        })
+        .cloned()
+        .collect()
+}
+
+/// Safely reads `[target_line - context_size ..= target_line + context_size]` from a repository file,
+/// blocking path traversal and leading-root paths.
+pub fn extract_file_context(
+    repo_path: &Path,
+    file_path: &str,
+    target_line: usize,
+    context_size: usize,
+) -> Option<Vec<CodeContextLine>> {
+    if target_line == 0 {
+        return None;
+    }
+
+    let normalized = file_path.trim().replace('\\', "/");
+    let stripped = normalized.trim_start_matches("./").trim_start_matches('/');
+    if stripped.is_empty() {
+        return None;
+    }
+
+    let rel = Path::new(stripped);
+    for comp in rel.components() {
+        if matches!(
+            comp,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        ) {
+            return None;
+        }
+    }
+
+    let full_path = repo_path.join(rel);
+    let canon_repo = std::fs::canonicalize(repo_path).ok()?;
+    let canon_full = std::fs::canonicalize(&full_path).ok()?;
+    if !canon_full.starts_with(&canon_repo) {
+        return None;
+    }
+
+    let content = std::fs::read_to_string(&canon_full).ok()?;
+    let all_lines: Vec<&str> = content
+        .split('\n')
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .collect();
+
+    if all_lines.is_empty() {
+        return None;
+    }
+
+    let clamped_context = context_size.min(MAX_CONTEXT_LINES);
+    let start_line = target_line.saturating_sub(clamped_context).max(1);
+    let end_line = target_line
+        .saturating_add(clamped_context)
+        .min(all_lines.len());
+    if start_line > end_line {
+        return None;
+    }
+
+    Some(
+        (start_line..=end_line)
+            .map(|ln| CodeContextLine {
+                line: ln,
+                text: all_lines[ln - 1].to_string(),
+                is_target: ln == target_line,
+            })
+            .collect(),
+    )
+}
+
+/// Parses a streamed JSONL object emitted during a PR review phase and enriches line comments with code context.
+pub fn parse_review_jsonl_line(
+    line: &str,
+    phase_id: &str,
+    phase_title: &str,
+    comment_id: &str,
+    effective_repo_path: &Path,
+) -> Option<ParsedReviewLine> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with("```") {
+        return None;
+    }
+
+    let val: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    let kind = val.get("type").and_then(|v| v.as_str())?.trim();
+
+    match kind {
+        "status" => {
+            let status_text = val
+                .get("status")
+                .or_else(|| val.get("text"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())?;
+            Some(ParsedReviewLine::Status(status_text.to_string()))
+        }
+        "general" => {
+            let comment = val
+                .get("comment")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())?
+                .to_string();
+            Some(ParsedReviewLine::Comment(ReviewComment {
+                id: comment_id.to_string(),
+                comment_type: ReviewCommentType::General,
+                file: None,
+                line: None,
+                context: None,
+                comment,
+                phase: Some(phase_title.to_string()),
+                phase_id: Some(phase_id.to_string()),
+                code_lines: None,
+                posted: false,
+            }))
+        }
+        "line" => {
+            let comment = val
+                .get("comment")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())?
+                .to_string();
+            let file = val
+                .get("file")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let target_line = val
+                .get("line")
+                .and_then(|v| v.as_u64())
+                .and_then(|n| usize::try_from(n).ok())
+                .filter(|&n| n >= 1);
+            let context_size = val
+                .get("context")
+                .and_then(|v| v.as_u64())
+                .and_then(|n| usize::try_from(n).ok());
+
+            let code_lines = match (file.as_deref(), target_line) {
+                (Some(f), Some(ln)) => {
+                    extract_file_context(effective_repo_path, f, ln, context_size.unwrap_or(0))
+                }
+                _ => None,
+            };
+
+            Some(ParsedReviewLine::Comment(ReviewComment {
+                id: comment_id.to_string(),
+                comment_type: ReviewCommentType::Line,
+                file,
+                line: target_line,
+                context: context_size,
+                comment,
+                phase: Some(phase_title.to_string()),
+                phase_id: Some(phase_id.to_string()),
+                code_lines,
+                posted: false,
+            }))
+        }
+        _ => None,
+    }
+}
+
+fn phase_attaches(phase: &ReviewPhase, target: &str) -> bool {
+    phase
+        .attach
+        .iter()
+        .any(|item| item.trim().eq_ignore_ascii_case(target))
+}
+
+fn resolve_model_display_name(raw_model: &str, available_models: &[CopilotModelInfo]) -> String {
+    let trimmed = raw_model.trim();
+    if trimmed.is_empty() {
+        return "Unknown".to_string();
+    }
+    available_models
+        .iter()
+        .find(|m| {
+            m.id.eq_ignore_ascii_case(trimmed) || m.name.eq_ignore_ascii_case(trimmed)
+        })
+        .map(|m| m.name.clone())
+        .unwrap_or_else(|| trimmed.to_string())
+}
+
+/// Manages PR repository checkout, worktree isolation, parallel phase reviews, and comment posting.
 pub struct PrReviewerService {
     git: Arc<GitService>,
+    copilot: Arc<CopilotService>,
     active_checkouts: Mutex<HashMap<PathBuf, String>>,
     active_worktrees: Mutex<HashMap<PathBuf, PathBuf>>,
 }
 
 impl PrReviewerService {
-    pub fn new(git: Arc<GitService>) -> Self {
+    pub fn new(git: Arc<GitService>, copilot: Arc<CopilotService>) -> Self {
         Self {
             git,
+            copilot,
             active_checkouts: Mutex::new(HashMap::new()),
             active_worktrees: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub async fn effective_repo_path(&self, repo_path: &Path) -> PathBuf {
+        let repo_root = self
+            .git
+            .get_repo_root(repo_path)
+            .await
+            .unwrap_or_else(|_| repo_path.to_path_buf());
+        let repo_key = canonical_or_raw(&repo_root);
+        let map = self.active_worktrees.lock().await;
+        map.get(&repo_key)
+            .or_else(|| map.get(repo_path))
+            .or_else(|| map.get(&repo_root))
+            .cloned()
+            .unwrap_or(repo_root)
+    }
+
+    pub async fn has_active_checkout(&self, repo_path: &Path) -> bool {
+        let repo_root = self
+            .git
+            .get_repo_root(repo_path)
+            .await
+            .unwrap_or_else(|_| repo_path.to_path_buf());
+        let repo_key = canonical_or_raw(&repo_root);
+
+        let has_wt = {
+            let map = self.active_worktrees.lock().await;
+            map.contains_key(&repo_key)
+                || map.contains_key(repo_path)
+                || map.contains_key(&repo_root)
+        };
+        if has_wt {
+            return true;
+        }
+        let map = self.active_checkouts.lock().await;
+        map.contains_key(&repo_key)
+            || map.contains_key(repo_path)
+            || map.contains_key(&repo_root)
     }
 
     pub async fn checkout_pr(
@@ -87,7 +446,7 @@ impl PrReviewerService {
         pr_number: u64,
         target_branch: &str,
         expected_repo_name: Option<&str>,
-        code_provider: Option<&dyn CodeReviewProvider>,
+        code_provider: Option<&dyn crate::infrastructure::providers::CodeReviewProvider>,
         settings: &AppSettings,
     ) -> Result<CheckoutResult, CheckoutError> {
         if !self.git.check_git_repo(repo_path).await {
@@ -103,7 +462,10 @@ impl PrReviewerService {
             .unwrap_or_else(|_| repo_path.to_path_buf());
         let repo_key = canonical_or_raw(&repo_root);
 
-        if let Some(expected) = expected_repo_name.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(expected) = expected_repo_name
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             if let (Some(provider), Some(remote_url)) =
                 (code_provider, self.git.get_remote_url(&repo_root).await)
             {
@@ -249,21 +611,571 @@ impl PrReviewerService {
 
         Ok(())
     }
+
+    async fn resolve_story_context(
+        &self,
+        req: &PrReviewRequest,
+        effective_repo_path: &Path,
+        doc_provider: Option<&Arc<dyn crate::infrastructure::providers::DocumentationProvider>>,
+    ) -> (String, Vec<KnownDoc>) {
+        let Ok(code_provider) = build_code_review_provider(&req.settings) else {
+            return (String::new(), Vec::new());
+        };
+
+        let remote_url = self.git.get_remote_url(effective_repo_path).await;
+        let pr_ref = if req.pr.host_type == PrHostType::GitHub {
+            req.pr.url.as_deref().unwrap_or(&req.pr.id)
+        } else {
+            req.pr.id.as_str()
+        };
+        let repo_hint = req.pr.repository_id.as_deref().or(remote_url.as_deref());
+
+        let work_item_refs = match code_provider.get_linked_tickets(pr_ref, repo_hint).await {
+            Ok(refs) => refs,
+            Err(err) => {
+                eprintln!("Warning: failed to retrieve associated work items: {err}");
+                return (String::new(), Vec::new());
+            }
+        };
+
+        if work_item_refs.is_empty() {
+            return (String::new(), Vec::new());
+        }
+
+        let issue_tracker = build_issue_tracker_provider(&req.settings).ok();
+        let mut stories = Vec::new();
+        let mut known_docs: Vec<KnownDoc> = Vec::new();
+        let mut seen_tickets = HashSet::new();
+
+        for raw_ref in work_item_refs {
+            let ref_id = raw_ref.trim().to_string();
+            if ref_id.is_empty() || !seen_tickets.insert(ref_id.clone()) {
+                continue;
+            }
+
+            let ticket = match issue_tracker.as_ref() {
+                Some(tracker) => match tracker.fetch_ticket(&ref_id).await {
+                    Ok(t) => t,
+                    Err(err) => {
+                        eprintln!("Warning: failed to fetch details for work item {ref_id}: {err}");
+                        continue;
+                    }
+                },
+                None => TicketData {
+                    id: Some(ref_id.clone()),
+                    title: format!("Work Item {ref_id}"),
+                    description: String::new(),
+                    acceptance_criteria: None,
+                },
+            };
+
+            stories.push(format!(
+                "Ticket ID: {}\nTitle: {}\nDescription: {}\nAcceptance Criteria: {}",
+                ticket.id.as_deref().unwrap_or("N/A"),
+                ticket.title,
+                ticket.description,
+                ticket.acceptance_criteria.as_deref().unwrap_or("N/A"),
+            ));
+
+            if let Some(doc_prov) = doc_provider {
+                let ac_text = ticket.acceptance_criteria.as_deref().unwrap_or("");
+                let discovered =
+                    discover_known_docs(doc_prov.as_ref(), &[&ticket.description, ac_text]).await;
+                for doc in discovered {
+                    if !known_docs.iter().any(|existing| existing.id == doc.id) {
+                        known_docs.push(doc);
+                    }
+                }
+            }
+        }
+
+        (stories.join("\n\n"), known_docs)
+    }
+
+    pub async fn review_pr(
+        &self,
+        req: PrReviewRequest,
+        cancel_rx: watch::Receiver<bool>,
+        tx: mpsc::UnboundedSender<PrReviewStreamEvent>,
+    ) {
+        let _sleep_guard = SleepGuard::acquire();
+
+        let outcome = self.execute_review_phases(&req, cancel_rx, &tx).await;
+
+        let should_cleanup = !req.skip_cleanup || outcome.is_error || outcome.was_cancelled;
+        let mut cleaned_up = false;
+        if should_cleanup {
+            match self.cleanup_checkout(&req.repo_path).await {
+                Ok(()) => cleaned_up = true,
+                Err(err) => eprintln!(
+                    "Warning: failed to automatically clean up checkout at {}: {err}",
+                    req.repo_path.display()
+                ),
+            }
+        }
+
+        if outcome.was_cancelled {
+            let _ = tx.send(PrReviewStreamEvent::Cancelled { cleaned_up });
+        } else if let Some(message) = outcome.error_message {
+            let _ = tx.send(PrReviewStreamEvent::Error {
+                message,
+                cleaned_up,
+            });
+        } else {
+            let usage = CopilotUsage {
+                input_tokens: outcome.total_input_tokens,
+                output_tokens: outcome.total_output_tokens,
+                cache_read_tokens: outcome.total_cache_read_tokens,
+                cost: outcome.total_cost,
+                model: None,
+                phases: Some(outcome.phase_usages),
+            };
+            let _ = tx.send(PrReviewStreamEvent::Finished {
+                comments: outcome.comments,
+                usage,
+                cleaned_up,
+            });
+        }
+    }
+
+    async fn execute_review_phases(
+        &self,
+        req: &PrReviewRequest,
+        cancel_rx: watch::Receiver<bool>,
+        tx: &mpsc::UnboundedSender<PrReviewStreamEvent>,
+    ) -> ReviewExecutionOutcome {
+        if *cancel_rx.borrow() {
+            return ReviewExecutionOutcome::cancelled();
+        }
+
+        if req.enabled_phase_ids.is_empty() {
+            return ReviewExecutionOutcome::error(
+                "No review phases selected. Please select at least one phase to start the review."
+                    .to_string(),
+            );
+        }
+
+        let phases = load_phases_from_disk();
+        if phases.is_empty() {
+            return ReviewExecutionOutcome::error(
+                "No custom review phases found on disk. Please configure them in ~/.stitch/pr-reviewer/phases"
+                    .to_string(),
+            );
+        }
+
+        let enabled_set: HashSet<&str> = req.enabled_phase_ids.iter().map(String::as_str).collect();
+        let enabled_phases: Vec<ReviewPhase> = phases
+            .into_iter()
+            .filter(|phase| enabled_set.contains(phase.id.as_str()))
+            .collect();
+
+        if enabled_phases.is_empty() {
+            return ReviewExecutionOutcome::error(
+                "None of the selected review phases were found on disk.".to_string(),
+            );
+        }
+
+        for phase in &enabled_phases {
+            if let Some(ref err) = phase.template_error {
+                return ReviewExecutionOutcome::error(err.clone());
+            }
+        }
+
+        let persona_guidelines = if !req.persona_name.trim().is_empty()
+            && !req.persona_name.trim().eq_ignore_ascii_case("none")
+        {
+            req.settings
+                .pr_reviewer
+                .personas
+                .iter()
+                .find(|p| p.name == req.persona_name)
+                .map(|p| p.guidelines.clone())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        let effective_repo_path = self.effective_repo_path(&req.repo_path).await;
+        let target_branch = if req.pr.target_branch.trim().is_empty() {
+            "main"
+        } else {
+            req.pr.target_branch.trim()
+        };
+        let diff_files = match self
+            .git
+            .get_diff_files(&effective_repo_path, target_branch)
+            .await
+        {
+            Ok(files) => files,
+            Err(err) => {
+                return ReviewExecutionOutcome::error(format!(
+                    "Failed to collect PR diff files: {err}"
+                ));
+            }
+        };
+
+        let doc_provider = build_documentation_provider(&req.settings).ok();
+        let any_phase_needs_story = enabled_phases
+            .iter()
+            .any(|phase| phase_attaches(phase, "story"));
+
+        let (linked_stories_content, known_docs) = if any_phase_needs_story {
+            self.resolve_story_context(req, &effective_repo_path, doc_provider.as_ref())
+                .await
+        } else {
+            (String::new(), Vec::new())
+        };
+
+        let mut active_tasks: Vec<(ReviewPhase, Vec<PrDiffFile>)> = Vec::new();
+        for phase in enabled_phases {
+            let eligible = filter_phase_files(&diff_files, &phase.include, &phase.exclude);
+            if eligible.is_empty() {
+                let _ = tx.send(PrReviewStreamEvent::PhaseSkipped {
+                    phase_id: phase.id.clone(),
+                    phase_title: phase.title.clone(),
+                    reason: "No matching files found".to_string(),
+                });
+                continue;
+            }
+            if phase_attaches(&phase, "story") && linked_stories_content.trim().is_empty() {
+                let _ = tx.send(PrReviewStreamEvent::PhaseSkipped {
+                    phase_id: phase.id.clone(),
+                    phase_title: phase.title.clone(),
+                    reason: "No linked stories found for this Pull Request".to_string(),
+                });
+                continue;
+            }
+            active_tasks.push((phase, eligible));
+        }
+
+        if active_tasks.is_empty() {
+            return ReviewExecutionOutcome::default();
+        }
+
+        let worker_count = resolve_effective_parallelism(
+            req.max_parallelism,
+            req.settings.max_parallelism,
+            system_cpu_count(),
+        )
+        .min(active_tasks.len())
+        .max(1);
+
+        let tasks = Arc::new(active_tasks);
+        let queue_cursor = Arc::new(AtomicUsize::new(0));
+        let comment_counter = Arc::new(AtomicU64::new(1));
+        let comments_acc = Arc::new(Mutex::new(Vec::<ReviewComment>::new()));
+        let usages_acc = Arc::new(Mutex::new(Vec::<PhaseUsage>::new()));
+        let first_error = Arc::new(Mutex::new(None::<String>));
+        let was_cancelled = Arc::new(AtomicBool::new(false));
+        let linked_stories_arc = Arc::new(linked_stories_content);
+        let known_docs_arc = Arc::new(known_docs);
+        let persona_arc = Arc::new(persona_guidelines);
+        let custom_instructions_arc = Arc::new(req.custom_instructions.clone());
+        let pr_description_arc = Arc::new(req.pr.description.clone());
+        let available_models_arc = Arc::new(req.available_models.clone());
+
+        let mut join_set = JoinSet::new();
+
+        for _ in 0..worker_count {
+            let copilot = Arc::clone(&self.copilot);
+            let tasks = Arc::clone(&tasks);
+            let queue_cursor = Arc::clone(&queue_cursor);
+            let comment_counter = Arc::clone(&comment_counter);
+            let comments_acc = Arc::clone(&comments_acc);
+            let usages_acc = Arc::clone(&usages_acc);
+            let first_error = Arc::clone(&first_error);
+            let was_cancelled = Arc::clone(&was_cancelled);
+            let doc_provider = doc_provider.clone();
+            let linked_stories = Arc::clone(&linked_stories_arc);
+            let known_docs = Arc::clone(&known_docs_arc);
+            let persona = Arc::clone(&persona_arc);
+            let custom_instructions = Arc::clone(&custom_instructions_arc);
+            let pr_description = Arc::clone(&pr_description_arc);
+            let available_models = Arc::clone(&available_models_arc);
+            let settings = req.settings.clone();
+            let model_override = req.model_override.clone();
+            let effective_repo = effective_repo_path.clone();
+            let cancel_rx = cancel_rx.clone();
+            let tx = tx.clone();
+
+            join_set.spawn(async move {
+                loop {
+                    if *cancel_rx.borrow() {
+                        was_cancelled.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    if first_error.lock().await.is_some() {
+                        break;
+                    }
+
+                    let idx = queue_cursor.fetch_add(1, Ordering::Relaxed);
+                    let Some((phase, eligible_files)) = tasks.get(idx) else {
+                        break;
+                    };
+
+                    let _ = tx.send(PrReviewStreamEvent::PhaseStarted {
+                        phase_id: phase.id.clone(),
+                        phase_title: phase.title.clone(),
+                    });
+
+                    let attach_story = phase_attaches(phase, "story");
+                    let attach_description = phase_attaches(phase, "description");
+
+                    let mut tools = vec![create_report_intent_tool()];
+                    if attach_story {
+                        let tx_doc = tx.clone();
+                        let pid = phase.id.clone();
+                        let ptitle = phase.title.clone();
+                        let status_cb: Arc<dyn Fn(String) + Send + Sync> =
+                            Arc::new(move |status| {
+                                let _ = tx_doc.send(PrReviewStreamEvent::PhaseStatus {
+                                    phase_id: pid.clone(),
+                                    phase_title: ptitle.clone(),
+                                    status,
+                                });
+                            });
+                        tools.push(create_request_documentation_tool(
+                            doc_provider.clone(),
+                            status_cb,
+                        ));
+                    }
+
+                    let resolved_model = match phase
+                        .model
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        Some(m) => m.to_string(),
+                        None => resolve_model_override(&model_override, &settings.copilot_model),
+                    };
+
+                    let prompt = build_phase_review_prompt(
+                        eligible_files,
+                        &phase.title,
+                        &phase.body,
+                        &custom_instructions,
+                        if attach_description {
+                            &pr_description
+                        } else {
+                            ""
+                        },
+                        if attach_story { &linked_stories } else { "" },
+                        if attach_story { &known_docs } else { &[] },
+                        &persona,
+                    );
+
+                    let session = match copilot
+                        .create_session(SessionOptions {
+                            token: settings.copilot_token.clone(),
+                            model: Some(resolved_model.clone()),
+                            working_directory: Some(effective_repo.clone()),
+                            tools,
+                            available_tools: None,
+                            streaming: true,
+                            label: format!("PR Reviewer Phase: {}", phase.title),
+                        })
+                        .await
+                    {
+                        Ok(s) => s,
+                        Err(err) => {
+                            let mut err_guard = first_error.lock().await;
+                            if err_guard.is_none() {
+                                *err_guard = Some(err.to_string());
+                            }
+                            break;
+                        }
+                    };
+
+                    let mut phase_comments = Vec::new();
+                    let stream_res = CopilotService::send_and_collect_stream(
+                        &session,
+                        &prompt,
+                        cancel_rx.clone(),
+                        |event| match event {
+                            StreamEvent::Status(status) => {
+                                let _ = tx.send(PrReviewStreamEvent::PhaseStatus {
+                                    phase_id: phase.id.clone(),
+                                    phase_title: phase.title.clone(),
+                                    status,
+                                });
+                            }
+                            StreamEvent::JsonLine(line) => {
+                                let seq = comment_counter.fetch_add(1, Ordering::Relaxed);
+                                let comment_id = format!("raw-{seq}-{}", phase.id);
+                                match parse_review_jsonl_line(
+                                    &line,
+                                    &phase.id,
+                                    &phase.title,
+                                    &comment_id,
+                                    &effective_repo,
+                                ) {
+                                    Some(ParsedReviewLine::Status(status)) => {
+                                        let _ = tx.send(PrReviewStreamEvent::PhaseStatus {
+                                            phase_id: phase.id.clone(),
+                                            phase_title: phase.title.clone(),
+                                            status,
+                                        });
+                                    }
+                                    Some(ParsedReviewLine::Comment(comment)) => {
+                                        phase_comments.push(comment.clone());
+                                        let _ = tx.send(PrReviewStreamEvent::Comment(comment));
+                                    }
+                                    None => {}
+                                }
+                            }
+                        },
+                    )
+                    .await;
+
+                    let _ = session.disconnect().await;
+
+                    let comment_count = phase_comments.len();
+                    if !phase_comments.is_empty() {
+                        comments_acc.lock().await.extend(phase_comments);
+                    }
+
+                    match stream_res {
+                        Ok(usage) => {
+                            let raw_model = usage.model.clone().unwrap_or(resolved_model);
+                            let display_model =
+                                resolve_model_display_name(&raw_model, &available_models);
+                            usages_acc.lock().await.push(PhaseUsage {
+                                phase_title: phase.title.clone(),
+                                model: display_model,
+                                input_tokens: usage.input_tokens,
+                                output_tokens: usage.output_tokens,
+                                cache_read_tokens: usage.cache_read_tokens,
+                                cost: usage.cost,
+                                multiplier: usage.cost,
+                            });
+                            let _ = tx.send(PrReviewStreamEvent::PhaseCompleted {
+                                phase_id: phase.id.clone(),
+                                phase_title: phase.title.clone(),
+                                comment_count,
+                            });
+                        }
+                        Err(StreamError::Cancelled) => {
+                            was_cancelled.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                        Err(StreamError::Timeout(dur)) => {
+                            let mut err_guard = first_error.lock().await;
+                            if err_guard.is_none() {
+                                *err_guard = Some(format!(
+                                    "Phase '{}' timed out after {} seconds waiting for Copilot response.",
+                                    phase.title,
+                                    dur.as_secs()
+                                ));
+                            }
+                            break;
+                        }
+                        Err(StreamError::Other(err)) => {
+                            let mut err_guard = first_error.lock().await;
+                            if err_guard.is_none() {
+                                *err_guard = Some(err.to_string());
+                            }
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+
+        while let Some(res) = join_set.join_next().await {
+            if let Err(join_err) = res {
+                let mut err_guard = first_error.lock().await;
+                if err_guard.is_none() {
+                    *err_guard = Some(format!("Review worker failed: {join_err}"));
+                }
+            }
+        }
+
+        let phase_usages = usages_acc.lock().await.clone();
+        let total_input_tokens: u64 = phase_usages.iter().map(|p| p.input_tokens).sum();
+        let total_output_tokens: u64 = phase_usages.iter().map(|p| p.output_tokens).sum();
+        let total_cache_read_tokens: u64 = phase_usages.iter().map(|p| p.cache_read_tokens).sum();
+        let total_cost: f64 = phase_usages.iter().map(|p| p.cost).sum();
+        let comments = comments_acc.lock().await.clone();
+        let err_msg = first_error.lock().await.clone();
+        let cancelled = was_cancelled.load(Ordering::Relaxed);
+
+        ReviewExecutionOutcome {
+            comments,
+            phase_usages,
+            total_input_tokens,
+            total_output_tokens,
+            total_cache_read_tokens,
+            total_cost,
+            is_error: err_msg.is_some(),
+            error_message: err_msg,
+            was_cancelled: cancelled,
+        }
+    }
+
+    pub async fn post_pr_comment(
+        &self,
+        repo_path: &Path,
+        pr_url_or_id: &str,
+        request: &PostPrCommentRequest,
+        settings: &AppSettings,
+    ) -> anyhow::Result<()> {
+        let provider = build_code_review_provider(settings)?;
+        let remote_url = self.git.get_remote_url(repo_path).await;
+        provider
+            .post_pr_comment(pr_url_or_id, request, remote_url.as_deref())
+            .await
+    }
+}
+
+#[derive(Default)]
+struct ReviewExecutionOutcome {
+    comments: Vec<ReviewComment>,
+    phase_usages: Vec<PhaseUsage>,
+    total_input_tokens: u64,
+    total_output_tokens: u64,
+    total_cache_read_tokens: u64,
+    total_cost: f64,
+    is_error: bool,
+    error_message: Option<String>,
+    was_cancelled: bool,
+}
+
+impl ReviewExecutionOutcome {
+    fn error(message: String) -> Self {
+        Self {
+            is_error: true,
+            error_message: Some(message),
+            ..Self::default()
+        }
+    }
+
+    fn cancelled() -> Self {
+        Self {
+            was_cancelled: true,
+            ..Self::default()
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::PrDiffStatus;
     use std::process::Command as StdCommand;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[test]
-    fn verify_repo_path_resolves_subdirectory_to_git_root() {
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time")
             .as_nanos();
-        let tmp = std::env::temp_dir().join(format!("stitch-rs-verify-repo-{nanos}"));
+        std::env::temp_dir().join(format!("{prefix}-{nanos}"))
+    }
+
+    #[test]
+    fn verify_repo_path_resolves_subdirectory_to_git_root() {
+        let tmp = unique_temp_dir("stitch-rs-verify-repo");
         let sub = tmp.join("packages").join("app");
         std::fs::create_dir_all(&sub).expect("create sub");
 
@@ -286,6 +1198,145 @@ mod tests {
             let verified_root = verify_repo_path(&git, &verified_sub.path).await;
             assert!(!verified_root.was_modified);
         });
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn filter_phase_files_matches_include_exclude_and_dotfiles() {
+        let files = vec![
+            PrDiffFile {
+                path: "src/auth.rs".to_string(),
+                status: PrDiffStatus::Modified,
+            },
+            PrDiffFile {
+                path: "src/auth_test.rs".to_string(),
+                status: PrDiffStatus::Added,
+            },
+            PrDiffFile {
+                path: ".github/workflows/ci.yml".to_string(),
+                status: PrDiffStatus::Modified,
+            },
+            PrDiffFile {
+                path: "README.md".to_string(),
+                status: PrDiffStatus::Modified,
+            },
+        ];
+
+        let rust_non_test = filter_phase_files(
+            &files,
+            &["src/**/*.rs".to_string()],
+            &["**/*_test.rs".to_string()],
+        );
+        assert_eq!(rust_non_test.len(), 1);
+        assert_eq!(rust_non_test[0].path, "src/auth.rs");
+
+        let workflows = filter_phase_files(&files, &[".github/**/*.yml".to_string()], &[]);
+        assert_eq!(workflows.len(), 1);
+        assert_eq!(workflows[0].path, ".github/workflows/ci.yml");
+
+        let top_level_only = filter_phase_files(&files, &["*.rs".to_string()], &[]);
+        assert!(top_level_only.is_empty());
+    }
+
+    #[test]
+    fn extract_file_context_slices_lines_handles_leading_slash_and_blocks_traversal() {
+        let tmp = unique_temp_dir("stitch-rs-context");
+        let src_dir = tmp.join("src");
+        std::fs::create_dir_all(&src_dir).expect("mkdir");
+        let sample = "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\n";
+        std::fs::write(src_dir.join("main.rs"), sample).expect("write sample");
+
+        let slice = extract_file_context(&tmp, "/src/main.rs", 3, 1).expect("slice");
+        assert_eq!(
+            slice,
+            vec![
+                CodeContextLine {
+                    line: 2,
+                    text: "line 2".to_string(),
+                    is_target: false,
+                },
+                CodeContextLine {
+                    line: 3,
+                    text: "line 3".to_string(),
+                    is_target: true,
+                },
+                CodeContextLine {
+                    line: 4,
+                    text: "line 4".to_string(),
+                    is_target: false,
+                },
+            ]
+        );
+
+        assert!(extract_file_context(&tmp, "../etc/passwd", 1, 1).is_none());
+        assert!(extract_file_context(&tmp, "src/main.rs", 0, 1).is_none());
+        assert!(extract_file_context(&tmp, "src/missing.rs", 1, 1).is_none());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn parse_review_jsonl_line_handles_general_line_status_and_enriches_code_context() {
+        let tmp = unique_temp_dir("stitch-rs-parse-jsonl");
+        std::fs::create_dir_all(tmp.join("src")).expect("mkdir");
+        std::fs::write(
+            tmp.join("src").join("lib.rs"),
+            "pub fn a() {}\npub fn b() {}\npub fn c() {}\n",
+        )
+        .expect("write");
+
+        let status = parse_review_jsonl_line(
+            r#"{"type":"status","text":"Reading lib.rs"}"#,
+            "sec",
+            "Security",
+            "c1",
+            &tmp,
+        );
+        assert_eq!(
+            status,
+            Some(ParsedReviewLine::Status("Reading lib.rs".to_string()))
+        );
+
+        let general = parse_review_jsonl_line(
+            r#"{"type":"general","comment":"Split module"}"#,
+            "sec",
+            "Security",
+            "c2",
+            &tmp,
+        );
+        match general {
+            Some(ParsedReviewLine::Comment(c)) => {
+                assert_eq!(c.comment_type, ReviewCommentType::General);
+                assert_eq!(c.comment, "Split module");
+                assert_eq!(c.phase.as_deref(), Some("Security"));
+                assert_eq!(c.phase_id.as_deref(), Some("sec"));
+                assert!(!c.posted);
+            }
+            other => panic!("unexpected parsed general: {other:?}"),
+        }
+
+        let line = parse_review_jsonl_line(
+            r#"{"type":"line","file":"src/lib.rs","line":2,"context":1,"comment":"Document public fn"}"#,
+            "sec",
+            "Security",
+            "c3",
+            &tmp,
+        );
+        match line {
+            Some(ParsedReviewLine::Comment(c)) => {
+                assert_eq!(c.comment_type, ReviewCommentType::Line);
+                assert_eq!(c.file.as_deref(), Some("src/lib.rs"));
+                assert_eq!(c.line, Some(2));
+                let ctx = c.code_lines.expect("code context");
+                assert_eq!(ctx.len(), 3);
+                assert_eq!(ctx[0].line, 1);
+                assert!(ctx[1].is_target);
+                assert_eq!(ctx[1].text, "pub fn b() {}");
+                assert_eq!(ctx[2].line, 3);
+            }
+            other => panic!("unexpected parsed line: {other:?}"),
+        }
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

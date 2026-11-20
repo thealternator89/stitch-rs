@@ -13,8 +13,8 @@ pub use confluence::ConfluenceClient;
 pub use github::{GitHubClient, GitHubCodeReviewClient};
 
 use crate::types::{
-    AppSettings, DocPageData, KnownDoc, ParsedPrUrl, ParsedRemoteUrl, PrMetadata, PrSearchType,
-    TicketData,
+    AppSettings, DocPageData, KnownDoc, ParsedPrUrl, ParsedRemoteUrl, PostPrCommentRequest,
+    PrMetadata, PrSearchType, TicketData,
 };
 
 /// External documentation provider (e.g., Atlassian Confluence).
@@ -57,12 +57,17 @@ pub trait CodeReviewProvider: Send + Sync {
         remote_url: Option<&str>,
     ) -> anyhow::Result<PrMetadata>;
     async fn get_project_prs(&self, search_type: PrSearchType) -> anyhow::Result<Vec<PrMetadata>>;
-    #[allow(dead_code)]
     async fn get_linked_tickets(
         &self,
         pr_id: &str,
         repository_id: Option<&str>,
     ) -> anyhow::Result<Vec<String>>;
+    async fn post_pr_comment(
+        &self,
+        pr_url_or_id: &str,
+        comment: &PostPrCommentRequest,
+        remote_url: Option<&str>,
+    ) -> anyhow::Result<()>;
 }
 
 /// Builds the active `DocumentationProvider` based on `settings.sources.docs`.

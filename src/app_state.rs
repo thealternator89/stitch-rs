@@ -168,6 +168,7 @@ impl AppState {
                 PrReviewerView::new(
                     app_state_handle.clone(),
                     &settings,
+                    copilot_service.clone(),
                     git_service.clone(),
                     window,
                     cx,
