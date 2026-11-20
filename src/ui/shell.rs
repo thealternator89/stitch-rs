@@ -13,7 +13,7 @@ use gpui_kit::component::{
 use gpui_kit::{
     AnyElement, App, Context, Entity, FontWeight, InteractiveElement as _, IntoElement,
     ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _, Subscription, Window,
-    div, hsla, prelude::FluentBuilder as _, px, relative,
+    div, hsla, img, prelude::FluentBuilder as _, px, relative,
 };
 
 use crate::app_state::{ActiveView, AppState, apply_theme, refresh_copilot_status};
@@ -110,15 +110,9 @@ impl WorkspaceShell {
                             .items_center()
                             .gap_1p5()
                             .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
+                                img(crate::branding::icon_image())
                                     .size(px(20.))
-                                    .rounded(px(5.))
-                                    .bg(theme.primary)
-                                    .text_color(theme.primary_foreground)
-                                    .child(Icon::new(LucideIcon::Layers).xsmall()),
+                                    .flex_shrink_0(),
                             )
                             .child(
                                 div()

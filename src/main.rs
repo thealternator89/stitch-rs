@@ -1,4 +1,5 @@
 mod app_state;
+mod branding;
 mod features;
 mod infrastructure;
 mod types;
@@ -10,23 +11,29 @@ use gpui_kit::{
 };
 
 use crate::app_state::AppState;
+use crate::branding::AppAssets;
 use crate::ui::WorkspaceShell;
 
 actions!(stitch, [Quit]);
 
 fn main() {
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::AllAssets)
+        .with_assets(AppAssets)
         .run(|cx| {
             gpui_kit::init(cx);
+            branding::set_app_dock_icon();
 
             cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
             cx.on_action(|_: &Quit, cx| cx.quit());
 
             let bounds = Bounds::centered(None, size(px(1200.), px(890.)), cx);
+            let mut titlebar = TitleBar::title_bar_options();
+            titlebar.title = Some("Stitch".into());
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(900.), px(640.))),
+                titlebar: Some(titlebar),
+                app_id: Some("Stitch".to_string()),
                 ..TitleBar::window_options()
             };
 
