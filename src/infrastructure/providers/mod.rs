@@ -13,8 +13,8 @@ pub use confluence::ConfluenceClient;
 pub use github::{GitHubClient, GitHubCodeReviewClient};
 
 use crate::types::{
-    AppSettings, DocPageData, KnownDoc, ParsedPrUrl, ParsedRemoteUrl, PostPrCommentRequest,
-    PrMetadata, PrSearchType, TicketData,
+    AppSettings, DocPageData, ExistingPrCommentThread, KnownDoc, ParsedPrUrl, ParsedRemoteUrl,
+    PostPrCommentRequest, PrMetadata, PrSearchType, TicketData,
 };
 
 /// External documentation provider (e.g., Atlassian Confluence).
@@ -62,6 +62,11 @@ pub trait CodeReviewProvider: Send + Sync {
         pr_id: &str,
         repository_id: Option<&str>,
     ) -> anyhow::Result<Vec<String>>;
+    async fn get_pr_comment_threads(
+        &self,
+        pr_url_or_id: &str,
+        remote_url: Option<&str>,
+    ) -> anyhow::Result<Vec<ExistingPrCommentThread>>;
     async fn post_pr_comment(
         &self,
         pr_url_or_id: &str,

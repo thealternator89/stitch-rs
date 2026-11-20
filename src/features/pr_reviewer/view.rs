@@ -29,7 +29,8 @@ use crate::features::pr_reviewer::phase_loader::{
     load_phases_from_disk, open_directory_in_os, pr_reviewer_root_dir,
 };
 use crate::features::pr_reviewer::service::{
-    CheckoutError, PrReviewRequest, PrReviewStreamEvent, PrReviewerService, verify_repo_path,
+    CheckoutError, PrCriticRequest, PrCriticStreamEvent, PrReviewRequest, PrReviewStreamEvent,
+    PrReviewerService, verify_repo_path,
 };
 use crate::features::settings::SettingsTab;
 use crate::infrastructure::copilot::CopilotService;
@@ -39,10 +40,26 @@ use crate::infrastructure::runtime::{runtime, spawn_tokio};
 use crate::types::{
     AppSettings, CodeContextLine, CopilotModelInfo, CopilotUsage, PhaseProgress, PhaseRunStatus,
     PostPrCommentRequest, PrDiffFile, PrDiffStatus, PrMetadata, PrSearchType, ReviewComment,
-    ReviewCommentType, ReviewPersona, ReviewPhase, max_parallelism_limit,
+    ReviewCommentStatus, ReviewCommentType, ReviewPersona, ReviewPhase, max_parallelism_limit,
     resolve_effective_parallelism, system_cpu_count,
 };
 use crate::ui::components::{ModelDropdown, ModelDropdownEvent, ModelDropdownMode};
+
+const CRITIC_PHASE_ID: &str = "critic-phase";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum CommentViewMode {
+    #[default]
+    Critiqued,
+    Unvalidated,
+}
+
+#[derive(Debug, Clone)]
+enum ReviewPipelineEvent {
+    Review(PrReviewStreamEvent),
+    CriticStarted,
+    Critic(PrCriticStreamEvent),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum PrSelectorTab {
@@ -179,13 +196,18 @@ pub struct PrReviewerView {
     custom_instructions_input: Entity<TextareaState>,
     show_diff_files: bool,
     is_reviewing: bool,
+    is_critiquing: bool,
     has_reviewed: bool,
+    has_critiqued: bool,
     review_cancel_tx: Option<watch::Sender<bool>>,
     phase_progress: Vec<PhaseProgress>,
     last_status_time: Option<String>,
     last_usage: Option<CopilotUsage>,
     comments: Vec<ReviewComment>,
+    critiqued_comments: Vec<ReviewComment>,
+    comment_view_mode: CommentViewMode,
     collapsed_comments: HashSet<String>,
+    expanded_rejected_comments: HashSet<String>,
     posting_comment_ids: HashSet<String>,
     comment_render_rev: u64,
     review_error: Option<String>,
@@ -415,13 +437,22 @@ impl PrReviewerView {
             custom_instructions_input,
             show_diff_files: false,
             is_reviewing: false,
+            is_critiquing: false,
             has_reviewed: false,
+            has_critiqued: false,
             review_cancel_tx: None,
             phase_progress: Vec::new(),
             last_status_time: None,
             last_usage: None,
             comments: Vec::new(),
+            critiqued_comments: Vec::new(),
+            comment_view_mode: if initial_settings.pr_reviewer.critic_enabled {
+                CommentViewMode::Critiqued
+            } else {
+                CommentViewMode::Unvalidated
+            },
             collapsed_comments: HashSet::new(),
+            expanded_rejected_comments: HashSet::new(),
             posting_comment_ids: HashSet::new(),
             comment_render_rev: 0,
             review_error: None,
@@ -663,7 +694,9 @@ impl PrReviewerView {
         self.checkout_error = None;
         self.status_notice = None;
         self.comments.clear();
+        self.critiqued_comments.clear();
         self.collapsed_comments.clear();
+        self.expanded_rejected_comments.clear();
         self.posting_comment_ids.clear();
         self.phase_progress.clear();
         self.last_status_time = None;
@@ -671,7 +704,14 @@ impl PrReviewerView {
         self.review_error = None;
         self.post_error = None;
         self.is_reviewing = false;
+        self.is_critiquing = false;
         self.has_reviewed = false;
+        self.has_critiqued = false;
+        self.comment_view_mode = if self.critic_enabled {
+            CommentViewMode::Critiqued
+        } else {
+            CommentViewMode::Unvalidated
+        };
         self.show_diff_files = false;
 
         self.apply_remembered_author_persona(&pr, &settings, window, cx);
@@ -1031,11 +1071,22 @@ impl PrReviewerView {
             (state.settings.clone(), state.copilot_models.clone())
         };
         let custom_instructions = self.custom_instructions_input.read(cx).value().to_string();
+        let pr_identifier = self.pr_identifier_for_post(&checked, cx);
+        let run_critic = self.critic_enabled;
 
         self.is_reviewing = true;
+        self.is_critiquing = false;
         self.has_reviewed = false;
+        self.has_critiqued = false;
         self.comments.clear();
+        self.critiqued_comments.clear();
+        self.comment_view_mode = if run_critic {
+            CommentViewMode::Critiqued
+        } else {
+            CommentViewMode::Unvalidated
+        };
         self.collapsed_comments.clear();
+        self.expanded_rejected_comments.clear();
         self.posting_comment_ids.clear();
         self.review_error = None;
         self.post_error = None;
@@ -1044,7 +1095,7 @@ impl PrReviewerView {
         if let Some(ref mut co) = self.checked_out {
             co.checkout_cleaned_up = false;
         }
-        self.phase_progress = enabled_phases
+        let mut initial_progress: Vec<PhaseProgress> = enabled_phases
             .iter()
             .map(|phase| PhaseProgress {
                 id: phase.id.clone(),
@@ -1056,15 +1107,30 @@ impl PrReviewerView {
                 comment_count: 0,
             })
             .collect();
+        if run_critic {
+            initial_progress.push(PhaseProgress {
+                id: CRITIC_PHASE_ID.to_string(),
+                title: "Critic".to_string(),
+                group: String::new(),
+                status: PhaseRunStatus::Pending,
+                status_text: Some(
+                    "Will run once the review phases have completed".to_string(),
+                ),
+                reason: None,
+                comment_count: 0,
+            });
+        }
+        self.phase_progress = initial_progress;
 
         let (cancel_tx, cancel_rx) = watch::channel(false);
         self.review_cancel_tx = Some(cancel_tx);
-        let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<PrReviewStreamEvent>();
+        let (pipeline_tx, mut pipeline_rx) = mpsc::unbounded_channel::<ReviewPipelineEvent>();
 
+        let pr_id_for_status = checked.pr.id.clone();
         self.app_state.update(cx, |state, cx| {
             state.set_task_status(
                 ActiveView::PrReviewer,
-                Some(format!("Reviewing PR #{}...", checked.pr.id)),
+                Some(format!("Reviewing PR #{pr_id_for_status}...")),
             );
             cx.notify();
         });
@@ -1080,8 +1146,8 @@ impl PrReviewerView {
             max_parallelism: Some(self.max_parallelism),
             persona_name: self.selected_persona.clone(),
             settings: settings.clone(),
-            available_models,
-            skip_cleanup: false,
+            available_models: available_models.clone(),
+            skip_cleanup: run_critic,
         };
 
         runtime().spawn(async move {
@@ -1107,140 +1173,370 @@ impl PrReviewerView {
                             )
                             .await
                         {
-                            let _ = ev_tx.send(PrReviewStreamEvent::Error {
-                                message: format!("Failed to re-checkout PR before review: {err}"),
-                                cleaned_up: false,
-                            });
+                            let _ = pipeline_tx.send(ReviewPipelineEvent::Review(
+                                PrReviewStreamEvent::Error {
+                                    message: format!(
+                                        "Failed to re-checkout PR before review: {err}"
+                                    ),
+                                    cleaned_up: false,
+                                },
+                            ));
                             return;
                         }
                     }
                     Err(_) => {
-                        let _ = ev_tx.send(PrReviewStreamEvent::Error {
-                            message: format!("Invalid PR ID: '{}'", req.pr.id),
-                            cleaned_up: false,
-                        });
+                        let _ = pipeline_tx.send(ReviewPipelineEvent::Review(
+                            PrReviewStreamEvent::Error {
+                                message: format!("Invalid PR ID: '{}'", req.pr.id),
+                                cleaned_up: false,
+                            },
+                        ));
                         return;
                     }
                 }
             }
 
-            pr_service.review_pr(req, cancel_rx, ev_tx).await;
+            let repo_for_critic = req.repo_path.clone();
+            let pr_for_critic = req.pr.clone();
+            let model_for_critic = req.model_override.clone();
+            let persona_for_critic = req.persona_name.clone();
+            let settings_for_critic = req.settings.clone();
+            let models_for_critic = req.available_models.clone();
+
+            let (rev_tx, mut rev_rx) = mpsc::unbounded_channel::<PrReviewStreamEvent>();
+            let pipeline_tx_rev = pipeline_tx.clone();
+            let forward_rev = async move {
+                let mut finished_comments: Option<Vec<ReviewComment>> = None;
+                while let Some(ev) = rev_rx.recv().await {
+                    if let PrReviewStreamEvent::Finished { ref comments, .. } = ev {
+                        finished_comments = Some(comments.clone());
+                    }
+                    let _ = pipeline_tx_rev.send(ReviewPipelineEvent::Review(ev));
+                }
+                finished_comments
+            };
+
+            let (_, finished_comments) = tokio::join!(
+                pr_service.review_pr(req, cancel_rx.clone(), rev_tx),
+                forward_rev
+            );
+
+            if run_critic {
+                if let Some(raw_comments) = finished_comments {
+                    let _ = pipeline_tx.send(ReviewPipelineEvent::CriticStarted);
+                    let (crit_tx, mut crit_rx) = mpsc::unbounded_channel::<PrCriticStreamEvent>();
+                    let pipeline_tx_crit = pipeline_tx.clone();
+                    let forward_crit = async move {
+                        while let Some(ev) = crit_rx.recv().await {
+                            let _ = pipeline_tx_crit.send(ReviewPipelineEvent::Critic(ev));
+                        }
+                    };
+                    let critic_req = PrCriticRequest {
+                        repo_path: repo_for_critic,
+                        pr: pr_for_critic,
+                        pr_url_or_id: pr_identifier,
+                        comments: raw_comments,
+                        model_override: model_for_critic,
+                        persona_name: persona_for_critic,
+                        settings: settings_for_critic,
+                        available_models: models_for_critic,
+                    };
+                    tokio::join!(
+                        pr_service.critique_comments(critic_req, cancel_rx, crit_tx),
+                        forward_crit
+                    );
+                }
+            }
         });
 
         let view = cx.entity();
         let app_state = self.app_state.clone();
         window
             .spawn(cx, async move |cx| {
-                while let Some(event) = ev_rx.recv().await {
+                while let Some(pipeline_event) = pipeline_rx.recv().await {
                     let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
                     let _ = cx.update(|_, cx| {
                         view.update(cx, |this, cx| {
                             this.last_status_time = Some(timestamp);
-                            match event {
-                                PrReviewStreamEvent::PhaseSkipped {
-                                    phase_id,
-                                    phase_title,
-                                    reason,
-                                } => {
-                                    if let Some(p) =
-                                        this.phase_progress.iter_mut().find(|p| p.id == phase_id)
-                                    {
-                                        p.title = phase_title;
-                                        p.status = PhaseRunStatus::Skipped;
-                                        p.reason = Some(reason);
+                            match pipeline_event {
+                                ReviewPipelineEvent::Review(event) => match event {
+                                    PrReviewStreamEvent::PhaseSkipped {
+                                        phase_id,
+                                        phase_title,
+                                        reason,
+                                    } => {
+                                        if let Some(p) = this
+                                            .phase_progress
+                                            .iter_mut()
+                                            .find(|p| p.id == phase_id)
+                                        {
+                                            p.title = phase_title;
+                                            p.status = PhaseRunStatus::Skipped;
+                                            p.reason = Some(reason);
+                                        }
                                     }
-                                }
-                                PrReviewStreamEvent::PhaseStarted {
-                                    phase_id,
-                                    phase_title,
-                                } => {
-                                    if let Some(p) =
-                                        this.phase_progress.iter_mut().find(|p| p.id == phase_id)
+                                    PrReviewStreamEvent::PhaseStarted {
+                                        phase_id,
+                                        phase_title,
+                                    } => {
+                                        if let Some(p) = this
+                                            .phase_progress
+                                            .iter_mut()
+                                            .find(|p| p.id == phase_id)
+                                        {
+                                            p.title = phase_title;
+                                            p.status = PhaseRunStatus::Running;
+                                        }
+                                    }
+                                    PrReviewStreamEvent::PhaseStatus {
+                                        phase_id,
+                                        phase_title,
+                                        status,
+                                    } => {
+                                        if let Some(p) = this
+                                            .phase_progress
+                                            .iter_mut()
+                                            .find(|p| p.id == phase_id)
+                                        {
+                                            p.title = phase_title;
+                                            p.status_text = Some(status);
+                                        }
+                                    }
+                                    PrReviewStreamEvent::Comment(comment) => {
+                                        this.comments.push(comment);
+                                    }
+                                    PrReviewStreamEvent::PhaseCompleted {
+                                        phase_id,
+                                        phase_title,
+                                        comment_count,
+                                    } => {
+                                        if let Some(p) = this
+                                            .phase_progress
+                                            .iter_mut()
+                                            .find(|p| p.id == phase_id)
+                                        {
+                                            p.title = phase_title;
+                                            p.status = PhaseRunStatus::Completed;
+                                            p.comment_count = comment_count;
+                                        }
+                                    }
+                                    PrReviewStreamEvent::Finished {
+                                        comments,
+                                        usage,
+                                        cleaned_up,
+                                    } => {
+                                        this.last_usage = Some(usage);
+                                        if this.comments.is_empty() && !comments.is_empty() {
+                                            this.comments = comments;
+                                        }
+                                        if cleaned_up {
+                                            if let Some(ref mut co) = this.checked_out {
+                                                co.checkout_cleaned_up = true;
+                                            }
+                                        }
+                                        if !run_critic {
+                                            this.is_reviewing = false;
+                                            this.has_reviewed = true;
+                                            this.review_cancel_tx = None;
+                                            app_state.update(cx, |state, cx| {
+                                                state.set_task_status(ActiveView::PrReviewer, None);
+                                                cx.notify();
+                                            });
+                                        }
+                                    }
+                                    PrReviewStreamEvent::Cancelled { cleaned_up } => {
+                                        this.is_reviewing = false;
+                                        this.is_critiquing = false;
+                                        this.review_cancel_tx = None;
+                                        if run_critic {
+                                            if let Some(p) = this
+                                                .phase_progress
+                                                .iter_mut()
+                                                .find(|p| p.id == CRITIC_PHASE_ID)
+                                            {
+                                                p.status = PhaseRunStatus::Skipped;
+                                                p.reason = Some("Review cancelled".to_string());
+                                            }
+                                        }
+                                        if cleaned_up {
+                                            if let Some(ref mut co) = this.checked_out {
+                                                co.checkout_cleaned_up = true;
+                                            }
+                                        }
+                                        app_state.update(cx, |state, cx| {
+                                            state.set_task_status(ActiveView::PrReviewer, None);
+                                            cx.notify();
+                                        });
+                                    }
+                                    PrReviewStreamEvent::Error {
+                                        message,
+                                        cleaned_up,
+                                    } => {
+                                        this.is_reviewing = false;
+                                        this.is_critiquing = false;
+                                        this.review_cancel_tx = None;
+                                        this.review_error = Some(message);
+                                        if run_critic {
+                                            if let Some(p) = this
+                                                .phase_progress
+                                                .iter_mut()
+                                                .find(|p| p.id == CRITIC_PHASE_ID)
+                                            {
+                                                p.status = PhaseRunStatus::Skipped;
+                                                p.reason = Some("Review phase failed".to_string());
+                                            }
+                                        }
+                                        if cleaned_up {
+                                            if let Some(ref mut co) = this.checked_out {
+                                                co.checkout_cleaned_up = true;
+                                            }
+                                        }
+                                        app_state.update(cx, |state, cx| {
+                                            state.set_task_status(ActiveView::PrReviewer, None);
+                                            cx.notify();
+                                        });
+                                    }
+                                },
+                                ReviewPipelineEvent::CriticStarted => {
+                                    this.is_critiquing = true;
+                                    if let Some(p) = this
+                                        .phase_progress
+                                        .iter_mut()
+                                        .find(|p| p.id == CRITIC_PHASE_ID)
                                     {
-                                        p.title = phase_title;
                                         p.status = PhaseRunStatus::Running;
-                                    }
-                                }
-                                PrReviewStreamEvent::PhaseStatus {
-                                    phase_id,
-                                    phase_title,
-                                    status,
-                                } => {
-                                    if let Some(p) =
-                                        this.phase_progress.iter_mut().find(|p| p.id == phase_id)
-                                    {
-                                        p.title = phase_title;
-                                        p.status_text = Some(status);
-                                    }
-                                }
-                                PrReviewStreamEvent::Comment(comment) => {
-                                    this.comments.push(comment);
-                                }
-                                PrReviewStreamEvent::PhaseCompleted {
-                                    phase_id,
-                                    phase_title,
-                                    comment_count,
-                                } => {
-                                    if let Some(p) =
-                                        this.phase_progress.iter_mut().find(|p| p.id == phase_id)
-                                    {
-                                        p.title = phase_title;
-                                        p.status = PhaseRunStatus::Completed;
-                                        p.comment_count = comment_count;
-                                    }
-                                }
-                                PrReviewStreamEvent::Finished {
-                                    comments,
-                                    usage,
-                                    cleaned_up,
-                                } => {
-                                    this.is_reviewing = false;
-                                    this.has_reviewed = true;
-                                    this.review_cancel_tx = None;
-                                    this.last_usage = Some(usage);
-                                    if this.comments.is_empty() && !comments.is_empty() {
-                                        this.comments = comments;
-                                    }
-                                    if cleaned_up {
-                                        if let Some(ref mut co) = this.checked_out {
-                                            co.checkout_cleaned_up = true;
-                                        }
+                                        p.status_text =
+                                            Some("Critiquing generated comments...".to_string());
                                     }
                                     app_state.update(cx, |state, cx| {
-                                        state.set_task_status(ActiveView::PrReviewer, None);
+                                        state.set_task_status(
+                                            ActiveView::PrReviewer,
+                                            Some(format!("Critiquing PR #{pr_id_for_status}...")),
+                                        );
                                         cx.notify();
                                     });
                                 }
-                                PrReviewStreamEvent::Cancelled { cleaned_up } => {
-                                    this.is_reviewing = false;
-                                    this.review_cancel_tx = None;
-                                    if cleaned_up {
-                                        if let Some(ref mut co) = this.checked_out {
-                                            co.checkout_cleaned_up = true;
+                                ReviewPipelineEvent::Critic(critic_ev) => match critic_ev {
+                                    PrCriticStreamEvent::Status(status) => {
+                                        if let Some(p) = this
+                                            .phase_progress
+                                            .iter_mut()
+                                            .find(|p| p.id == CRITIC_PHASE_ID)
+                                        {
+                                            p.status_text = Some(status);
                                         }
                                     }
-                                    app_state.update(cx, |state, cx| {
-                                        state.set_task_status(ActiveView::PrReviewer, None);
-                                        cx.notify();
-                                    });
-                                }
-                                PrReviewStreamEvent::Error {
-                                    message,
-                                    cleaned_up,
-                                } => {
-                                    this.is_reviewing = false;
-                                    this.review_cancel_tx = None;
-                                    this.review_error = Some(message);
-                                    if cleaned_up {
-                                        if let Some(ref mut co) = this.checked_out {
-                                            co.checkout_cleaned_up = true;
+                                    PrCriticStreamEvent::Finished {
+                                        comments,
+                                        usage,
+                                        cleaned_up,
+                                    } => {
+                                        if let Some(ref mut prev) = this.last_usage {
+                                            prev.input_tokens = prev
+                                                .input_tokens
+                                                .saturating_add(usage.input_tokens);
+                                            prev.output_tokens = prev
+                                                .output_tokens
+                                                .saturating_add(usage.output_tokens);
+                                            prev.cache_read_tokens = prev
+                                                .cache_read_tokens
+                                                .saturating_add(usage.cache_read_tokens);
+                                            prev.cost += usage.cost;
+                                            if let Some(critic_phases) = usage.phases {
+                                                prev.phases
+                                                    .get_or_insert_with(Vec::new)
+                                                    .extend(critic_phases);
+                                            }
+                                        } else {
+                                            this.last_usage = Some(usage);
                                         }
+
+                                        let active_count = comments
+                                            .iter()
+                                            .filter(|c| {
+                                                c.status != Some(ReviewCommentStatus::Rejected)
+                                            })
+                                            .count();
+                                        this.critiqued_comments = comments;
+                                        this.has_critiqued = true;
+                                        this.comment_view_mode = CommentViewMode::Critiqued;
+                                        this.is_critiquing = false;
+                                        this.is_reviewing = false;
+                                        this.has_reviewed = true;
+                                        this.review_cancel_tx = None;
+
+                                        if let Some(p) = this
+                                            .phase_progress
+                                            .iter_mut()
+                                            .find(|p| p.id == CRITIC_PHASE_ID)
+                                        {
+                                            p.status = PhaseRunStatus::Completed;
+                                            p.comment_count = active_count;
+                                            p.status_text =
+                                                Some("Critic phase complete.".to_string());
+                                        }
+                                        if cleaned_up {
+                                            if let Some(ref mut co) = this.checked_out {
+                                                co.checkout_cleaned_up = true;
+                                            }
+                                        }
+                                        app_state.update(cx, |state, cx| {
+                                            state.set_task_status(ActiveView::PrReviewer, None);
+                                            cx.notify();
+                                        });
                                     }
-                                    app_state.update(cx, |state, cx| {
-                                        state.set_task_status(ActiveView::PrReviewer, None);
-                                        cx.notify();
-                                    });
-                                }
+                                    PrCriticStreamEvent::Cancelled { cleaned_up } => {
+                                        this.is_critiquing = false;
+                                        this.is_reviewing = false;
+                                        this.review_cancel_tx = None;
+                                        if let Some(p) = this
+                                            .phase_progress
+                                            .iter_mut()
+                                            .find(|p| p.id == CRITIC_PHASE_ID)
+                                        {
+                                            p.status = PhaseRunStatus::Skipped;
+                                            p.reason = Some("Critic cancelled".to_string());
+                                        }
+                                        if cleaned_up {
+                                            if let Some(ref mut co) = this.checked_out {
+                                                co.checkout_cleaned_up = true;
+                                            }
+                                        }
+                                        app_state.update(cx, |state, cx| {
+                                            state.set_task_status(ActiveView::PrReviewer, None);
+                                            cx.notify();
+                                        });
+                                    }
+                                    PrCriticStreamEvent::Error {
+                                        message,
+                                        cleaned_up,
+                                    } => {
+                                        this.is_critiquing = false;
+                                        this.is_reviewing = false;
+                                        this.has_reviewed = true;
+                                        this.review_cancel_tx = None;
+                                        this.comment_view_mode = CommentViewMode::Unvalidated;
+                                        this.review_error =
+                                            Some(format!("Critic phase failed: {message}"));
+                                        if let Some(p) = this
+                                            .phase_progress
+                                            .iter_mut()
+                                            .find(|p| p.id == CRITIC_PHASE_ID)
+                                        {
+                                            p.status = PhaseRunStatus::Skipped;
+                                            p.reason = Some(format!("Critic failed: {message}"));
+                                        }
+                                        if cleaned_up {
+                                            if let Some(ref mut co) = this.checked_out {
+                                                co.checkout_cleaned_up = true;
+                                            }
+                                        }
+                                        app_state.update(cx, |state, cx| {
+                                            state.set_task_status(ActiveView::PrReviewer, None);
+                                            cx.notify();
+                                        });
+                                    }
+                                },
                             }
                             cx.notify();
                         });
@@ -1249,8 +1545,9 @@ impl PrReviewerView {
 
                 let _ = cx.update(|_, cx| {
                     view.update(cx, |this, cx| {
-                        if this.is_reviewing {
+                        if this.is_reviewing || this.is_critiquing {
                             this.is_reviewing = false;
+                            this.is_critiquing = false;
                             this.review_cancel_tx = None;
                             app_state.update(cx, |state, cx| {
                                 state.set_task_status(ActiveView::PrReviewer, None);
@@ -1292,13 +1589,16 @@ impl PrReviewerView {
         }
 
         let is_edited = final_text != comment.comment;
+        let original_text = comment.comment.clone();
+        let original_file = comment.file.clone();
+        let original_line = comment.line;
         let request = PostPrCommentRequest {
             comment_type: comment.comment_type,
             file: comment.file.clone(),
             line: comment.line,
             comment: final_text.clone(),
             edited: is_edited,
-            thread_id: None,
+            thread_id: comment.thread_id,
         };
 
         let pr_identifier = self.pr_identifier_for_post(checked, cx);
@@ -1324,12 +1624,20 @@ impl PrReviewerView {
                 this.posting_comment_ids.remove(&comment_id);
                 match res {
                     Ok(Ok(())) => {
-                        if let Some(existing) =
-                            this.comments.iter_mut().find(|c| c.id == comment_id)
-                        {
-                            existing.comment = final_text;
-                            existing.posted = true;
-                        }
+                        let mark_posted = |list: &mut Vec<ReviewComment>| {
+                            for existing in list.iter_mut() {
+                                if existing.id == comment_id
+                                    || (existing.comment == original_text
+                                        && existing.file == original_file
+                                        && existing.line == original_line)
+                                {
+                                    existing.comment = final_text.clone();
+                                    existing.posted = true;
+                                }
+                            }
+                        };
+                        mark_posted(&mut this.comments);
+                        mark_posted(&mut this.critiqued_comments);
                         if is_edited {
                             this.comment_render_rev = this.comment_render_rev.wrapping_add(1);
                         }
@@ -1356,6 +1664,7 @@ impl PrReviewerView {
     ) {
         let view = cx.entity();
         let initial_text = comment.comment.clone();
+        let is_reply = comment.status == Some(ReviewCommentStatus::Reply);
         let textarea = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .placeholder("Write your comment here...")
@@ -1365,6 +1674,10 @@ impl PrReviewerView {
             (ReviewCommentType::Line, Some(f), Some(l)) => Some(format!("{f}:{l}")),
             _ => None,
         };
+        let thread_label = comment
+            .thread_id
+            .filter(|_| is_reply)
+            .map(|tid| format!("Reply to Thread #{tid}"));
 
         window.open_dialog(cx, move |dialog, _window, cx| {
             let theme = cx.theme();
@@ -1382,12 +1695,16 @@ impl PrReviewerView {
                         .items_center()
                         .gap_2()
                         .child(Icon::new(LucideIcon::SquarePen).with_size(Size::Medium))
-                        .child("Edit Comment"),
+                        .child(if is_reply {
+                            "Edit Reply"
+                        } else {
+                            "Edit Comment"
+                        }),
                 )
                 .child(
                     v_flex()
                         .gap_3()
-                        .when_some(file_label.clone(), |col, loc| {
+                        .when_some(thread_label.clone().or(file_label.clone()), |col, loc| {
                             col.child(
                                 div()
                                     .px_2p5()
@@ -1427,8 +1744,15 @@ impl PrReviewerView {
                         .child(
                             Button::new("pr-edit-comment-post")
                                 .primary()
-                                .icon(Icon::new(LucideIcon::Send).small())
-                                .label("Post")
+                                .icon(
+                                    Icon::new(if is_reply {
+                                        LucideIcon::Reply
+                                    } else {
+                                        LucideIcon::Send
+                                    })
+                                    .small(),
+                                )
+                                .label(if is_reply { "Reply" } else { "Post" })
                                 .on_click(move |_, window, cx| {
                                     let updated_text =
                                         textarea_for_post.read(cx).value().to_string();
@@ -2648,15 +2972,29 @@ impl PrReviewerView {
                                             .into_any_element(),
                                     };
 
+                                    let is_critic_phase = phase.id == CRITIC_PHASE_ID;
+                                    let is_critic_pending =
+                                        is_critic_phase && phase.status == PhaseRunStatus::Pending;
                                     let (badge_text, badge_color) = match phase.status {
-                                        PhaseRunStatus::Pending => ("Pending".to_string(), theme.muted_foreground),
+                                        PhaseRunStatus::Pending => (
+                                            if is_critic_pending {
+                                                "Queued".to_string()
+                                            } else {
+                                                "Pending".to_string()
+                                            },
+                                            theme.muted_foreground,
+                                        ),
                                         PhaseRunStatus::Running => ("Running".to_string(), theme.primary),
                                         PhaseRunStatus::Completed => (
-                                            format!(
-                                                "Done ({} draft comment{})",
-                                                phase.comment_count,
-                                                if phase.comment_count == 1 { "" } else { "s" }
-                                            ),
+                                            if is_critic_phase {
+                                                "Done".to_string()
+                                            } else {
+                                                format!(
+                                                    "Done ({} draft comment{})",
+                                                    phase.comment_count,
+                                                    if phase.comment_count == 1 { "" } else { "s" }
+                                                )
+                                            },
                                             green,
                                         ),
                                         PhaseRunStatus::Skipped => ("Skipped".to_string(), amber),
@@ -2669,6 +3007,8 @@ impl PrReviewerView {
                                                 .clone()
                                                 .unwrap_or_else(|| "Analyzing diffs...".to_string()),
                                         )
+                                    } else if is_critic_pending {
+                                        phase.status_text.clone()
                                     } else if is_skipped {
                                         phase.reason.clone()
                                     } else {
@@ -3051,6 +3391,30 @@ impl PrReviewerView {
             )
         });
 
+        let active_critiqued: Vec<ReviewComment> = self
+            .critiqued_comments
+            .iter()
+            .filter(|c| c.status != Some(ReviewCommentStatus::Rejected))
+            .cloned()
+            .collect();
+        let rejected_critiqued: Vec<ReviewComment> = self
+            .critiqued_comments
+            .iter()
+            .filter(|c| c.status == Some(ReviewCommentStatus::Rejected))
+            .cloned()
+            .collect();
+
+        let displayed_comments: Vec<ReviewComment> =
+            if self.has_critiqued && self.comment_view_mode == CommentViewMode::Critiqued {
+                active_critiqued.clone()
+            } else {
+                self.comments.clone()
+            };
+
+        let show_rejected_section = self.has_critiqued
+            && self.comment_view_mode == CommentViewMode::Critiqued
+            && !rejected_critiqued.is_empty();
+
         v_flex()
             .size_full()
             .p_5()
@@ -3060,6 +3424,7 @@ impl PrReviewerView {
                 h_flex()
                     .items_center()
                     .justify_between()
+                    .flex_wrap()
                     .gap_2()
                     .child(
                         h_flex()
@@ -3072,14 +3437,47 @@ impl PrReviewerView {
                                     .small()
                                     .text_color(theme.primary),
                             )
-                            .child(format!("Review Comments ({})", self.comments.len())),
+                            .child(format!("Review Comments ({})", displayed_comments.len())),
                     )
-                    .when(self.critic_enabled && !self.is_reviewing, |row| {
+                    .when(self.has_critiqued, |row| {
+                        let is_crit_mode = self.comment_view_mode == CommentViewMode::Critiqued;
+                        let crit_btn = Button::new("pr-mode-critiqued")
+                            .small()
+                            .icon(Icon::new(LucideIcon::UserCheck).small())
+                            .label(format!("Critiqued ({})", active_critiqued.len()));
+                        let crit_btn = if is_crit_mode {
+                            crit_btn.primary()
+                        } else {
+                            crit_btn.ghost()
+                        };
+
+                        let raw_btn = Button::new("pr-mode-unvalidated")
+                            .small()
+                            .icon(Icon::new(LucideIcon::List).small())
+                            .label(format!("Unvalidated ({})", self.comments.len()));
+                        let raw_btn = if !is_crit_mode {
+                            raw_btn.primary()
+                        } else {
+                            raw_btn.ghost()
+                        };
+
                         row.child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child("Drafts (Critic execution arrives in Phase 11)"),
+                            h_flex()
+                                .items_center()
+                                .gap_1()
+                                .p_0p5()
+                                .rounded(theme.radius)
+                                .border_1()
+                                .border_color(theme.border)
+                                .bg(theme.sidebar)
+                                .child(crit_btn.on_click(cx.listener(|this, _, _, cx| {
+                                    this.comment_view_mode = CommentViewMode::Critiqued;
+                                    cx.notify();
+                                })))
+                                .child(raw_btn.on_click(cx.listener(|this, _, _, cx| {
+                                    this.comment_view_mode = CommentViewMode::Unvalidated;
+                                    cx.notify();
+                                }))),
                         )
                     }),
             )
@@ -3157,6 +3555,11 @@ impl PrReviewerView {
                 )
             })
             .when(!self.is_reviewing && self.has_reviewed && !self.comments.is_empty(), |col| {
+                let complete_label = if self.has_critiqued {
+                    "Review complete • Critic phase completed"
+                } else {
+                    "Review complete"
+                };
                 col.child(
                     h_flex()
                         .px_3()
@@ -3175,7 +3578,7 @@ impl PrReviewerView {
                                 .gap_2()
                                 .text_color(green)
                                 .child(Icon::new(LucideIcon::CircleCheck).small())
-                                .child("Review complete"),
+                                .child(complete_label),
                         )
                         .child(
                             h_flex()
@@ -3198,7 +3601,7 @@ impl PrReviewerView {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scrollbar()
-                    .child(if self.comments.is_empty() {
+                    .child(if displayed_comments.is_empty() && !show_rejected_section {
                         v_flex()
                             .size_full()
                             .min_h(px(280.))
@@ -3290,16 +3693,43 @@ impl PrReviewerView {
                     } else {
                         v_flex()
                             .gap_3()
-                            .children(self.comments.iter().enumerate().map(|(idx, comment)| {
+                            .when(displayed_comments.is_empty() && show_rejected_section, |col| {
+                                col.child(
+                                    v_flex()
+                                        .p_4()
+                                        .items_center()
+                                        .gap_1()
+                                        .rounded(theme.radius)
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .bg(theme.sidebar)
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .child("No active comments remaining"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(theme.muted_foreground)
+                                                .child("All draft comments were rejected by the AI Critic. Inspect rejected comments below or switch to Unvalidated."),
+                                        ),
+                                )
+                            })
+                            .children(displayed_comments.iter().enumerate().map(|(idx, comment)| {
                                 let comment_id = comment.id.clone();
                                 let is_collapsed = self.collapsed_comments.contains(&comment_id);
                                 let is_posting = self.posting_comment_ids.contains(&comment_id);
                                 let is_line = comment.comment_type == ReviewCommentType::Line;
+                                let is_reply = comment.status == Some(ReviewCommentStatus::Reply);
                                 let location_label = match (comment.file.as_deref(), comment.line) {
                                     (Some(f), Some(l)) => Some(format!("{f}:{l}")),
                                     (Some(f), None) => Some(f.to_string()),
                                     _ => None,
                                 };
+                                let critic_badge =
+                                    render_critic_status_badge(comment, is_collapsed, theme);
 
                                 if is_collapsed {
                                     let id_for_expand = comment_id.clone();
@@ -3330,6 +3760,7 @@ impl PrReviewerView {
                                                             .child(phase),
                                                     )
                                                 })
+                                                .when_some(critic_badge, |row, badge| row.child(badge))
                                                 .child(if comment.posted {
                                                     h_flex()
                                                         .items_center()
@@ -3407,6 +3838,7 @@ impl PrReviewerView {
                                             .border_color(theme.border)
                                             .child(
                                                 h_flex()
+                                                    .flex_wrap()
                                                     .items_center()
                                                     .gap_2()
                                                     .when_some(comment.phase.clone(), |row, phase| {
@@ -3422,6 +3854,7 @@ impl PrReviewerView {
                                                                 .child(phase),
                                                         )
                                                     })
+                                                    .when_some(critic_badge, |row, badge| row.child(badge))
                                                     .when(!is_line, |row| {
                                                         row.child(
                                                             div()
@@ -3510,8 +3943,20 @@ impl PrReviewerView {
                                                     .small()
                                                     .disabled(is_posting)
                                                     .loading(is_posting)
-                                                    .icon(Icon::new(LucideIcon::Send).small())
-                                                    .label(if is_posting { "Posting..." } else { "Post" })
+                                                    .icon(
+                                                        Icon::new(if is_reply {
+                                                            LucideIcon::Reply
+                                                        } else {
+                                                            LucideIcon::Send
+                                                        })
+                                                        .small(),
+                                                    )
+                                                    .label(match (is_posting, is_reply) {
+                                                        (true, true) => "Replying...",
+                                                        (true, false) => "Posting...",
+                                                        (false, true) => "Reply",
+                                                        (false, false) => "Post",
+                                                    })
                                                     .on_click(cx.listener(move |this, _, _, cx| {
                                                         this.handle_post_comment(
                                                             comment_for_post.clone(),
@@ -3523,11 +3968,277 @@ impl PrReviewerView {
                                     )
                                     .into_any_element()
                             }))
+                            .when(show_rejected_section, |col| {
+                                col.child(
+                                    v_flex()
+                                        .mt_3()
+                                        .pt_3()
+                                        .border_t_1()
+                                        .border_color(theme.border)
+                                        .gap_2()
+                                        .child(
+                                            h_flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .text_xs()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(theme.muted_foreground)
+                                                .child(
+                                                    Icon::new(LucideIcon::Ban)
+                                                        .small()
+                                                        .text_color(red),
+                                                )
+                                                .child(format!(
+                                                    "Rejected Comments ({})",
+                                                    rejected_critiqued.len()
+                                                )),
+                                        )
+                                        .children(
+                                            rejected_critiqued.into_iter().enumerate().map(
+                                                |(r_idx, comment)| {
+                                                    let rej_id = comment.id.clone();
+                                                    let is_expanded = self
+                                                        .expanded_rejected_comments
+                                                        .contains(&rej_id);
+                                                    let is_line = comment.comment_type
+                                                        == ReviewCommentType::Line;
+                                                    let loc_label =
+                                                        match (comment.file.as_deref(), comment.line)
+                                                        {
+                                                            (Some(f), Some(l)) => {
+                                                                Some(format!("{f}:{l}"))
+                                                            }
+                                                            (Some(f), None) => Some(f.to_string()),
+                                                            _ => None,
+                                                        };
+                                                    let reason_text = comment
+                                                        .reason
+                                                        .clone()
+                                                        .filter(|s| !s.trim().is_empty())
+                                                        .unwrap_or_else(|| "Rejected".to_string());
+                                                    let toggle_id = rej_id.clone();
+                                                    let md_id = SharedString::from(format!(
+                                                        "pr-rejected-md-{}-{}",
+                                                        comment.id, self.comment_render_rev
+                                                    ));
+
+                                                    v_flex()
+                                                        .p_3()
+                                                        .gap_2p5()
+                                                        .rounded(theme.radius)
+                                                        .border_1()
+                                                        .border_color(theme.border)
+                                                        .bg(theme.sidebar)
+                                                        .child(
+                                                            h_flex()
+                                                                .items_center()
+                                                                .justify_between()
+                                                                .gap_2()
+                                                                .child(
+                                                                    h_flex()
+                                                                        .flex_1()
+                                                                        .min_w_0()
+                                                                        .flex_wrap()
+                                                                        .items_center()
+                                                                        .gap_2()
+                                                                        .child(
+                                                                            h_flex()
+                                                                                .items_center()
+                                                                                .gap_1()
+                                                                                .px_2()
+                                                                                .py_0p5()
+                                                                                .rounded(theme.radius)
+                                                                                .border_1()
+                                                                                .border_color(red.opacity(0.4))
+                                                                                .bg(red.opacity(0.1))
+                                                                                .text_xs()
+                                                                                .font_weight(FontWeight::SEMIBOLD)
+                                                                                .text_color(red)
+                                                                                .child(
+                                                                                    Icon::new(LucideIcon::CircleX)
+                                                                                        .xsmall(),
+                                                                                )
+                                                                                .child(reason_text),
+                                                                        )
+                                                                        .when_some(
+                                                                            comment.phase.clone(),
+                                                                            |row, phase| {
+                                                                                row.child(
+                                                                                    div()
+                                                                                        .px_1p5()
+                                                                                        .py_0p5()
+                                                                                        .rounded(theme.radius)
+                                                                                        .bg(theme.secondary)
+                                                                                        .text_xs()
+                                                                                        .text_color(
+                                                                                            theme.muted_foreground,
+                                                                                        )
+                                                                                        .child(phase),
+                                                                                )
+                                                                            },
+                                                                        )
+                                                                        .when(is_line, |row| {
+                                                                            row.when_some(loc_label, |r, loc| {
+                                                                                r.child(
+                                                                                    div()
+                                                                                        .max_w(px(280.))
+                                                                                        .font_family(
+                                                                                            theme
+                                                                                                .mono_font_family
+                                                                                                .clone(),
+                                                                                        )
+                                                                                        .text_xs()
+                                                                                        .text_color(
+                                                                                            theme.muted_foreground,
+                                                                                        )
+                                                                                        .truncate()
+                                                                                        .child(loc),
+                                                                                )
+                                                                            })
+                                                                        }),
+                                                                )
+                                                                .child(
+                                                                    Button::new((
+                                                                        "pr-toggle-rejected",
+                                                                        r_idx,
+                                                                    ))
+                                                                    .ghost()
+                                                                    .xsmall()
+                                                                    .icon(
+                                                                        Icon::new(if is_expanded {
+                                                                            LucideIcon::ChevronUp
+                                                                        } else {
+                                                                            LucideIcon::ChevronDown
+                                                                        })
+                                                                        .xsmall(),
+                                                                    )
+                                                                    .label(if is_expanded {
+                                                                        "Collapse"
+                                                                    } else {
+                                                                        "Expand"
+                                                                    })
+                                                                    .on_click(cx.listener(
+                                                                        move |this, _, _, cx| {
+                                                                            if this
+                                                                                .expanded_rejected_comments
+                                                                                .contains(&toggle_id)
+                                                                            {
+                                                                                this.expanded_rejected_comments
+                                                                                    .remove(&toggle_id);
+                                                                            } else {
+                                                                                this.expanded_rejected_comments
+                                                                                    .insert(
+                                                                                        toggle_id.clone(),
+                                                                                    );
+                                                                            }
+                                                                            cx.notify();
+                                                                        },
+                                                                    )),
+                                                                ),
+                                                        )
+                                                        .when(is_expanded, |card| {
+                                                            card.child(
+                                                                v_flex()
+                                                                    .pt_2()
+                                                                    .border_t_1()
+                                                                    .border_color(theme.border)
+                                                                    .gap_2()
+                                                                    .when(
+                                                                        is_line
+                                                                            && comment
+                                                                                .code_lines
+                                                                                .as_ref()
+                                                                                .is_some_and(
+                                                                                    |lines| {
+                                                                                        !lines.is_empty()
+                                                                                    },
+                                                                                ),
+                                                                        |inner| {
+                                                                            let lines = comment
+                                                                                .code_lines
+                                                                                .as_ref()
+                                                                                .map(|v| v.as_slice())
+                                                                                .unwrap_or(&[]);
+                                                                            inner.child(
+                                                                                render_code_context_block(
+                                                                                    lines, theme,
+                                                                                ),
+                                                                            )
+                                                                        },
+                                                                    )
+                                                                    .child(
+                                                                        div()
+                                                                            .text_sm()
+                                                                            .text_color(theme.foreground)
+                                                                            .child(
+                                                                                TextView::markdown(
+                                                                                    md_id,
+                                                                                    comment.comment.clone(),
+                                                                                )
+                                                                                .selectable(true),
+                                                                            ),
+                                                                    ),
+                                                            )
+                                                        })
+                                                },
+                                            ),
+                                        ),
+                                )
+                            })
                             .into_any_element()
                     }),
             )
             .into_any_element()
     }
+}
+
+fn render_critic_status_badge(
+    comment: &ReviewComment,
+    collapsed: bool,
+    theme: &Theme,
+) -> Option<AnyElement> {
+    let status = comment.status?;
+    let green = hsla(152.0 / 360.0, 0.76, 0.40, 1.0);
+    let amber = hsla(38.0 / 360.0, 0.92, 0.50, 1.0);
+    let blue = hsla(212.0 / 360.0, 0.88, 0.56, 1.0);
+
+    let (icon, label, color) = match status {
+        ReviewCommentStatus::Approved => (LucideIcon::Check, "Approved".to_string(), green),
+        ReviewCommentStatus::Edited => (LucideIcon::Pencil, "Edited by Critic".to_string(), amber),
+        ReviewCommentStatus::Merged => (
+            LucideIcon::GitMerge,
+            "Merged by Critic".to_string(),
+            theme.primary,
+        ),
+        ReviewCommentStatus::Reply => {
+            let text = match (comment.thread_id, collapsed) {
+                (Some(tid), true) => format!("Reply #{tid}"),
+                (Some(tid), false) => format!("Reply to Thread #{tid}"),
+                (None, true) => "Reply".to_string(),
+                (None, false) => "Reply by Critic".to_string(),
+            };
+            (LucideIcon::Reply, text, blue)
+        }
+        ReviewCommentStatus::Rejected => return None,
+    };
+
+    Some(
+        h_flex()
+            .items_center()
+            .gap_1()
+            .px_1p5()
+            .py_0p5()
+            .rounded(theme.radius)
+            .border_1()
+            .border_color(color.opacity(0.35))
+            .bg(color.opacity(0.1))
+            .text_xs()
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(color)
+            .child(Icon::new(icon).xsmall())
+            .child(label)
+            .into_any_element(),
+    )
 }
 
 fn render_code_context_block(code_lines: &[CodeContextLine], theme: &Theme) -> AnyElement {

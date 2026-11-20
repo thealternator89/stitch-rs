@@ -12,8 +12,9 @@ use crate::infrastructure::providers::{
     ensure_success_json, strip_git_suffix,
 };
 use crate::types::{
-    ParsedPrUrl, ParsedRemoteUrl, PostPrCommentRequest, PrHostType, PrMetadata, PrSearchType,
-    ReviewCommentType, TicketData,
+    ExistingPrCommentLineRange, ExistingPrCommentThread, ExistingPrThreadComment, ParsedPrUrl,
+    ParsedRemoteUrl, PostPrCommentRequest, PrHostType, PrMetadata, PrSearchType, ReviewCommentType,
+    TicketData,
 };
 
 const API_VERSION: &str = "7.1";
@@ -1160,6 +1161,181 @@ impl CodeReviewProvider for AzureDevOpsCodeReviewClient {
             .map_err(|err| anyhow::anyhow!("Failed to create comment thread: {err}"))?;
         ensure_success(response, "Azure DevOps PR comment thread").await
     }
+
+    async fn get_pr_comment_threads(
+        &self,
+        pr_url_or_id: &str,
+        remote_url: Option<&str>,
+    ) -> anyhow::Result<Vec<ExistingPrCommentThread>> {
+        if self.pat.is_empty() {
+            anyhow::bail!("Azure DevOps Personal Access Token is required.");
+        }
+
+        let (org, project, pr_number) = self.resolve_org_project_pr(pr_url_or_id, remote_url)?;
+        let org_url = AzureDevOpsClient::normalize_org_url(&org);
+        let project_trimmed = project.trim();
+        let pr_details = self
+            .fetch_pr_raw(&org_url, project_trimmed, pr_number)
+            .await?;
+        let repo_id = pr_details
+            .repository
+            .as_ref()
+            .and_then(|r| r.id.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("Pull Request #{pr_number} is missing repository ID.")
+            })?;
+
+        let pr_str = pr_number.to_string();
+        let url = build_ado_api_url(
+            &org_url,
+            &[
+                project_trimmed,
+                "_apis",
+                "git",
+                "repositories",
+                repo_id,
+                "pullRequests",
+                &pr_str,
+                "threads",
+            ],
+            &[],
+            true,
+        )?;
+
+        let response = self
+            .client
+            .get(url)
+            .header(reqwest::header::AUTHORIZATION, self.auth_header())
+            .header(reqwest::header::ACCEPT, "application/json")
+            .send()
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!("Failed to fetch comment threads from Azure DevOps: {err}")
+            })?;
+
+        let list: AdoCommentThreadsResponse =
+            ensure_success_json(response, "Azure DevOps PR comment threads").await?;
+
+        Ok(map_ado_threads(list.value))
+    }
+}
+
+fn map_ado_thread_status(val: Option<&serde_json::Value>) -> (&'static str, bool) {
+    match val {
+        Some(serde_json::Value::Number(n)) => match n.as_u64() {
+            Some(1) => ("active", false),
+            Some(2) => ("fixed", true),
+            Some(3) => ("wontFix", true),
+            Some(4) => ("closed", true),
+            Some(5) => ("byDesign", true),
+            Some(6) => ("pending", false),
+            _ => ("unknown", false),
+        },
+        Some(serde_json::Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+            "active" | "1" => ("active", false),
+            "fixed" | "2" => ("fixed", true),
+            "wontfix" | "3" => ("wontFix", true),
+            "closed" | "4" => ("closed", true),
+            "bydesign" | "5" => ("byDesign", true),
+            "pending" | "6" => ("pending", false),
+            _ => ("unknown", false),
+        },
+        _ => ("unknown", false),
+    }
+}
+
+pub(crate) fn map_ado_threads(raw_threads: Vec<AdoCommentThread>) -> Vec<ExistingPrCommentThread> {
+    let mut result = Vec::new();
+
+    for thread in raw_threads {
+        if thread.is_deleted.unwrap_or(false) {
+            continue;
+        }
+        let Some(thread_id) = thread.id else {
+            continue;
+        };
+
+        let (status_str, is_resolved) = map_ado_thread_status(thread.status.as_ref());
+
+        let (is_line, file_path, line_range) = match thread.thread_context {
+            Some(ctx) => {
+                let raw_path = ctx
+                    .file_path
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                if let Some(fp) = raw_path {
+                    let normalized = fp.replace('\\', "/");
+                    let clean_path = normalized.trim_start_matches('/').to_string();
+                    let start_line = ctx
+                        .right_file_start
+                        .and_then(|p| p.line)
+                        .or_else(|| ctx.left_file_start.and_then(|p| p.line));
+                    let end_line = ctx
+                        .right_file_end
+                        .and_then(|p| p.line)
+                        .or_else(|| ctx.left_file_end.and_then(|p| p.line));
+                    (
+                        true,
+                        Some(clean_path),
+                        Some(ExistingPrCommentLineRange {
+                            start_line,
+                            end_line,
+                        }),
+                    )
+                } else {
+                    (false, None, None)
+                }
+            }
+            None => (false, None, None),
+        };
+
+        let comments: Vec<ExistingPrThreadComment> = thread
+            .comments
+            .into_iter()
+            .filter(|c| !c.is_deleted.unwrap_or(false))
+            .filter_map(|c| {
+                let content = c.content?;
+                if content.trim().is_empty() {
+                    return None;
+                }
+                let author = c
+                    .author
+                    .and_then(|a| a.display_name)
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "Unknown".to_string());
+                Some(ExistingPrThreadComment {
+                    id: c.id,
+                    author,
+                    content,
+                    published_date: c.published_date,
+                })
+            })
+            .collect();
+
+        if comments.is_empty() {
+            continue;
+        }
+
+        result.push(ExistingPrCommentThread {
+            id: thread_id,
+            status: status_str.to_string(),
+            is_resolved,
+            comment_type: if is_line {
+                ReviewCommentType::Line
+            } else {
+                ReviewCommentType::General
+            },
+            file: file_path,
+            line_range,
+            comments,
+        });
+    }
+
+    result
 }
 
 #[derive(Debug, Deserialize)]
@@ -1213,6 +1389,48 @@ struct AdoPrWorkItemsResponse {
 #[derive(Debug, Deserialize)]
 struct AdoWorkItemRefId {
     id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdoCommentThreadsResponse {
+    #[serde(default)]
+    value: Vec<AdoCommentThread>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AdoCommentThread {
+    id: Option<u64>,
+    status: Option<serde_json::Value>,
+    is_deleted: Option<bool>,
+    thread_context: Option<AdoThreadContext>,
+    #[serde(default)]
+    comments: Vec<AdoThreadComment>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdoThreadContext {
+    file_path: Option<String>,
+    right_file_start: Option<AdoCommentPosition>,
+    right_file_end: Option<AdoCommentPosition>,
+    left_file_start: Option<AdoCommentPosition>,
+    left_file_end: Option<AdoCommentPosition>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdoCommentPosition {
+    line: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdoThreadComment {
+    id: Option<u64>,
+    author: Option<AdoIdentityRef>,
+    content: Option<String>,
+    published_date: Option<String>,
+    is_deleted: Option<bool>,
 }
 
 #[cfg(test)]
@@ -1491,5 +1709,83 @@ mod tests {
         assert_eq!(line_json["threadContext"]["rightFileStart"]["offset"], 1);
         assert_eq!(line_json["threadContext"]["rightFileEnd"]["line"], 43);
         assert_eq!(line_json["threadContext"]["rightFileEnd"]["offset"], 1);
+    }
+
+    #[test]
+    fn map_ado_threads_handles_string_and_numeric_statuses_line_context_and_deleted() {
+        let json = r#"{
+            "value": [
+                {
+                    "id": 10,
+                    "status": "fixed",
+                    "isDeleted": false,
+                    "threadContext": {
+                        "filePath": "/src\\auth/token.rs",
+                        "rightFileStart": { "line": 12 },
+                        "rightFileEnd": { "line": 15 }
+                    },
+                    "comments": [
+                        {
+                            "id": 1,
+                            "author": { "displayName": "Alice" },
+                            "content": "Check expiry here.",
+                            "publishedDate": "2026-05-01T10:00:00Z",
+                            "isDeleted": false
+                        },
+                        {
+                            "id": 2,
+                            "author": { "displayName": "Bob" },
+                            "content": "Deleted comment",
+                            "isDeleted": true
+                        }
+                    ]
+                },
+                {
+                    "id": 11,
+                    "status": 1,
+                    "isDeleted": false,
+                    "comments": [
+                        {
+                            "id": 3,
+                            "author": { "displayName": "Carol" },
+                            "content": "Overall PR looks solid."
+                        }
+                    ]
+                },
+                {
+                    "id": 12,
+                    "status": 4,
+                    "isDeleted": true,
+                    "comments": [
+                        { "id": 4, "content": "Ignored deleted thread" }
+                    ]
+                }
+            ]
+        }"#;
+
+        let parsed: AdoCommentThreadsResponse = serde_json::from_str(json).expect("threads json");
+        let threads = map_ado_threads(parsed.value);
+        assert_eq!(threads.len(), 2);
+
+        assert_eq!(threads[0].id, 10);
+        assert_eq!(threads[0].status, "fixed");
+        assert!(threads[0].is_resolved);
+        assert_eq!(threads[0].comment_type, ReviewCommentType::Line);
+        assert_eq!(threads[0].file.as_deref(), Some("src/auth/token.rs"));
+        assert_eq!(
+            threads[0].line_range,
+            Some(ExistingPrCommentLineRange {
+                start_line: Some(12),
+                end_line: Some(15),
+            })
+        );
+        assert_eq!(threads[0].comments.len(), 1);
+        assert_eq!(threads[0].comments[0].author, "Alice");
+
+        assert_eq!(threads[1].id, 11);
+        assert_eq!(threads[1].status, "active");
+        assert!(!threads[1].is_resolved);
+        assert_eq!(threads[1].comment_type, ReviewCommentType::General);
+        assert!(threads[1].file.is_none());
     }
 }

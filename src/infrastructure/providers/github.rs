@@ -11,8 +11,9 @@ use crate::infrastructure::providers::{
     ensure_success_json, strip_git_suffix,
 };
 use crate::types::{
-    ParsedPrUrl, ParsedRemoteUrl, PostPrCommentRequest, PrHostType, PrMetadata, PrSearchType,
-    ReviewCommentType, TicketData,
+    ExistingPrCommentLineRange, ExistingPrCommentThread, ExistingPrThreadComment, ParsedPrUrl,
+    ParsedRemoteUrl, PostPrCommentRequest, PrHostType, PrMetadata, PrSearchType, ReviewCommentType,
+    TicketData,
 };
 
 const GITHUB_API_BASE: &str = "https://api.github.com";
@@ -458,6 +459,124 @@ struct GitHubPullRequest {
     user: Option<GitHubUser>,
 }
 
+#[derive(Debug, Deserialize)]
+struct GitHubPullReviewComment {
+    id: u64,
+    #[serde(default)]
+    in_reply_to_id: Option<u64>,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    line: Option<usize>,
+    #[serde(default)]
+    original_line: Option<usize>,
+    #[serde(default)]
+    start_line: Option<usize>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    user: Option<GitHubUser>,
+    #[serde(default)]
+    created_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubIssueComment {
+    id: u64,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    user: Option<GitHubUser>,
+    #[serde(default)]
+    created_at: Option<String>,
+}
+
+fn map_github_pr_threads(
+    review_comments: Vec<GitHubPullReviewComment>,
+    issue_comments: Vec<GitHubIssueComment>,
+) -> Vec<ExistingPrCommentThread> {
+    let mut threads: Vec<ExistingPrCommentThread> = Vec::new();
+
+    for rc in review_comments {
+        let Some(body) = rc
+            .body
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+
+        let root_id = rc.in_reply_to_id.unwrap_or(rc.id);
+        let author = rc
+            .user
+            .map(|u| u.login)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "Unknown".to_string());
+        let comment_item = ExistingPrThreadComment {
+            id: Some(rc.id),
+            author,
+            content: body,
+            published_date: rc.created_at,
+        };
+
+        if let Some(existing) = threads.iter_mut().find(|t| t.id == root_id) {
+            existing.comments.push(comment_item);
+        } else {
+            let normalized_path = rc.path.trim().replace('\\', "/");
+            let clean_path = normalized_path.trim_start_matches('/').to_string();
+            let start_line = rc.start_line.or(rc.line).or(rc.original_line);
+            let end_line = rc.line.or(rc.original_line);
+            threads.push(ExistingPrCommentThread {
+                id: root_id,
+                status: "active".to_string(),
+                is_resolved: false,
+                comment_type: ReviewCommentType::Line,
+                file: (!clean_path.is_empty()).then_some(clean_path),
+                line_range: Some(ExistingPrCommentLineRange {
+                    start_line,
+                    end_line,
+                }),
+                comments: vec![comment_item],
+            });
+        }
+    }
+
+    for ic in issue_comments {
+        let Some(body) = ic
+            .body
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let author = ic
+            .user
+            .map(|u| u.login)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "Unknown".to_string());
+        threads.push(ExistingPrCommentThread {
+            id: ic.id,
+            status: "active".to_string(),
+            is_resolved: false,
+            comment_type: ReviewCommentType::General,
+            file: None,
+            line_range: None,
+            comments: vec![ExistingPrThreadComment {
+                id: Some(ic.id),
+                author,
+                content: body,
+                published_date: ic.created_at,
+            }],
+        });
+    }
+
+    threads
+}
+
 /// Extracts unique numeric issue references (`#123` or `issues/123`) from a PR description.
 pub fn extract_github_linked_issue_numbers(body: &str) -> Vec<String> {
     if body.is_empty() {
@@ -802,6 +921,50 @@ impl CodeReviewProvider for GitHubCodeReviewClient {
         )
     }
 
+    async fn get_pr_comment_threads(
+        &self,
+        pr_url_or_id: &str,
+        remote_url: Option<&str>,
+    ) -> anyhow::Result<Vec<ExistingPrCommentThread>> {
+        if self.token.is_empty() {
+            anyhow::bail!("GitHub Personal Access Token is required.");
+        }
+
+        let (owner, repo_name, pr_number) =
+            self.resolve_owner_repo_and_number(pr_url_or_id, remote_url)?;
+        let pr_str = pr_number.to_string();
+
+        let mut review_url =
+            build_github_api_url(&["repos", &owner, &repo_name, "pulls", &pr_str, "comments"])?;
+        review_url.query_pairs_mut().append_pair("per_page", "100");
+
+        let mut issue_url =
+            build_github_api_url(&["repos", &owner, &repo_name, "issues", &pr_str, "comments"])?;
+        issue_url.query_pairs_mut().append_pair("per_page", "100");
+
+        let headers_rev = self.headers()?;
+        let headers_iss = self.headers()?;
+
+        let (rev_res, iss_res) = tokio::join!(
+            self.client.get(review_url).headers(headers_rev).send(),
+            self.client.get(issue_url).headers(headers_iss).send()
+        );
+
+        let rev_resp = rev_res.map_err(|err| {
+            anyhow::anyhow!("Failed to fetch GitHub PR review comments: {err}")
+        })?;
+        let iss_resp = iss_res.map_err(|err| {
+            anyhow::anyhow!("Failed to fetch GitHub PR issue comments: {err}")
+        })?;
+
+        let review_comments: Vec<GitHubPullReviewComment> =
+            ensure_success_json(rev_resp, "GitHub PR review comments").await?;
+        let issue_comments: Vec<GitHubIssueComment> =
+            ensure_success_json(iss_resp, "GitHub PR issue comments").await?;
+
+        Ok(map_github_pr_threads(review_comments, issue_comments))
+    }
+
     async fn post_pr_comment(
         &self,
         pr_url_or_id: &str,
@@ -821,7 +984,10 @@ impl CodeReviewProvider for GitHubCodeReviewClient {
             get_attribution_statement(comment.edited)
         );
 
-        let response = if let Some(thread_id) = comment.thread_id {
+        let response = if let Some(thread_id) = comment
+            .thread_id
+            .filter(|_| comment.comment_type == ReviewCommentType::Line)
+        {
             let thread_str = thread_id.to_string();
             let url = build_github_api_url(&[
                 "repos",
@@ -1061,5 +1227,59 @@ mod tests {
         assert_eq!(payload["path"], "src/api/handler.rs");
         assert_eq!(payload["line"], 19);
         assert_eq!(payload["side"], "RIGHT");
+    }
+
+    #[test]
+    fn map_github_pr_threads_groups_review_replies_and_general_comments() {
+        let rev_json = r#"[
+            {
+                "id": 100,
+                "path": "/src/auth.rs",
+                "line": 25,
+                "start_line": 20,
+                "body": "Avoid unwrap here",
+                "user": { "login": "alice" },
+                "created_at": "2026-05-01T10:00:00Z"
+            },
+            {
+                "id": 101,
+                "in_reply_to_id": 100,
+                "path": "src/auth.rs",
+                "line": 25,
+                "body": "Will fix in next commit",
+                "user": { "login": "bob" },
+                "created_at": "2026-05-01T10:05:00Z"
+            }
+        ]"#;
+        let iss_json = r#"[
+            {
+                "id": 200,
+                "body": "Please add changelog entry.",
+                "user": { "login": "carol" },
+                "created_at": "2026-05-01T11:00:00Z"
+            }
+        ]"#;
+
+        let rev: Vec<GitHubPullReviewComment> = serde_json::from_str(rev_json).expect("rev");
+        let iss: Vec<GitHubIssueComment> = serde_json::from_str(iss_json).expect("iss");
+        let threads = map_github_pr_threads(rev, iss);
+
+        assert_eq!(threads.len(), 2);
+        assert_eq!(threads[0].id, 100);
+        assert_eq!(threads[0].comment_type, ReviewCommentType::Line);
+        assert_eq!(threads[0].file.as_deref(), Some("src/auth.rs"));
+        assert_eq!(
+            threads[0].line_range,
+            Some(ExistingPrCommentLineRange {
+                start_line: Some(20),
+                end_line: Some(25),
+            })
+        );
+        assert_eq!(threads[0].comments.len(), 2);
+        assert_eq!(threads[0].comments[1].author, "bob");
+
+        assert_eq!(threads[1].id, 200);
+        assert_eq!(threads[1].comment_type, ReviewCommentType::General);
+        assert_eq!(threads[1].comments[0].content, "Please add changelog entry.");
     }
 }

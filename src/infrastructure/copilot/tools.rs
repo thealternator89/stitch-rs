@@ -7,7 +7,8 @@ use github_copilot_sdk::tool::ToolHandler;
 use github_copilot_sdk::types::{Tool, ToolInvocation};
 use github_copilot_sdk::{Error as SdkError, ToolResult};
 
-use crate::infrastructure::providers::DocumentationProvider;
+use crate::infrastructure::providers::{CodeReviewProvider, DocumentationProvider};
+use crate::types::{ExistingPrCommentThread, ReviewCommentType};
 
 /// Extracts complete JSON objects from a streaming text buffer, discarding non-JSON prefix noise
 /// and returning any trailing incomplete fragment for future chunks.
@@ -180,6 +181,289 @@ pub fn create_request_documentation_tool(
         .with_handler(Arc::new(RequestDocumentationHandler {
             doc_provider,
             provided_doc_ids: Mutex::new(HashSet::new()),
+            on_status,
+        }))
+}
+
+/// Filters existing PR comment threads by optional file path, line range, and keywords.
+pub fn filter_existing_comment_threads(
+    threads: &[ExistingPrCommentThread],
+    file: Option<&str>,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+    keywords: Option<&str>,
+) -> Vec<ExistingPrCommentThread> {
+    let target_file = file
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|f| f.replace('\\', "/").trim_start_matches('/').to_ascii_lowercase());
+    let query_terms: Vec<String> = keywords
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|kw| {
+            kw.split_whitespace()
+                .map(|t| t.to_ascii_lowercase())
+                .collect()
+        })
+        .unwrap_or_default();
+    let has_keywords = !query_terms.is_empty();
+
+    let effective_start = start_line.or(end_line);
+    let effective_end = end_line.or(start_line);
+
+    let mut matched: Vec<ExistingPrCommentThread> = if let Some(ref tf) = target_file {
+        threads
+            .iter()
+            .filter(|t| {
+                if t.comment_type != ReviewCommentType::Line {
+                    return false;
+                }
+                let Some(ref raw_tf) = t.file else {
+                    return false;
+                };
+                let thread_file = raw_tf
+                    .replace('\\', "/")
+                    .trim_start_matches('/')
+                    .to_ascii_lowercase();
+                if !thread_file.ends_with(tf.as_str()) && !tf.ends_with(thread_file.as_str()) {
+                    return false;
+                }
+
+                if let (Some(start), Some(lr)) = (effective_start, t.line_range.as_ref()) {
+                    let end = effective_end.unwrap_or(start);
+                    let thread_start = lr.start_line.or(lr.end_line).unwrap_or(0);
+                    let thread_end = lr.end_line.or(lr.start_line).unwrap_or(thread_start);
+                    if thread_end < start || thread_start > end {
+                        return false;
+                    }
+                }
+
+                if has_keywords {
+                    let content = t
+                        .comments
+                        .iter()
+                        .map(|c| c.content.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .to_ascii_lowercase();
+                    if !query_terms.iter().all(|term| content.contains(term)) {
+                        return false;
+                    }
+                }
+
+                true
+            })
+            .cloned()
+            .collect()
+    } else if has_keywords {
+        threads
+            .iter()
+            .filter(|t| {
+                if t.comment_type != ReviewCommentType::General {
+                    return false;
+                }
+                let content = t
+                    .comments
+                    .iter()
+                    .map(|c| c.content.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_ascii_lowercase();
+                query_terms.iter().all(|term| content.contains(term))
+            })
+            .cloned()
+            .collect()
+    } else {
+        threads.to_vec()
+    };
+
+    let mut seen_ids = HashSet::new();
+    matched.retain(|t| seen_ids.insert(t.id));
+    matched
+}
+
+/// Formats matching PR comment threads into the text block returned by `get_existing_comments`.
+pub fn format_existing_comment_threads(results: &[ExistingPrCommentThread]) -> String {
+    if results.is_empty() {
+        return "No existing comment threads found matching the specified criteria.".to_string();
+    }
+
+    let formatted = results
+        .iter()
+        .map(|t| {
+            let location_str = if t.comment_type == ReviewCommentType::Line {
+                let mut loc = format!(
+                    "Line Comment on {}",
+                    t.file.as_deref().unwrap_or("unknown")
+                );
+                if let Some(start) = t.line_range.as_ref().and_then(|lr| lr.start_line) {
+                    loc.push_str(&format!(":{start}"));
+                    if let Some(end) = t
+                        .line_range
+                        .as_ref()
+                        .and_then(|lr| lr.end_line)
+                        .filter(|&e| e != start)
+                    {
+                        loc.push_str(&format!("-{end}"));
+                    }
+                }
+                loc
+            } else {
+                "General PR Comment".to_string()
+            };
+
+            let status_label = if t.status.trim().is_empty() {
+                "unknown"
+            } else {
+                t.status.trim()
+            };
+            let resolved_label = if t.is_resolved { "YES" } else { "NO" };
+            let header = format!(
+                "Thread #{} [{location_str}]\nStatus: {status_label} (Resolved: {resolved_label})",
+                t.id
+            );
+
+            let comments_text = t
+                .comments
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let author = if c.author.trim().is_empty() {
+                        "Unknown"
+                    } else {
+                        c.author.trim()
+                    };
+                    let date = c
+                        .published_date
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(|d| format!(" at {d}"))
+                        .unwrap_or_default();
+                    let indented = c.content.replace('\n', "\n  ");
+                    format!("  [Comment {} by {author}{date}]:\n  {indented}", i + 1)
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+
+            format!(
+                "--- {header} ---\n{comments_text}\n--- End Thread #{} ---",
+                t.id
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    format!(
+        "Found {} relevant comment thread(s) on the Pull Request:\n\n{formatted}",
+        results.len()
+    )
+}
+
+struct ViewExistingCommentsHandler {
+    provider: Arc<dyn CodeReviewProvider>,
+    pr_url_or_id: String,
+    remote_url: Option<String>,
+    cached_threads: tokio::sync::Mutex<Option<Vec<ExistingPrCommentThread>>>,
+    on_status: Arc<dyn Fn(String) + Send + Sync>,
+}
+
+impl ViewExistingCommentsHandler {
+    async fn query(
+        &self,
+        file: Option<&str>,
+        start_line: Option<usize>,
+        end_line: Option<usize>,
+        keywords: Option<&str>,
+    ) -> String {
+        let mut guard = self.cached_threads.lock().await;
+        if guard.is_none() {
+            (self.on_status)("Critic fetching existing PR comments...".to_string());
+            match self
+                .provider
+                .get_pr_comment_threads(&self.pr_url_or_id, self.remote_url.as_deref())
+                .await
+            {
+                Ok(threads) => {
+                    *guard = Some(threads);
+                }
+                Err(err) => {
+                    let msg = format!("Failed to fetch existing comments: {err}");
+                    (self.on_status)(msg.clone());
+                    return format!("Error: {msg}");
+                }
+            }
+        }
+
+        let threads = guard.as_deref().unwrap_or(&[]);
+        let filtered =
+            filter_existing_comment_threads(threads, file, start_line, end_line, keywords);
+        format_existing_comment_threads(&filtered)
+    }
+}
+
+#[async_trait]
+impl ToolHandler for ViewExistingCommentsHandler {
+    async fn call(&self, invocation: ToolInvocation) -> Result<ToolResult, SdkError> {
+        let file = invocation.arguments.get("file").and_then(|v| v.as_str());
+        let keywords = invocation
+            .arguments
+            .get("keywords")
+            .and_then(|v| v.as_str());
+        let start_line = invocation
+            .arguments
+            .get("startLine")
+            .and_then(|v| v.as_u64())
+            .and_then(|n| usize::try_from(n).ok());
+        let end_line = invocation
+            .arguments
+            .get("endLine")
+            .and_then(|v| v.as_u64())
+            .and_then(|n| usize::try_from(n).ok());
+
+        let text = self.query(file, start_line, end_line, keywords).await;
+        Ok(ToolResult::Text(text))
+    }
+}
+
+/// Creates the `get_existing_comments` custom Copilot tool used by the AI Critic pass.
+pub fn create_view_existing_comments_tool(
+    provider: Arc<dyn CodeReviewProvider>,
+    pr_url_or_id: String,
+    remote_url: Option<String>,
+    on_status: Arc<dyn Fn(String) + Send + Sync>,
+) -> Tool {
+    Tool::new("get_existing_comments")
+        .with_description(
+            "Fetch and search existing comment threads already posted on this Pull Request. File-based search can be either line-based (by specifying \"file\" and optional \"startLine\"/\"endLine\") or keyword-based (by specifying \"file\" and \"keywords\"). You can also search general PR comments by providing \"keywords\" without a \"file\". Use this tool to check if an issue has already been reported or resolved on the PR, and consider suggesting a reply to the existing thread instead of creating a duplicate comment.",
+        )
+        .with_parameters(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "keywords": {
+                    "type": "string",
+                    "description": "Keywords to search for in comment threads. When \"file\" is provided, searches comments on that file matching these keywords. When \"file\" is omitted, searches general PR comments."
+                },
+                "file": {
+                    "type": "string",
+                    "description": "File path to filter comments (e.g. \"src/auth/login.ts\"). Can be combined with line ranges (\"startLine\", \"endLine\") for line-based search, or with \"keywords\" for file-specific keyword search."
+                },
+                "startLine": {
+                    "type": "number",
+                    "description": "Optional start line number to filter line-based comments within this range."
+                },
+                "endLine": {
+                    "type": "number",
+                    "description": "Optional end line number to filter line-based comments within this range."
+                }
+            }
+        }))
+        .with_skip_permission(true)
+        .with_handler(Arc::new(ViewExistingCommentsHandler {
+            provider,
+            pr_url_or_id,
+            remote_url,
+            cached_threads: tokio::sync::Mutex::new(None),
             on_status,
         }))
 }
@@ -530,6 +814,203 @@ mod tests {
             recorded_statuses
                 .iter()
                 .any(|s| s == "Agent requested duplicate document ID: 101 (declined)")
+        );
+    }
+
+    #[test]
+    fn filter_and_format_existing_comment_threads_supports_file_lines_keywords_and_general() {
+        use crate::types::{ExistingPrCommentLineRange, ExistingPrThreadComment};
+
+        let threads = vec![
+            ExistingPrCommentThread {
+                id: 10,
+                status: "fixed".to_string(),
+                is_resolved: true,
+                comment_type: ReviewCommentType::Line,
+                file: Some("src/auth/login.rs".to_string()),
+                line_range: Some(ExistingPrCommentLineRange {
+                    start_line: Some(40),
+                    end_line: Some(45),
+                }),
+                comments: vec![ExistingPrThreadComment {
+                    id: Some(1),
+                    author: "Alice".to_string(),
+                    content: "SQL injection risk in query builder.".to_string(),
+                    published_date: Some("2026-05-01T10:00:00Z".to_string()),
+                }],
+            },
+            ExistingPrCommentThread {
+                id: 11,
+                status: "active".to_string(),
+                is_resolved: false,
+                comment_type: ReviewCommentType::Line,
+                file: Some("src/auth/login.rs".to_string()),
+                line_range: Some(ExistingPrCommentLineRange {
+                    start_line: Some(100),
+                    end_line: Some(100),
+                }),
+                comments: vec![ExistingPrThreadComment {
+                    id: Some(2),
+                    author: "Bob".to_string(),
+                    content: "Nit: rename variable.".to_string(),
+                    published_date: None,
+                }],
+            },
+            ExistingPrCommentThread {
+                id: 12,
+                status: "active".to_string(),
+                is_resolved: false,
+                comment_type: ReviewCommentType::General,
+                file: None,
+                line_range: None,
+                comments: vec![ExistingPrThreadComment {
+                    id: Some(3),
+                    author: "Carol".to_string(),
+                    content: "Please update architecture docs.".to_string(),
+                    published_date: None,
+                }],
+            },
+        ];
+
+        // File + overlapping line range
+        let by_line = filter_existing_comment_threads(
+            &threads,
+            Some("/src/auth/login.rs"),
+            Some(38),
+            Some(42),
+            None,
+        );
+        assert_eq!(by_line.len(), 1);
+        assert_eq!(by_line[0].id, 10);
+
+        // File + keywords
+        let by_file_kw = filter_existing_comment_threads(
+            &threads,
+            Some("login.rs"),
+            None,
+            None,
+            Some("rename variable"),
+        );
+        assert_eq!(by_file_kw.len(), 1);
+        assert_eq!(by_file_kw[0].id, 11);
+
+        // General keywords (no file)
+        let by_general_kw =
+            filter_existing_comment_threads(&threads, None, None, None, Some("architecture docs"));
+        assert_eq!(by_general_kw.len(), 1);
+        assert_eq!(by_general_kw[0].id, 12);
+
+        let formatted = format_existing_comment_threads(&by_line);
+        assert!(formatted.contains("Found 1 relevant comment thread(s)"));
+        assert!(formatted.contains("Thread #10 [Line Comment on src/auth/login.rs:40-45]"));
+        assert!(formatted.contains("Status: fixed (Resolved: YES)"));
+        assert!(formatted.contains("[Comment 1 by Alice at 2026-05-01T10:00:00Z]:"));
+        assert!(formatted.contains("SQL injection risk in query builder."));
+
+        assert_eq!(
+            format_existing_comment_threads(&[]),
+            "No existing comment threads found matching the specified criteria."
+        );
+    }
+
+    #[tokio::test]
+    async fn view_existing_comments_handler_caches_provider_fetch_and_handles_errors() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use crate::types::{
+            ExistingPrThreadComment, ParsedPrUrl, ParsedRemoteUrl, PostPrCommentRequest,
+            PrMetadata, PrSearchType,
+        };
+
+        struct StubCodeProvider {
+            calls: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl CodeReviewProvider for StubCodeProvider {
+            fn parse_pr_url(&self, _url: &str) -> Option<ParsedPrUrl> {
+                None
+            }
+            fn parse_remote_url(&self, _url: &str) -> Option<ParsedRemoteUrl> {
+                None
+            }
+            async fn get_pr_details(
+                &self,
+                _pr_url_or_id: &str,
+                _remote_url: Option<&str>,
+            ) -> anyhow::Result<PrMetadata> {
+                anyhow::bail!("unused")
+            }
+            async fn get_project_prs(
+                &self,
+                _search_type: PrSearchType,
+            ) -> anyhow::Result<Vec<PrMetadata>> {
+                Ok(Vec::new())
+            }
+            async fn get_linked_tickets(
+                &self,
+                _pr_id: &str,
+                _repository_id: Option<&str>,
+            ) -> anyhow::Result<Vec<String>> {
+                Ok(Vec::new())
+            }
+            async fn get_pr_comment_threads(
+                &self,
+                _pr_url_or_id: &str,
+                _remote_url: Option<&str>,
+            ) -> anyhow::Result<Vec<ExistingPrCommentThread>> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                Ok(vec![ExistingPrCommentThread {
+                    id: 77,
+                    status: "active".to_string(),
+                    is_resolved: false,
+                    comment_type: ReviewCommentType::General,
+                    file: None,
+                    line_range: None,
+                    comments: vec![ExistingPrThreadComment {
+                        id: Some(1),
+                        author: "Reviewer".to_string(),
+                        content: "Check retry backoff.".to_string(),
+                        published_date: None,
+                    }],
+                }])
+            }
+            async fn post_pr_comment(
+                &self,
+                _pr_url_or_id: &str,
+                _comment: &PostPrCommentRequest,
+                _remote_url: Option<&str>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let provider = Arc::new(StubCodeProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let statuses: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let statuses_cb = Arc::clone(&statuses);
+        let handler = ViewExistingCommentsHandler {
+            provider: provider.clone(),
+            pr_url_or_id: "42".to_string(),
+            remote_url: None,
+            cached_threads: tokio::sync::Mutex::new(None),
+            on_status: Arc::new(move |s| statuses_cb.lock().unwrap().push(s)),
+        };
+
+        let first = handler.query(None, None, None, Some("retry")).await;
+        assert!(first.contains("Thread #77"));
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
+
+        // Second query uses cached threads without calling provider again.
+        let second = handler.query(None, None, None, Some("nonexistent")).await;
+        assert_eq!(
+            second,
+            "No existing comment threads found matching the specified criteria."
+        );
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            statuses.lock().unwrap().as_slice(),
+            &["Critic fetching existing PR comments...".to_string()]
         );
     }
 }

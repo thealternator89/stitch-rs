@@ -483,7 +483,6 @@ pub struct PrDiffFile {
 #[serde(rename_all = "camelCase", default)]
 pub struct PrReviewerDiskConfig {
     pub groups: Vec<String>,
-    #[allow(dead_code)] // Used by Critic engine in Phase 11
     pub critic_instruction: Option<String>,
 }
 
@@ -521,6 +520,17 @@ pub enum ReviewCommentType {
     Line,
 }
 
+/// Evaluation status assigned to a draft comment by the AI Critic pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReviewCommentStatus {
+    Approved,
+    Edited,
+    Rejected,
+    Merged,
+    Reply,
+}
+
 /// A draft or posted PR review comment generated during a review phase.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -536,6 +546,46 @@ pub struct ReviewComment {
     pub phase_id: Option<String>,
     pub code_lines: Option<Vec<CodeContextLine>>,
     pub posted: bool,
+    #[serde(default)]
+    pub status: Option<ReviewCommentStatus>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub thread_id: Option<u64>,
+    #[serde(default)]
+    pub merged_from_indices: Option<Vec<usize>>,
+}
+
+/// Line span for an existing PR comment thread anchored to a file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExistingPrCommentLineRange {
+    pub start_line: Option<usize>,
+    pub end_line: Option<usize>,
+}
+
+/// Individual comment inside an existing Pull Request discussion thread.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExistingPrThreadComment {
+    pub id: Option<u64>,
+    pub author: String,
+    pub content: String,
+    pub published_date: Option<String>,
+}
+
+/// Existing Pull Request comment thread fetched by `CodeReviewProvider::get_pr_comment_threads`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExistingPrCommentThread {
+    pub id: u64,
+    pub status: String,
+    pub is_resolved: bool,
+    #[serde(rename = "type")]
+    pub comment_type: ReviewCommentType,
+    pub file: Option<String>,
+    pub line_range: Option<ExistingPrCommentLineRange>,
+    pub comments: Vec<ExistingPrThreadComment>,
 }
 
 /// Payload used when posting a review comment (or reply) to Azure DevOps / GitHub.

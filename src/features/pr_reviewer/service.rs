@@ -7,11 +7,13 @@ use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinSet;
 
-use crate::features::pr_reviewer::phase_loader::load_phases_from_disk;
-use crate::features::pr_reviewer::prompts::build_phase_review_prompt;
+use crate::features::pr_reviewer::phase_loader::{
+    load_config_from_dir, load_phases_from_disk, pr_reviewer_root_dir,
+};
+use crate::features::pr_reviewer::prompts::{build_critic_prompt, build_phase_review_prompt};
 use crate::infrastructure::copilot::{
     CopilotService, SessionOptions, StreamError, StreamEvent, create_report_intent_tool,
-    create_request_documentation_tool, resolve_model_override,
+    create_request_documentation_tool, create_view_existing_comments_tool, resolve_model_override,
 };
 use crate::infrastructure::git::GitService;
 use crate::infrastructure::providers::{
@@ -21,8 +23,8 @@ use crate::infrastructure::providers::{
 use crate::infrastructure::sleep_guard::SleepGuard;
 use crate::types::{
     AppSettings, CodeContextLine, CopilotModelInfo, CopilotUsage, KnownDoc, PhaseUsage,
-    PostPrCommentRequest, PrDiffFile, PrHostType, PrMetadata, ReviewComment, ReviewCommentType,
-    ReviewPhase, TicketData, resolve_effective_parallelism, system_cpu_count,
+    PostPrCommentRequest, PrDiffFile, PrHostType, PrMetadata, ReviewComment, ReviewCommentStatus,
+    ReviewCommentType, ReviewPhase, TicketData, resolve_effective_parallelism, system_cpu_count,
 };
 
 const MAX_CONTEXT_LINES: usize = 25;
@@ -95,6 +97,37 @@ pub enum PrReviewStreamEvent {
         phase_title: String,
         comment_count: usize,
     },
+    Finished {
+        comments: Vec<ReviewComment>,
+        usage: CopilotUsage,
+        cleaned_up: bool,
+    },
+    Cancelled {
+        cleaned_up: bool,
+    },
+    Error {
+        message: String,
+        cleaned_up: bool,
+    },
+}
+
+/// Parameters for executing the AI Critic evaluation pass over draft review comments.
+#[derive(Debug, Clone)]
+pub struct PrCriticRequest {
+    pub repo_path: PathBuf,
+    pub pr: PrMetadata,
+    pub pr_url_or_id: String,
+    pub comments: Vec<ReviewComment>,
+    pub model_override: String,
+    pub persona_name: String,
+    pub settings: AppSettings,
+    pub available_models: Vec<CopilotModelInfo>,
+}
+
+/// Streaming status and completion events from `PrReviewerService::critique_comments`.
+#[derive(Debug, Clone)]
+pub enum PrCriticStreamEvent {
+    Status(String),
     Finished {
         comments: Vec<ReviewComment>,
         usage: CopilotUsage,
@@ -314,6 +347,10 @@ pub fn parse_review_jsonl_line(
                 phase_id: Some(phase_id.to_string()),
                 code_lines: None,
                 posted: false,
+                status: None,
+                reason: None,
+                thread_id: None,
+                merged_from_indices: None,
             }))
         }
         "line" => {
@@ -357,10 +394,361 @@ pub fn parse_review_jsonl_line(
                 phase_id: Some(phase_id.to_string()),
                 code_lines,
                 posted: false,
+                status: None,
+                reason: None,
+                thread_id: None,
+                merged_from_indices: None,
             }))
         }
         _ => None,
     }
+}
+
+fn parse_1_based_indices(val: &serde_json::Value, max_len: usize) -> Vec<usize> {
+    let Some(arr) = val.as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|v| v.as_u64())
+        .filter(|&n| n >= 1)
+        .filter_map(|n| usize::try_from(n - 1).ok())
+        .filter(|&idx| idx < max_len)
+        .collect()
+}
+
+/// Applies streamed JSONL Critic decisions (`approve`, `edit`, `reject`, `merge`, `reply`)
+/// to the raw draft comments, re-extracting `code_lines` when line comments are relocated
+/// and defaulting any unhandled comments to `Approved`.
+pub fn apply_critic_decisions(
+    original_comments: &[ReviewComment],
+    decision_lines: &[String],
+    effective_repo_path: Option<&Path>,
+) -> Vec<ReviewComment> {
+    if original_comments.is_empty() {
+        return Vec::new();
+    }
+
+    let mut handled_original_indices: HashSet<usize> = HashSet::new();
+    let mut critiqued: Vec<ReviewComment> = Vec::new();
+    let mut seq = 0usize;
+    let mut next_id = || {
+        seq += 1;
+        format!("critic-{seq}")
+    };
+
+    for raw_line in decision_lines {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with("```") {
+            continue;
+        }
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(action) = obj.get("action").and_then(|v| v.as_str()).map(str::trim) else {
+            continue;
+        };
+
+        match action {
+            "approve" => {
+                let Some(idx) = obj
+                    .get("commentIndex")
+                    .and_then(|v| v.as_u64())
+                    .filter(|&n| n >= 1)
+                    .and_then(|n| usize::try_from(n - 1).ok())
+                    .filter(|&i| i < original_comments.len())
+                else {
+                    continue;
+                };
+                if handled_original_indices.insert(idx) {
+                    let mut c = original_comments[idx].clone();
+                    c.id = next_id();
+                    c.status = Some(ReviewCommentStatus::Approved);
+                    critiqued.push(c);
+                }
+            }
+            "edit" => {
+                let Some(idx) = obj
+                    .get("commentIndex")
+                    .and_then(|v| v.as_u64())
+                    .filter(|&n| n >= 1)
+                    .and_then(|n| usize::try_from(n - 1).ok())
+                    .filter(|&i| i < original_comments.len())
+                else {
+                    continue;
+                };
+                let Some(updated_comment) = obj
+                    .get("comment")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                else {
+                    continue;
+                };
+                if handled_original_indices.insert(idx) {
+                    let original = &original_comments[idx];
+                    let target_type = match obj.get("type").and_then(|v| v.as_str()).map(str::trim)
+                    {
+                        Some("general") => ReviewCommentType::General,
+                        Some("line") => ReviewCommentType::Line,
+                        _ => original.comment_type,
+                    };
+                    let is_general = target_type == ReviewCommentType::General;
+                    let target_file = if is_general {
+                        None
+                    } else {
+                        obj.get("file")
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                            .or_else(|| original.file.clone())
+                    };
+                    let target_line = if is_general {
+                        None
+                    } else {
+                        obj.get("line")
+                            .and_then(|v| v.as_u64())
+                            .and_then(|n| usize::try_from(n).ok())
+                            .filter(|&n| n >= 1)
+                            .or(original.line)
+                    };
+
+                    let mut code_lines = if is_general {
+                        None
+                    } else {
+                        original.code_lines.clone()
+                    };
+
+                    if !is_general {
+                        if let (Some(repo), Some(tf), Some(tl)) =
+                            (effective_repo_path, target_file.as_deref(), target_line)
+                        {
+                            if target_file != original.file || target_line != original.line {
+                                let ctx_size = original.context.unwrap_or(5);
+                                if let Some(extracted) =
+                                    extract_file_context(repo, tf, tl, ctx_size)
+                                {
+                                    code_lines = Some(extracted);
+                                }
+                            }
+                        }
+                    }
+
+                    critiqued.push(ReviewComment {
+                        id: next_id(),
+                        comment_type: target_type,
+                        file: target_file,
+                        line: target_line,
+                        context: if is_general { None } else { original.context },
+                        comment: updated_comment,
+                        phase: original.phase.clone(),
+                        phase_id: original.phase_id.clone(),
+                        code_lines,
+                        posted: false,
+                        status: Some(ReviewCommentStatus::Edited),
+                        reason: None,
+                        thread_id: None,
+                        merged_from_indices: None,
+                    });
+                }
+            }
+            "reject" => {
+                let Some(idx) = obj
+                    .get("commentIndex")
+                    .and_then(|v| v.as_u64())
+                    .filter(|&n| n >= 1)
+                    .and_then(|n| usize::try_from(n - 1).ok())
+                    .filter(|&i| i < original_comments.len())
+                else {
+                    continue;
+                };
+                if handled_original_indices.insert(idx) {
+                    let reason = obj
+                        .get("reason")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("Rejected by Critic")
+                        .to_string();
+                    let mut c = original_comments[idx].clone();
+                    c.id = next_id();
+                    c.status = Some(ReviewCommentStatus::Rejected);
+                    c.reason = Some(reason);
+                    critiqued.push(c);
+                }
+            }
+            "merge" => {
+                let Some(indices_val) = obj.get("commentIndices") else {
+                    continue;
+                };
+                let Some(merged_comment) = obj
+                    .get("comment")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                else {
+                    continue;
+                };
+                let indices = parse_1_based_indices(indices_val, original_comments.len());
+                if indices.is_empty() {
+                    continue;
+                }
+                let unhandled: Vec<usize> = indices
+                    .iter()
+                    .copied()
+                    .filter(|i| !handled_original_indices.contains(i))
+                    .collect();
+                if unhandled.is_empty() {
+                    continue;
+                }
+                for i in unhandled {
+                    handled_original_indices.insert(i);
+                }
+
+                let first = &original_comments[indices[0]];
+                let explicit_file = obj
+                    .get("file")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                let target_type = match obj.get("type").and_then(|v| v.as_str()).map(str::trim) {
+                    Some("general") => ReviewCommentType::General,
+                    Some("line") => ReviewCommentType::Line,
+                    _ => {
+                        if explicit_file.is_some() {
+                            ReviewCommentType::Line
+                        } else {
+                            first.comment_type
+                        }
+                    }
+                };
+                let is_general = target_type == ReviewCommentType::General;
+                let target_file = if is_general {
+                    None
+                } else {
+                    explicit_file.or_else(|| first.file.clone())
+                };
+                let target_line = if is_general {
+                    None
+                } else {
+                    obj.get("line")
+                        .and_then(|v| v.as_u64())
+                        .and_then(|n| usize::try_from(n).ok())
+                        .filter(|&n| n >= 1)
+                        .or(first.line)
+                };
+
+                let mut code_lines = if is_general {
+                    None
+                } else {
+                    first.code_lines.clone()
+                };
+
+                if !is_general {
+                    if let (Some(repo), Some(tf), Some(tl)) =
+                        (effective_repo_path, target_file.as_deref(), target_line)
+                    {
+                        if target_file != first.file || target_line != first.line {
+                            let ctx_size = first.context.unwrap_or(5);
+                            if let Some(extracted) = extract_file_context(repo, tf, tl, ctx_size) {
+                                code_lines = Some(extracted);
+                            }
+                        }
+                    }
+                }
+
+                critiqued.push(ReviewComment {
+                    id: next_id(),
+                    comment_type: target_type,
+                    file: target_file,
+                    line: target_line,
+                    context: if is_general { None } else { first.context },
+                    comment: merged_comment,
+                    phase: first.phase.clone(),
+                    phase_id: first.phase_id.clone(),
+                    code_lines,
+                    posted: false,
+                    status: Some(ReviewCommentStatus::Merged),
+                    reason: None,
+                    thread_id: None,
+                    merged_from_indices: Some(indices),
+                });
+            }
+            "reply" => {
+                let Some(thread_id) = obj.get("threadId").and_then(|v| {
+                    v.as_u64()
+                        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+                }) else {
+                    continue;
+                };
+                let custom_reply_text = obj
+                    .get("comment")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+
+                if let Some(idx) = obj
+                    .get("commentIndex")
+                    .and_then(|v| v.as_u64())
+                    .filter(|&n| n >= 1)
+                    .and_then(|n| usize::try_from(n - 1).ok())
+                    .filter(|&i| i < original_comments.len())
+                {
+                    if handled_original_indices.insert(idx) {
+                        let mut c = original_comments[idx].clone();
+                        c.id = next_id();
+                        if let Some(text) = custom_reply_text {
+                            c.comment = text;
+                        }
+                        c.status = Some(ReviewCommentStatus::Reply);
+                        c.thread_id = Some(thread_id);
+                        critiqued.push(c);
+                    }
+                } else if let Some(indices_val) = obj.get("commentIndices") {
+                    let indices = parse_1_based_indices(indices_val, original_comments.len());
+                    if indices.is_empty() {
+                        continue;
+                    }
+                    let unhandled: Vec<usize> = indices
+                        .iter()
+                        .copied()
+                        .filter(|i| !handled_original_indices.contains(i))
+                        .collect();
+                    if unhandled.is_empty() {
+                        continue;
+                    }
+                    for i in unhandled {
+                        handled_original_indices.insert(i);
+                    }
+                    let mut c = original_comments[indices[0]].clone();
+                    c.id = next_id();
+                    if let Some(text) = custom_reply_text {
+                        c.comment = text;
+                    }
+                    c.status = Some(ReviewCommentStatus::Reply);
+                    c.thread_id = Some(thread_id);
+                    c.merged_from_indices = Some(indices);
+                    critiqued.push(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for (idx, original) in original_comments.iter().enumerate() {
+        if !handled_original_indices.contains(&idx) {
+            let mut c = original.clone();
+            c.id = next_id();
+            c.status = Some(ReviewCommentStatus::Approved);
+            critiqued.push(c);
+        }
+    }
+
+    critiqued
 }
 
 fn phase_attaches(phase: &ReviewPhase, target: &str) -> bool {
@@ -1126,6 +1514,183 @@ impl PrReviewerService {
             .post_pr_comment(pr_url_or_id, request, remote_url.as_deref())
             .await
     }
+
+    pub async fn critique_comments(
+        &self,
+        req: PrCriticRequest,
+        cancel_rx: watch::Receiver<bool>,
+        tx: mpsc::UnboundedSender<PrCriticStreamEvent>,
+    ) {
+        let _sleep_guard = SleepGuard::acquire();
+
+        let outcome = self.execute_critic_pass(&req, cancel_rx, &tx).await;
+
+        let mut cleaned_up = false;
+        match self.cleanup_checkout(&req.repo_path).await {
+            Ok(()) => cleaned_up = true,
+            Err(err) => eprintln!(
+                "Warning: failed to clean up checkout after Critic pass at {}: {err}",
+                req.repo_path.display()
+            ),
+        }
+
+        match outcome {
+            CriticOutcome::Finished { comments, usage } => {
+                let _ = tx.send(PrCriticStreamEvent::Finished {
+                    comments,
+                    usage,
+                    cleaned_up,
+                });
+            }
+            CriticOutcome::Cancelled => {
+                let _ = tx.send(PrCriticStreamEvent::Cancelled { cleaned_up });
+            }
+            CriticOutcome::Error(message) => {
+                let _ = tx.send(PrCriticStreamEvent::Error {
+                    message,
+                    cleaned_up,
+                });
+            }
+        }
+    }
+
+    async fn execute_critic_pass(
+        &self,
+        req: &PrCriticRequest,
+        cancel_rx: watch::Receiver<bool>,
+        tx: &mpsc::UnboundedSender<PrCriticStreamEvent>,
+    ) -> CriticOutcome {
+        if *cancel_rx.borrow() {
+            return CriticOutcome::Cancelled;
+        }
+        if req.comments.is_empty() {
+            return CriticOutcome::Finished {
+                comments: Vec::new(),
+                usage: CopilotUsage::default(),
+            };
+        }
+
+        let effective_repo_path = self.effective_repo_path(&req.repo_path).await;
+        let mut tools = vec![create_report_intent_tool()];
+
+        if !req.pr_url_or_id.trim().is_empty() {
+            if let Ok(provider) = build_code_review_provider(&req.settings) {
+                let remote_url = self.git.get_remote_url(&req.repo_path).await;
+                let tx_status = tx.clone();
+                let status_cb: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |status| {
+                    let _ = tx_status.send(PrCriticStreamEvent::Status(status));
+                });
+                tools.push(create_view_existing_comments_tool(
+                    provider,
+                    req.pr_url_or_id.clone(),
+                    remote_url,
+                    status_cb,
+                ));
+            }
+        }
+
+        let persona_guidelines = if !req.persona_name.trim().is_empty()
+            && !req.persona_name.trim().eq_ignore_ascii_case("none")
+        {
+            req.settings
+                .pr_reviewer
+                .personas
+                .iter()
+                .find(|p| p.name == req.persona_name)
+                .map(|p| p.guidelines.clone())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        let disk_config = load_config_from_dir(&pr_reviewer_root_dir());
+        let critic_instruction = disk_config.critic_instruction.unwrap_or_default();
+
+        let prompt = build_critic_prompt(
+            &req.comments,
+            &req.pr.description,
+            &persona_guidelines,
+            &critic_instruction,
+        );
+
+        let resolved_model =
+            resolve_model_override(&req.model_override, &req.settings.copilot_model);
+
+        let session = match self
+            .copilot
+            .create_session(SessionOptions {
+                token: req.settings.copilot_token.clone(),
+                model: Some(resolved_model.clone()),
+                working_directory: Some(effective_repo_path.clone()),
+                tools,
+                available_tools: None,
+                streaming: true,
+                label: "PR Reviewer Phase: Critic".to_string(),
+            })
+            .await
+        {
+            Ok(s) => s,
+            Err(err) => return CriticOutcome::Error(err.to_string()),
+        };
+
+        let mut decision_lines: Vec<String> = Vec::new();
+        let stream_res = CopilotService::send_and_collect_stream(
+            &session,
+            &prompt,
+            cancel_rx,
+            |event| match event {
+                StreamEvent::Status(status) => {
+                    let _ = tx.send(PrCriticStreamEvent::Status(status));
+                }
+                StreamEvent::JsonLine(line) => {
+                    decision_lines.push(line);
+                }
+            },
+        )
+        .await;
+
+        let _ = session.disconnect().await;
+
+        match stream_res {
+            Ok(mut usage) => {
+                let critiqued = apply_critic_decisions(
+                    &req.comments,
+                    &decision_lines,
+                    Some(&effective_repo_path),
+                );
+                let raw_model = usage.model.clone().unwrap_or(resolved_model);
+                let display_model = resolve_model_display_name(&raw_model, &req.available_models);
+                usage.phases = Some(vec![PhaseUsage {
+                    phase_title: "Critic".to_string(),
+                    model: display_model,
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    cache_read_tokens: usage.cache_read_tokens,
+                    cost: usage.cost,
+                    multiplier: usage.cost,
+                }]);
+                CriticOutcome::Finished {
+                    comments: critiqued,
+                    usage,
+                }
+            }
+            Err(StreamError::Cancelled) => CriticOutcome::Cancelled,
+            Err(StreamError::Timeout(dur)) => CriticOutcome::Error(format!(
+                "Critic phase timed out after {} seconds waiting for Copilot response.",
+                dur.as_secs()
+            )),
+            Err(StreamError::Other(err)) => CriticOutcome::Error(err.to_string()),
+        }
+    }
+}
+
+enum CriticOutcome {
+    Finished {
+        comments: Vec<ReviewComment>,
+        usage: CopilotUsage,
+    },
+    Cancelled,
+    Error(String),
 }
 
 #[derive(Default)]
@@ -1337,6 +1902,89 @@ mod tests {
             }
             other => panic!("unexpected parsed line: {other:?}"),
         }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn apply_critic_decisions_handles_approve_edit_relocate_reject_merge_reply_and_fallback() {
+        let tmp = unique_temp_dir("stitch-rs-critic-decisions");
+        std::fs::create_dir_all(tmp.join("src")).expect("mkdir");
+        std::fs::write(
+            tmp.join("src").join("auth.rs"),
+            "fn one() {}\nfn two() {}\nfn three() {}\nfn four() {}\n",
+        )
+        .expect("write");
+
+        let make_line = |id: &str, line: usize, text: &str| ReviewComment {
+            id: id.to_string(),
+            comment_type: ReviewCommentType::Line,
+            file: Some("src/auth.rs".to_string()),
+            line: Some(line),
+            context: Some(1),
+            comment: text.to_string(),
+            phase: Some("Security".to_string()),
+            phase_id: Some("sec".to_string()),
+            code_lines: extract_file_context(&tmp, "src/auth.rs", line, 1),
+            posted: false,
+            status: None,
+            reason: None,
+            thread_id: None,
+            merged_from_indices: None,
+        };
+
+        let originals = vec![
+            make_line("raw-1", 1, "Approve me"),
+            make_line("raw-2", 1, "Relocate me to line 3"),
+            make_line("raw-3", 2, "Reject me"),
+            make_line("raw-4", 2, "Merge part A"),
+            make_line("raw-5", 2, "Merge part B"),
+            make_line("raw-6", 3, "Reply to existing thread"),
+            make_line("raw-7", 4, "Unhandled fallback"),
+        ];
+
+        let decisions = vec![
+            r#"{"action":"approve","commentIndex":1}"#.to_string(),
+            r#"{"action":"edit","commentIndex":2,"type":"line","file":"src/auth.rs","line":3,"comment":"Edited and relocated"}"#.to_string(),
+            r#"{"action":"reject","commentIndex":3,"reason":"False positive"}"#.to_string(),
+            r#"{"action":"merge","commentIndices":[4,5],"type":"line","file":"src/auth.rs","line":4,"comment":"Combined A+B"}"#.to_string(),
+            r#"{"action":"reply","commentIndex":6,"threadId":889,"comment":"Issue still present"}"#.to_string(),
+        ];
+
+        let out = apply_critic_decisions(&originals, &decisions, Some(&tmp));
+        assert_eq!(out.len(), 6);
+
+        // 1: Approved
+        assert_eq!(out[0].status, Some(ReviewCommentStatus::Approved));
+        assert_eq!(out[0].comment, "Approve me");
+
+        // 2: Edited + relocated to line 3 (code_lines re-extracted)
+        assert_eq!(out[1].status, Some(ReviewCommentStatus::Edited));
+        assert_eq!(out[1].comment, "Edited and relocated");
+        assert_eq!(out[1].line, Some(3));
+        let relocated_ctx = out[1].code_lines.as_ref().expect("relocated context");
+        assert!(relocated_ctx.iter().any(|l| l.line == 3 && l.is_target && l.text == "fn three() {}"));
+
+        // 3: Rejected with terse reason
+        assert_eq!(out[2].status, Some(ReviewCommentStatus::Rejected));
+        assert_eq!(out[2].reason.as_deref(), Some("False positive"));
+
+        // 4+5: Merged + relocated to line 4
+        assert_eq!(out[3].status, Some(ReviewCommentStatus::Merged));
+        assert_eq!(out[3].comment, "Combined A+B");
+        assert_eq!(out[3].line, Some(4));
+        assert_eq!(out[3].merged_from_indices, Some(vec![3, 4]));
+        let merged_ctx = out[3].code_lines.as_ref().expect("merged context");
+        assert!(merged_ctx.iter().any(|l| l.line == 4 && l.is_target && l.text == "fn four() {}"));
+
+        // 6: Reply to thread #889
+        assert_eq!(out[4].status, Some(ReviewCommentStatus::Reply));
+        assert_eq!(out[4].thread_id, Some(889));
+        assert_eq!(out[4].comment, "Issue still present");
+
+        // 7: Unhandled fallback -> Approved
+        assert_eq!(out[5].status, Some(ReviewCommentStatus::Approved));
+        assert_eq!(out[5].comment, "Unhandled fallback");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
