@@ -3,8 +3,9 @@ use std::sync::Arc;
 use tokio::sync::watch;
 
 use crate::features::story_writer::prompts::build_story_prompt;
+use crate::features::test_case_writer::prompts::build_test_case_prompt;
 use crate::infrastructure::copilot::{CopilotService, SessionOptions, StreamError};
-use crate::types::{AppSettings, StoryWriterPrompts};
+use crate::types::{AppSettings, StoryWriterPrompts, TestCaseWriterPrompts};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValidationVerdict {
@@ -110,33 +111,16 @@ USER-CUSTOMIZED STATEMENTS TO EVALUATE:
     )
 }
 
-pub async fn check_story_writer_prompt_complexity(
+const NO_CUSTOM_PROMPT_PASS: &str =
+    "PASS: No customized prompt statements detected. Please customize at least one field before checking.";
+
+async fn run_prompt_complexity_check(
     copilot: Arc<CopilotService>,
-    prompts: &StoryWriterPrompts,
+    prompt_to_check: &str,
+    custom_inputs: &[(&str, &str)],
     settings: &AppSettings,
 ) -> anyhow::Result<PromptValidationResult> {
-    let custom_inputs = [
-        ("general", prompts.general.as_str()),
-        ("title", prompts.title.as_str()),
-        ("description", prompts.description.as_str()),
-        ("acceptanceCriteria", prompts.acceptance_criteria.as_str()),
-        ("notes", prompts.notes.as_str()),
-    ];
-
-    let has_custom = custom_inputs.iter().any(|(_, val)| !val.trim().is_empty());
-    if !has_custom {
-        return Ok(parse_validation_response(
-            "PASS: No customized prompt statements detected. Please customize at least one field before checking.",
-        ));
-    }
-
-    let prompt_to_check = build_story_prompt(
-        "[Page Title Placeholder]",
-        "[Page Content Placeholder]",
-        "[Additional Context Placeholder]",
-        prompts,
-    );
-    let meta_prompt = build_prompt_complexity_check_prompt(&prompt_to_check, &custom_inputs);
+    let meta_prompt = build_prompt_complexity_check_prompt(prompt_to_check, custom_inputs);
 
     let session = copilot
         .create_session(SessionOptions {
@@ -163,6 +147,60 @@ pub async fn check_story_writer_prompt_complexity(
         Err(StreamError::Cancelled) => anyhow::bail!("Prompt validation was cancelled."),
         Err(StreamError::Other(err)) => Err(err),
     }
+}
+
+pub async fn check_story_writer_prompt_complexity(
+    copilot: Arc<CopilotService>,
+    prompts: &StoryWriterPrompts,
+    settings: &AppSettings,
+) -> anyhow::Result<PromptValidationResult> {
+    let custom_inputs = [
+        ("general", prompts.general.as_str()),
+        ("title", prompts.title.as_str()),
+        ("description", prompts.description.as_str()),
+        ("acceptanceCriteria", prompts.acceptance_criteria.as_str()),
+        ("notes", prompts.notes.as_str()),
+    ];
+
+    if !custom_inputs.iter().any(|(_, val)| !val.trim().is_empty()) {
+        return Ok(parse_validation_response(NO_CUSTOM_PROMPT_PASS));
+    }
+
+    let prompt_to_check = build_story_prompt(
+        "[Page Title Placeholder]",
+        "[Page Content Placeholder]",
+        "[Additional Context Placeholder]",
+        prompts,
+    );
+    run_prompt_complexity_check(copilot, &prompt_to_check, &custom_inputs, settings).await
+}
+
+pub async fn check_test_case_writer_prompt_complexity(
+    copilot: Arc<CopilotService>,
+    prompts: &TestCaseWriterPrompts,
+    settings: &AppSettings,
+) -> anyhow::Result<PromptValidationResult> {
+    let custom_inputs = [
+        ("general", prompts.general.as_str()),
+        ("description", prompts.description.as_str()),
+        ("preConditions", prompts.pre_conditions.as_str()),
+        ("steps", prompts.steps.as_str()),
+        ("expectedResult", prompts.expected_result.as_str()),
+    ];
+
+    if !custom_inputs.iter().any(|(_, val)| !val.trim().is_empty()) {
+        return Ok(parse_validation_response(NO_CUSTOM_PROMPT_PASS));
+    }
+
+    let prompt_to_check = build_test_case_prompt(
+        "[Ticket ID Placeholder]",
+        "[Title Placeholder]",
+        "[Description Placeholder]",
+        Some("[Acceptance Criteria Placeholder]"),
+        "[Additional Context Placeholder]",
+        prompts,
+    );
+    run_prompt_complexity_check(copilot, &prompt_to_check, &custom_inputs, settings).await
 }
 
 #[cfg(test)]

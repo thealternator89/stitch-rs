@@ -168,7 +168,7 @@ pub struct StoryWriterPrompts {
     pub notes: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct TestCaseWriterPrompts {
     pub general: String,
@@ -349,4 +349,24 @@ pub struct StoryData {
     pub acceptance_criteria: String,
     #[serde(default)]
     pub notes: Option<String>,
+}
+
+/// Test case payload streamed from Copilot and managed in `TestCaseWriterView`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestCase {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub pre_conditions: String,
+    #[serde(default)]
+    pub steps: String,
+    #[serde(default)]
+    pub expected_result: String,
+    #[serde(default)]
+    pub priority: String,
+    #[serde(default)]
+    pub deleted: bool,
 }

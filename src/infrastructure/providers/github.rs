@@ -5,7 +5,7 @@ use url::Url;
 
 use crate::infrastructure::constants::get_attribution_statement;
 use crate::infrastructure::providers::{
-    IssueTrackerProvider, build_http_client, ensure_success_json,
+    IssueTrackerProvider, build_http_client, ensure_success, ensure_success_json,
 };
 use crate::types::TicketData;
 
@@ -280,6 +280,47 @@ impl IssueTrackerProvider for GitHubClient {
 
         Ok(Some(format!("{repo}/{}", created.number)))
     }
+
+    async fn add_comment(&self, ticket_id: &str, text: &str, edited: bool) -> anyhow::Result<()> {
+        if self.token.is_empty() {
+            anyhow::bail!("GitHub Personal Access Token is required.");
+        }
+        let (owner, repo, number) = self.parse_ticket_id(ticket_id)?;
+        let number_str = number.to_string();
+        let mut url = Url::parse(GITHUB_API_BASE)?;
+        {
+            let mut segs = url
+                .path_segments_mut()
+                .map_err(|()| anyhow::anyhow!("Invalid GitHub API base URL"))?;
+            segs.push("repos")
+                .push(&owner)
+                .push(&repo)
+                .push("issues")
+                .push(&number_str)
+                .push("comments");
+        }
+
+        let body = build_add_comment_body(text, edited);
+        let response = self
+            .client
+            .post(url)
+            .headers(self.headers()?)
+            .json(&GitHubCreateCommentRequest { body: &body })
+            .send()
+            .await
+            .map_err(|err| anyhow::anyhow!("Failed to post GitHub comment: {err}"))?;
+
+        ensure_success(response, "GitHub").await
+    }
+}
+
+pub fn build_add_comment_body(text: &str, edited: bool) -> String {
+    let attribution = get_attribution_statement(edited);
+    if text.trim().is_empty() {
+        attribution
+    } else {
+        format!("{text}\n\n{attribution}")
+    }
 }
 
 pub fn build_create_issue_body(data: &TicketData, parent_number: u64, edited: bool) -> String {
@@ -314,6 +355,11 @@ pub fn extract_repo_name(repository_url: &str) -> &str {
         .rsplit('/')
         .next()
         .unwrap_or("")
+}
+
+#[derive(Serialize)]
+struct GitHubCreateCommentRequest<'a> {
+    body: &'a str,
 }
 
 #[derive(Serialize)]
@@ -446,5 +492,16 @@ mod tests {
             serde_json::from_str(created_json).expect("created issue");
         assert_eq!(created.id, Some(998877));
         assert_eq!(created.number, 105);
+    }
+
+    #[test]
+    fn build_add_comment_body_appends_attribution() {
+        let generated = build_add_comment_body("Test Cases:\n\n| TC-1 |", false);
+        assert!(generated.starts_with("Test Cases:\n\n| TC-1 |\n\n"));
+        assert!(generated.contains("> Generated with "));
+
+        let edited = build_add_comment_body("Edited table", true);
+        assert!(edited.starts_with("Edited table\n\n"));
+        assert!(edited.contains("> Assisted by "));
     }
 }

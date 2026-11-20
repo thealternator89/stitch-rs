@@ -8,7 +8,7 @@ use url::Url;
 
 use crate::infrastructure::constants::get_attribution_statement;
 use crate::infrastructure::providers::{
-    IssueTrackerProvider, build_http_client, ensure_success_json,
+    IssueTrackerProvider, build_http_client, ensure_success, ensure_success_json,
 };
 use crate::types::TicketData;
 
@@ -311,6 +311,56 @@ impl IssueTrackerProvider for AzureDevOpsClient {
         let created: AdoWorkItem = ensure_success_json(response, "Azure DevOps").await?;
         Ok(created.id.map(|id| id.to_string()))
     }
+
+    async fn add_comment(&self, ticket_id: &str, text: &str, edited: bool) -> anyhow::Result<()> {
+        self.validate_credentials()?;
+        let clean_id = ticket_id.trim();
+        let numeric_id: u64 = clean_id.parse().map_err(|_| {
+            anyhow::anyhow!("Invalid Azure DevOps Work Item ID '{clean_id}'. Expected a number.")
+        })?;
+        let id_str = numeric_id.to_string();
+        let url = self.build_api_url(&["_apis", "wit", "workitems", &id_str], &[])?;
+        let patch = build_add_comment_patch(text, edited);
+        let body_bytes = serde_json::to_vec(&patch)?;
+
+        let response = self
+            .client
+            .patch(url)
+            .header(reqwest::header::AUTHORIZATION, self.auth_header())
+            .header(reqwest::header::ACCEPT, "application/json")
+            .header(reqwest::header::CONTENT_TYPE, "application/json-patch+json")
+            .body(body_bytes)
+            .send()
+            .await
+            .map_err(|err| anyhow::anyhow!("Failed to post Azure DevOps comment: {err}"))?;
+
+        ensure_success(response, "Azure DevOps").await
+    }
+}
+
+fn append_attribution(text: &str, edited: bool) -> String {
+    let attribution = get_attribution_statement(edited);
+    if text.trim().is_empty() {
+        attribution
+    } else {
+        format!("{text}\n\n{attribution}")
+    }
+}
+
+pub fn build_add_comment_patch(text: &str, edited: bool) -> Vec<serde_json::Value> {
+    let comment_with_attribution = append_attribution(text, edited);
+    vec![
+        json!({
+            "op": "add",
+            "path": "/fields/System.History",
+            "value": comment_with_attribution,
+        }),
+        json!({
+            "op": "add",
+            "path": "/multilineFieldsFormat/System.History",
+            "value": "Markdown",
+        }),
+    ]
 }
 
 pub fn build_create_work_item_patch(
@@ -318,12 +368,7 @@ pub fn build_create_work_item_patch(
     parent_url: &str,
     edited: bool,
 ) -> Vec<serde_json::Value> {
-    let attribution = get_attribution_statement(edited);
-    let description_with_attribution = if data.description.trim().is_empty() {
-        attribution
-    } else {
-        format!("{}\n\n{}", data.description, attribution)
-    };
+    let description_with_attribution = append_attribution(&data.description, edited);
 
     let mut ops = vec![
         json!({
@@ -594,5 +639,23 @@ mod tests {
             url.as_str(),
             "https://dev.azure.com/my-org/My%20Project/_apis/wit/workitems/$Product%20Backlog%20Item?api-version=7.1"
         );
+    }
+
+    #[test]
+    fn build_add_comment_patch_includes_markdown_format_and_attribution() {
+        let patch = build_add_comment_patch("Test Cases:\n\n| TC-1 | Works |", false);
+        assert_eq!(patch.len(), 2);
+        assert_eq!(patch[0]["op"], "add");
+        assert_eq!(patch[0]["path"], "/fields/System.History");
+        let value = patch[0]["value"].as_str().unwrap();
+        assert!(value.starts_with("Test Cases:\n\n| TC-1 | Works |"));
+        assert!(value.contains("> Generated with "));
+        assert_eq!(patch[1]["op"], "add");
+        assert_eq!(patch[1]["path"], "/multilineFieldsFormat/System.History");
+        assert_eq!(patch[1]["value"], "Markdown");
+
+        let edited_patch = build_add_comment_patch("Edited comment", true);
+        let edited_val = edited_patch[0]["value"].as_str().unwrap();
+        assert!(edited_val.contains("> Assisted by "));
     }
 }

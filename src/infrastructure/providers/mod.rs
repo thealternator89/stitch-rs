@@ -40,6 +40,7 @@ pub trait IssueTrackerProvider: Send + Sync {
         data: &TicketData,
         edited: bool,
     ) -> anyhow::Result<Option<String>>;
+    async fn add_comment(&self, ticket_id: &str, text: &str, edited: bool) -> anyhow::Result<()>;
 }
 
 /// Builds the active `DocumentationProvider` based on `settings.sources.docs`.
@@ -127,10 +128,10 @@ pub(crate) fn build_http_client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
-pub(crate) async fn ensure_success_json<T: serde::de::DeserializeOwned>(
+async fn check_response_status(
     response: reqwest::Response,
     service_label: &str,
-) -> anyhow::Result<T> {
+) -> anyhow::Result<reqwest::Response> {
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
@@ -140,6 +141,22 @@ pub(crate) async fn ensure_success_json<T: serde::de::DeserializeOwned>(
         }
         anyhow::bail!("{service_label} request failed ({status}): {summary}");
     }
+    Ok(response)
+}
+
+pub(crate) async fn ensure_success(
+    response: reqwest::Response,
+    service_label: &str,
+) -> anyhow::Result<()> {
+    check_response_status(response, service_label).await?;
+    Ok(())
+}
+
+pub(crate) async fn ensure_success_json<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    service_label: &str,
+) -> anyhow::Result<T> {
+    let response = check_response_status(response, service_label).await?;
     response
         .json::<T>()
         .await

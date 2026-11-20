@@ -151,7 +151,9 @@ impl AppState {
             let story_writer = cx.new(|cx| {
                 StoryWriterView::new(app_state_handle.clone(), &settings, window, cx)
             });
-            let test_case_writer = cx.new(|_| TestCaseWriterView::new());
+            let test_case_writer = cx.new(|cx| {
+                TestCaseWriterView::new(app_state_handle.clone(), &settings, window, cx)
+            });
             let story_elaborator = cx.new(|_| StoryElaboratorView::new());
             let pr_reviewer = cx.new(|_| PrReviewerView::new());
             let usage_history = cx.new(|_| UsageHistoryView::new());

@@ -15,14 +15,18 @@ use gpui_kit::{
 use crate::app_state::AppState;
 use crate::features::settings::prompt_validator::{
     PromptValidationResult, ValidationVerdict, check_story_writer_prompt_complexity,
-    parse_validation_response,
+    check_test_case_writer_prompt_complexity, parse_validation_response,
 };
 use crate::features::story_writer::prompts::{
     DEFAULT_STORY_AC_PROMPT, DEFAULT_STORY_DESCRIPTION_PROMPT, DEFAULT_STORY_NOTES_PROMPT,
     DEFAULT_STORY_TITLE_PROMPT,
 };
+use crate::features::test_case_writer::prompts::{
+    DEFAULT_TC_DESCRIPTION_PROMPT, DEFAULT_TC_EXPECTED_RESULT_PROMPT,
+    DEFAULT_TC_PRECONDITIONS_PROMPT, DEFAULT_TC_STEPS_PROMPT, SYSTEM_TC_PRIORITY_PROMPT,
+};
 use crate::infrastructure::runtime::spawn_tokio;
-use crate::types::{AppSettings, StoryWriterPrompts};
+use crate::types::{AppSettings, StoryWriterPrompts, TestCaseWriterPrompts};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PromptsSubTab {
@@ -82,6 +86,14 @@ pub struct PromptsSettingsView {
     is_checking_story: bool,
     last_checked_story_key: Option<String>,
     cached_story_result: Option<Result<PromptValidationResult, String>>,
+    tc_general_input: Entity<TextareaState>,
+    tc_description_input: Entity<TextareaState>,
+    tc_preconditions_input: Entity<TextareaState>,
+    tc_steps_input: Entity<TextareaState>,
+    tc_expected_result_input: Entity<TextareaState>,
+    is_checking_tc: bool,
+    last_checked_tc_key: Option<String>,
+    cached_tc_result: Option<Result<PromptValidationResult, String>>,
     feedback: Option<PromptFeedback>,
     _subscriptions: Vec<Subscription>,
 }
@@ -94,6 +106,7 @@ impl PromptsSettingsView {
         cx: &mut Context<Self>,
     ) -> Self {
         let sw = &initial_settings.prompts.story_writer;
+        let tc = &initial_settings.prompts.test_case_writer;
 
         let story_general_input = cx.new(|cx| {
             TextareaState::new(window, cx)
@@ -121,6 +134,32 @@ impl PromptsSettingsView {
                 .default_value(sw.notes.clone())
         });
 
+        let tc_general_input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .placeholder("Optional general instructions inserted between the default header context and ticket details (e.g., 'Emphasize accessibility testing and responsiveness.')")
+                .default_value(tc.general.clone())
+        });
+        let tc_description_input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .placeholder(DEFAULT_TC_DESCRIPTION_PROMPT)
+                .default_value(tc.description.clone())
+        });
+        let tc_preconditions_input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .placeholder(DEFAULT_TC_PRECONDITIONS_PROMPT)
+                .default_value(tc.pre_conditions.clone())
+        });
+        let tc_steps_input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .placeholder(DEFAULT_TC_STEPS_PROMPT)
+                .default_value(tc.steps.clone())
+        });
+        let tc_expected_result_input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .placeholder(DEFAULT_TC_EXPECTED_RESULT_PROMPT)
+                .default_value(tc.expected_result.clone())
+        });
+
         let mut subs = Vec::new();
         for input in [
             &story_general_input,
@@ -134,6 +173,30 @@ impl PromptsSettingsView {
                     InputEvent::Blur => {
                         if this.is_story_dirty(cx) {
                             this.save_story_prompts(false, cx);
+                        }
+                    }
+                    InputEvent::Change => {
+                        this.feedback = None;
+                        cx.notify();
+                    }
+                    _ => {}
+                }
+            });
+            subs.push(sub);
+        }
+
+        for input in [
+            &tc_general_input,
+            &tc_description_input,
+            &tc_preconditions_input,
+            &tc_steps_input,
+            &tc_expected_result_input,
+        ] {
+            let sub = cx.subscribe(input, |this, _, event, cx| {
+                match event {
+                    InputEvent::Blur => {
+                        if this.is_tc_dirty(cx) {
+                            this.save_tc_prompts(false, cx);
                         }
                     }
                     InputEvent::Change => {
@@ -160,9 +223,37 @@ impl PromptsSettingsView {
             is_checking_story: false,
             last_checked_story_key: None,
             cached_story_result: None,
+            tc_general_input,
+            tc_description_input,
+            tc_preconditions_input,
+            tc_steps_input,
+            tc_expected_result_input,
+            is_checking_tc: false,
+            last_checked_tc_key: None,
+            cached_tc_result: None,
             feedback: None,
             _subscriptions: subs,
         }
+    }
+
+    fn apply_save_outcome(
+        &mut self,
+        res: anyhow::Result<()>,
+        success_msg: Option<&str>,
+        err_prefix: &str,
+        cx: &mut Context<Self>,
+    ) {
+        match res {
+            Ok(()) => {
+                if let Some(msg) = success_msg {
+                    self.feedback = Some(PromptFeedback::Saved(msg.to_string()));
+                }
+            }
+            Err(err) => {
+                self.feedback = Some(PromptFeedback::Error(format!("{err_prefix}: {err}")));
+            }
+        }
+        cx.notify();
     }
 
     fn current_story_prompts(&self, cx: &App) -> StoryWriterPrompts {
@@ -195,21 +286,12 @@ impl PromptsSettingsView {
             save_res
         });
 
-        match res {
-            Ok(()) => {
-                if show_saved_banner {
-                    self.feedback = Some(PromptFeedback::Saved(
-                        "Story Writer custom prompts saved.".to_string(),
-                    ));
-                }
-            }
-            Err(err) => {
-                self.feedback = Some(PromptFeedback::Error(format!(
-                    "Failed to save custom prompts: {err}"
-                )));
-            }
-        }
-        cx.notify();
+        self.apply_save_outcome(
+            res,
+            show_saved_banner.then_some("Story Writer custom prompts saved."),
+            "Failed to save custom prompts",
+            cx,
+        );
     }
 
     fn reset_story_defaults(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -234,19 +316,90 @@ impl PromptsSettingsView {
             save_res
         });
 
-        match res {
-            Ok(()) => {
-                self.feedback = Some(PromptFeedback::Saved(
-                    "Story Writer prompts reset to defaults.".to_string(),
-                ));
-            }
-            Err(err) => {
-                self.feedback = Some(PromptFeedback::Error(format!(
-                    "Failed to reset custom prompts: {err}"
-                )));
-            }
+        self.apply_save_outcome(
+            res,
+            Some("Story Writer prompts reset to defaults."),
+            "Failed to reset custom prompts",
+            cx,
+        );
+    }
+
+    fn current_tc_prompts(&self, cx: &App) -> TestCaseWriterPrompts {
+        TestCaseWriterPrompts {
+            general: self.tc_general_input.read(cx).value().trim().to_string(),
+            description: self
+                .tc_description_input
+                .read(cx)
+                .value()
+                .trim()
+                .to_string(),
+            pre_conditions: self
+                .tc_preconditions_input
+                .read(cx)
+                .value()
+                .trim()
+                .to_string(),
+            steps: self.tc_steps_input.read(cx).value().trim().to_string(),
+            expected_result: self
+                .tc_expected_result_input
+                .read(cx)
+                .value()
+                .trim()
+                .to_string(),
         }
-        cx.notify();
+    }
+
+    fn is_tc_dirty(&self, cx: &App) -> bool {
+        let current = self.current_tc_prompts(cx);
+        let saved = &self.app_state.read(cx).settings.prompts.test_case_writer;
+        &current != saved
+    }
+
+    fn save_tc_prompts(&mut self, show_saved_banner: bool, cx: &mut Context<Self>) {
+        let next = self.current_tc_prompts(cx);
+        let res = self.app_state.update(cx, |state, cx| {
+            state.settings.prompts.test_case_writer = next;
+            let save_res = state.save_settings();
+            cx.notify();
+            save_res
+        });
+
+        self.apply_save_outcome(
+            res,
+            show_saved_banner.then_some("Test Case Writer custom prompts saved."),
+            "Failed to save custom prompts",
+            cx,
+        );
+    }
+
+    fn reset_tc_defaults(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for input in [
+            &self.tc_general_input,
+            &self.tc_description_input,
+            &self.tc_preconditions_input,
+            &self.tc_steps_input,
+            &self.tc_expected_result_input,
+        ] {
+            input.update(cx, |state, cx| {
+                state.set_value("", window, cx);
+            });
+        }
+        self.last_checked_tc_key = None;
+        self.cached_tc_result = None;
+
+        let res = self.app_state.update(cx, |state, cx| {
+            state.settings.prompts.test_case_writer = TestCaseWriterPrompts::default();
+            let save_res = state.save_settings();
+            cx.notify();
+            save_res
+        });
+
+        self.apply_save_outcome(
+            res,
+            Some("Test Case Writer prompts reset to defaults."),
+            "Failed to reset custom prompts",
+            cx,
+        );
     }
 
     fn check_story_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -327,90 +480,202 @@ impl PromptsSettingsView {
             .detach();
     }
 
-    fn render_story_writer_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
-        let is_dirty = self.is_story_dirty(cx);
-        let green = hsla(152.0 / 360.0, 0.76, 0.40, 1.0);
-        let red = hsla(0.0, 0.78, 0.55, 1.0);
+    fn check_tc_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_checking_tc {
+            return;
+        }
 
-        v_flex()
-            .gap_4()
+        if self.is_tc_dirty(cx) {
+            self.save_tc_prompts(false, cx);
+        }
+
+        let prompts = self.current_tc_prompts(cx);
+        let has_custom = [
+            &prompts.general,
+            &prompts.description,
+            &prompts.pre_conditions,
+            &prompts.steps,
+            &prompts.expected_result,
+        ]
+        .iter()
+        .any(|s| !s.trim().is_empty());
+
+        if !has_custom {
+            let immediate = parse_validation_response(
+                "PASS: No customized prompt statements detected. Please customize at least one field before checking.",
+            );
+            let modal =
+                cx.new(|_| PromptValidationModalView::with_outcome("Test Case Writer", Ok(immediate)));
+            open_validation_dialog(modal, window, cx);
+            return;
+        }
+
+        let current_key = serde_json::to_string(&prompts).unwrap_or_default();
+        if self.last_checked_tc_key.as_deref() == Some(current_key.as_str()) {
+            if let Some(cached) = self.cached_tc_result.clone() {
+                let modal =
+                    cx.new(|_| PromptValidationModalView::with_outcome("Test Case Writer", cached));
+                open_validation_dialog(modal, window, cx);
+                return;
+            }
+        }
+
+        let (copilot, settings) = {
+            let state = self.app_state.read(cx);
+            (state.copilot_service.clone(), state.settings.clone())
+        };
+
+        self.is_checking_tc = true;
+        cx.notify();
+
+        let modal = cx.new(|_| PromptValidationModalView::loading("Test Case Writer"));
+        open_validation_dialog(modal.clone(), window, cx);
+
+        let view = cx.entity();
+        window
+            .spawn(cx, async move |cx| {
+                let res = spawn_tokio(async move {
+                    check_test_case_writer_prompt_complexity(copilot, &prompts, &settings).await
+                })
+                .await;
+
+                let outcome = match res {
+                    Ok(Ok(parsed)) => Ok(parsed),
+                    Ok(Err(err)) => Err(err.to_string()),
+                    Err(err) => Err(err.to_string()),
+                };
+
+                let _ = cx.update(|_, cx| {
+                    view.update(cx, |this, cx| {
+                        this.is_checking_tc = false;
+                        this.last_checked_tc_key = Some(current_key);
+                        this.cached_tc_result = Some(outcome.clone());
+                        cx.notify();
+                    });
+                    modal.update(cx, |m, cx| {
+                        m.set_outcome(outcome, cx);
+                    });
+                });
+            })
+            .detach();
+    }
+
+    fn render_prompt_toolbar(
+        &self,
+        id_prefix: &'static str,
+        description: &'static str,
+        is_dirty: bool,
+        is_checking: bool,
+        on_check: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        on_reset: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        on_save: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        theme: &gpui_kit::component::Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        h_flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .child(
+                div()
+                    .flex_1()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(description),
+            )
             .child(
                 h_flex()
                     .items_center()
-                    .justify_between()
-                    .gap_3()
+                    .gap_2()
+                    .flex_shrink_0()
                     .child(
-                        div()
-                            .flex_1()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child("Customize the functional guidelines and JSON field instructions sent to Copilot when drafting user stories. Leave a field empty to use its default prompt."),
+                        Button::new(format!("{id_prefix}-check"))
+                            .small()
+                            .disabled(is_checking)
+                            .loading(is_checking)
+                            .icon(Icon::new(LucideIcon::ShieldCheck).small())
+                            .label(if is_checking {
+                                "Checking..."
+                            } else {
+                                "Check Prompt"
+                            })
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                on_check(this, window, cx);
+                            })),
                     )
                     .child(
-                        h_flex()
-                            .items_center()
-                            .gap_2()
-                            .flex_shrink_0()
-                            .child(
-                                Button::new("prompts-story-check")
-                                    .small()
-                                    .disabled(self.is_checking_story)
-                                    .loading(self.is_checking_story)
-                                    .icon(Icon::new(LucideIcon::ShieldCheck).small())
-                                    .label(if self.is_checking_story {
-                                        "Checking..."
-                                    } else {
-                                        "Check Prompt"
-                                    })
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.check_story_prompt(window, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("prompts-story-reset")
-                                    .ghost()
-                                    .small()
-                                    .disabled(self.is_checking_story)
-                                    .icon(Icon::new(LucideIcon::RotateCcw).small())
-                                    .label("Reset Defaults")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.reset_story_defaults(window, cx);
-                                    })),
-                            )
-                            .child({
-                                let btn = Button::new("prompts-story-save")
-                                    .small()
-                                    .disabled(!is_dirty || self.is_checking_story)
-                                    .icon(Icon::new(LucideIcon::Save).small())
-                                    .label("Save Changes")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.save_story_prompts(true, cx);
-                                    }));
-                                if is_dirty { btn.primary() } else { btn.ghost() }
-                            }),
-                    ),
+                        Button::new(format!("{id_prefix}-reset"))
+                            .ghost()
+                            .small()
+                            .disabled(is_checking)
+                            .icon(Icon::new(LucideIcon::RotateCcw).small())
+                            .label("Reset Defaults")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                on_reset(this, window, cx);
+                            })),
+                    )
+                    .child({
+                        let btn = Button::new(format!("{id_prefix}-save"))
+                            .small()
+                            .disabled(!is_dirty || is_checking)
+                            .icon(Icon::new(LucideIcon::Save).small())
+                            .label("Save Changes")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                on_save(this, window, cx);
+                            }));
+                        if is_dirty { btn.primary() } else { btn.ghost() }
+                    }),
             )
-            .when_some(self.feedback.clone(), |col, fb| {
-                let (msg, color, icon) = match fb {
-                    PromptFeedback::Saved(m) => (m, green, LucideIcon::Check),
-                    PromptFeedback::Error(m) => (m, red, LucideIcon::CircleAlert),
-                };
-                col.child(
-                    h_flex()
-                        .items_center()
-                        .gap_2()
-                        .px_3()
-                        .py_2p5()
-                        .rounded(theme.radius)
-                        .border_1()
-                        .border_color(color.opacity(0.4))
-                        .bg(color.opacity(0.08))
-                        .text_xs()
-                        .text_color(color)
-                        .child(Icon::new(icon).small())
-                        .child(div().flex_1().child(msg)),
-                )
+    }
+
+    fn render_feedback_row(
+        &self,
+        feedback: Option<PromptFeedback>,
+        theme: &gpui_kit::component::Theme,
+    ) -> Option<impl IntoElement> {
+        let fb = feedback?;
+        let green = hsla(152.0 / 360.0, 0.76, 0.40, 1.0);
+        let red = hsla(0.0, 0.78, 0.55, 1.0);
+        let (msg, color, icon) = match fb {
+            PromptFeedback::Saved(m) => (m, green, LucideIcon::Check),
+            PromptFeedback::Error(m) => (m, red, LucideIcon::CircleAlert),
+        };
+        Some(
+            h_flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_2p5()
+                .rounded(theme.radius)
+                .border_1()
+                .border_color(color.opacity(0.4))
+                .bg(color.opacity(0.08))
+                .text_xs()
+                .text_color(color)
+                .child(Icon::new(icon).small())
+                .child(div().flex_1().child(msg)),
+        )
+    }
+
+    fn render_story_writer_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let is_dirty = self.is_story_dirty(cx);
+
+        v_flex()
+            .gap_4()
+            .child(self.render_prompt_toolbar(
+                "prompts-story",
+                "Customize the functional guidelines and JSON field instructions sent to Copilot when drafting user stories. Leave a field empty to use its default prompt.",
+                is_dirty,
+                self.is_checking_story,
+                |this, window, cx| this.check_story_prompt(window, cx),
+                |this, window, cx| this.reset_story_defaults(window, cx),
+                |this, _, cx| this.save_story_prompts(true, cx),
+                &theme,
+                cx,
+            ))
+            .when_some(self.render_feedback_row(self.feedback.clone(), &theme), |col, banner| {
+                col.child(banner)
             })
             .child(
                 v_flex()
@@ -463,6 +728,131 @@ impl PromptsSettingsView {
                         72.0,
                         &theme,
                     )),
+            )
+    }
+
+    fn render_test_case_writer_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let is_dirty = self.is_tc_dirty(cx);
+        let amber = hsla(38.0 / 360.0, 0.92, 0.50, 1.0);
+
+        v_flex()
+            .gap_4()
+            .child(self.render_prompt_toolbar(
+                "prompts-tc",
+                "Customize the guidelines and JSON field instructions sent to Copilot when generating test cases. Leave a field empty to use its default prompt.",
+                is_dirty,
+                self.is_checking_tc,
+                |this, window, cx| this.check_tc_prompt(window, cx),
+                |this, window, cx| this.reset_tc_defaults(window, cx),
+                |this, _, cx| this.save_tc_prompts(true, cx),
+                &theme,
+                cx,
+            ))
+            .when_some(self.render_feedback_row(self.feedback.clone(), &theme), |col, banner| {
+                col.child(banner)
+            })
+            .child(
+                v_flex()
+                    .p_5()
+                    .gap_4()
+                    .rounded(theme.radius_lg)
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.sidebar)
+                    .child(render_prompt_field(
+                        "General Instructions",
+                        "Inserted right after the main goal description to influence overall test generation behavior.",
+                        &self.tc_general_input,
+                        92.0,
+                        &theme,
+                    ))
+                    .child(div().h(px(1.)).w_full().bg(theme.border))
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.muted_foreground)
+                            .child("FIELD CUSTOMIZATION"),
+                    )
+                    .child(render_prompt_field(
+                        "Description",
+                        "Define scenario structure requirements.",
+                        &self.tc_description_input,
+                        72.0,
+                        &theme,
+                    ))
+                    .child(render_prompt_field(
+                        "Preconditions",
+                        "Instruct how to detail environment states or prerequisites.",
+                        &self.tc_preconditions_input,
+                        72.0,
+                        &theme,
+                    ))
+                    .child(render_prompt_field(
+                        "Steps",
+                        "Customize the format of steps (e.g. Gherkin Given/When/Then, numbered list).",
+                        &self.tc_steps_input,
+                        84.0,
+                        &theme,
+                    ))
+                    .child(render_prompt_field(
+                        "Expected Result",
+                        "Specify detail requirements for validation expectations.",
+                        &self.tc_expected_result_input,
+                        72.0,
+                        &theme,
+                    ))
+                    .child(
+                        v_flex()
+                            .gap_1p5()
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(theme.foreground)
+                                            .child("Priority"),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .px_2()
+                                            .py_0p5()
+                                            .rounded(theme.radius)
+                                            .border_1()
+                                            .border_color(amber.opacity(0.4))
+                                            .bg(amber.opacity(0.1))
+                                            .text_xs()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(amber)
+                                            .child(Icon::new(LucideIcon::Lock).xsmall())
+                                            .child("System Required"),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .px_3()
+                                    .py_2()
+                                    .rounded(theme.radius)
+                                    .border_1()
+                                    .border_color(theme.border)
+                                    .bg(theme.secondary.opacity(0.5))
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(SYSTEM_TC_PRIORITY_PROMPT),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child("This field is fixed to match downstream categorization logic and cannot be customized."),
+                            ),
+                    ),
             )
     }
 
@@ -519,14 +909,9 @@ impl Render for PromptsSettingsView {
 
         let body = match self.sub_tab {
             PromptsSubTab::StoryWriter => self.render_story_writer_panel(cx).into_any_element(),
-            PromptsSubTab::TestCaseWriter => self
-                .render_future_subtab(
-                    "Test Case Writer Prompts",
-                    "Scheduled for Phase 6",
-                    "Customize general, description, preconditions, steps, and expected result prompts for Test Case Writer along with Check Prompt validation.",
-                    cx,
-                )
-                .into_any_element(),
+            PromptsSubTab::TestCaseWriter => {
+                self.render_test_case_writer_panel(cx).into_any_element()
+            }
             PromptsSubTab::StoryElaborator => self
                 .render_future_subtab(
                     "Story Elaborator Prompts",
@@ -571,8 +956,11 @@ impl Render for PromptsSettingsView {
                             .icon(Icon::new(tab.icon()).small())
                             .label(tab.label())
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.sub_tab = tab;
-                                cx.notify();
+                                if this.sub_tab != tab {
+                                    this.sub_tab = tab;
+                                    this.feedback = None;
+                                    cx.notify();
+                                }
                             }));
                         if active { btn.primary() } else { btn.ghost() }
                     })),
