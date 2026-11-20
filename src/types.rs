@@ -184,11 +184,25 @@ pub struct StoryElaboratorPrompts {
     pub general: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct PrReviewerSettingsConfig {
     pub personas: Vec<ReviewPersona>,
+    #[serde(default = "default_true")]
     pub critic_enabled: bool,
+}
+
+impl Default for PrReviewerSettingsConfig {
+    fn default() -> Self {
+        Self {
+            personas: Vec::new(),
+            critic_enabled: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -377,4 +391,114 @@ pub struct TestCase {
 pub struct KnownDoc {
     pub id: String,
     pub title: String,
+}
+
+/// Filter category for listing active pull requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrSearchType {
+    Assigned,
+    Created,
+    All,
+}
+
+/// Hosting provider kind for a pull request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrHostType {
+    #[default]
+    Azure,
+    GitHub,
+}
+
+/// Components parsed from a Pull Request web URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedPrUrl {
+    pub org: String,
+    pub project: String,
+    pub repo_name: String,
+    pub pr_number: u64,
+}
+
+/// Components parsed from a Git remote origin URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedRemoteUrl {
+    pub org: String,
+    pub project: String,
+    pub repo_name: String,
+}
+
+/// Pull Request metadata retrieved by `CodeReviewProvider`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrMetadata {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub source_branch: String,
+    pub target_branch: String,
+    pub author: String,
+    pub author_unique_name: String,
+    pub repository_name: String,
+    pub repository_id: Option<String>,
+    pub host_type: PrHostType,
+    pub url: Option<String>,
+}
+
+/// Git file change status parsed from `git diff --name-status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrDiffStatus {
+    Added,
+    Deleted,
+    Modified,
+    Renamed,
+    TypeChanged,
+    #[default]
+    Unknown,
+}
+
+impl PrDiffStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::Deleted => "deleted",
+            Self::Modified => "modified",
+            Self::Renamed => "renamed",
+            Self::TypeChanged => "type_changed",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Changed file entry returned by `GitService::get_diff_files`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrDiffFile {
+    pub path: String,
+    pub status: PrDiffStatus,
+}
+
+/// Parsed `~/.stitch/pr-reviewer/config.json`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PrReviewerDiskConfig {
+    pub groups: Vec<String>,
+    #[allow(dead_code)] // Used by Critic engine in Phase 11
+    pub critic_instruction: Option<String>,
+}
+
+/// A review phase markdown file loaded from `~/.stitch/pr-reviewer/phases/*.md`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewPhase {
+    pub id: String,
+    pub title: String,
+    pub group: String,
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    pub attach: Vec<String>,
+    pub body: String,
+    pub template: Option<String>,
+    pub template_error: Option<String>,
+    pub model: Option<String>,
 }

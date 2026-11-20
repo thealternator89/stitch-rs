@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use anyhow::Context as _;
 use tokio::process::Command;
 
-use crate::types::{WorktreeCheckResult, WorktreeCleanResult};
+use crate::types::{PrDiffFile, PrDiffStatus, WorktreeCheckResult, WorktreeCleanResult};
 
 /// Manages Git repository discovery and isolated temporary worktree lifecycles.
 pub struct GitService {
@@ -74,13 +74,208 @@ impl GitService {
         branch.to_string()
     }
 
-    /// Sanitizes a repository directory name for safe use inside worktree directory names.
-    pub fn sanitize_repo_name(repo_root: &Path) -> String {
-        let raw = repo_root
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("repo");
+    /// Reads `remote.origin.url` from the Git repository at `repo_path`.
+    pub async fn get_remote_url(&self, repo_path: &Path) -> Option<String> {
+        let out = Self::run_git(repo_path, &["config", "--get", "remote.origin.url"])
+            .await
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let trimmed = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    }
+
+    /// Returns `true` when `git status --porcelain` reports any uncommitted changes.
+    pub async fn has_uncommitted_changes(&self, repo_path: &Path) -> bool {
+        match Self::run_git(repo_path, &["status", "--porcelain"]).await {
+            Ok(out) if out.status.success() => {
+                !String::from_utf8_lossy(&out.stdout).trim().is_empty()
+            }
+            _ => false,
+        }
+    }
+
+    /// Resolves the current checked-out branch name, falling back to the commit SHA when detached.
+    pub async fn get_current_ref(&self, repo_path: &Path) -> anyhow::Result<String> {
+        if let Ok(branch_out) = Self::run_git(repo_path, &["symbolic-ref", "--short", "-q", "HEAD"]).await {
+            if branch_out.status.success() {
+                let branch = String::from_utf8_lossy(&branch_out.stdout).trim().to_string();
+                if !branch.is_empty() {
+                    return Ok(branch);
+                }
+            }
+        }
+
+        let sha_out = Self::run_git(repo_path, &["rev-parse", "HEAD"]).await?;
+        if !sha_out.status.success() {
+            let stderr = String::from_utf8_lossy(&sha_out.stderr).trim().to_string();
+            anyhow::bail!("Failed to determine current Git ref: {stderr}");
+        }
+        let sha = String::from_utf8_lossy(&sha_out.stdout).trim().to_string();
+        if sha.is_empty() {
+            anyhow::bail!("git rev-parse HEAD returned empty SHA");
+        }
+        Ok(sha)
+    }
+
+    /// Restores the repository to `ref_name`, refusing if uncommitted changes are present.
+    pub async fn restore_ref(&self, repo_path: &Path, ref_name: &str) -> anyhow::Result<()> {
+        if self.has_uncommitted_changes(repo_path).await {
+            anyhow::bail!("Cannot restore repository because it has uncommitted changes.");
+        }
+        let out = Self::run_git(repo_path, &["checkout", ref_name]).await?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            anyhow::bail!("Failed to restore Git ref '{ref_name}': {stderr}");
+        }
+        Ok(())
+    }
+
+    /// Fetches `refs/pull/{pr_number}/merge` (falling back to `/head`) and returns `FETCH_HEAD` SHA.
+    pub async fn fetch_pr(&self, repo_path: &Path, pr_number: u64) -> anyhow::Result<String> {
+        let merge_ref = format!("refs/pull/{pr_number}/merge");
+        let head_ref = format!("refs/pull/{pr_number}/head");
+
+        let primary = Self::run_git(repo_path, &["fetch", "origin", &merge_ref]).await;
+        let fetched_ok = match &primary {
+            Ok(out) if out.status.success() => true,
+            _ => {
+                let fallback = Self::run_git(repo_path, &["fetch", "origin", &head_ref]).await?;
+                if !fallback.status.success() {
+                    let err1 = primary
+                        .as_ref()
+                        .map(|o| String::from_utf8_lossy(&o.stderr).trim().to_string())
+                        .unwrap_or_default();
+                    let err2 = String::from_utf8_lossy(&fallback.stderr).trim().to_string();
+                    anyhow::bail!(
+                        "Failed to fetch PR #{pr_number} from origin: {err1} (fallback: {err2})"
+                    );
+                }
+                true
+            }
+        };
+
+        if fetched_ok {
+            let sha_out = Self::run_git(repo_path, &["rev-parse", "FETCH_HEAD"]).await?;
+            if sha_out.status.success() {
+                let sha = String::from_utf8_lossy(&sha_out.stdout).trim().to_string();
+                if !sha.is_empty() {
+                    return Ok(sha);
+                }
+            }
+        }
+
+        anyhow::bail!("Fetched PR #{pr_number} but failed to resolve FETCH_HEAD SHA.");
+    }
+
+    /// Fetches PR refs and checks out `FETCH_HEAD` directly in `repo_path`, returning the checked-out commit SHA.
+    pub async fn fetch_and_checkout_pr(
+        &self,
+        repo_path: &Path,
+        pr_number: u64,
+    ) -> anyhow::Result<String> {
+        let _fetch_sha = self.fetch_pr(repo_path, pr_number).await?;
+        let checkout = Self::run_git(repo_path, &["checkout", "FETCH_HEAD"]).await?;
+        if !checkout.status.success() {
+            let stderr = String::from_utf8_lossy(&checkout.stderr).trim().to_string();
+            anyhow::bail!("Failed to checkout PR #{pr_number}: {stderr}");
+        }
+        let head_out = Self::run_git(repo_path, &["rev-parse", "HEAD"]).await?;
+        if !head_out.status.success() {
+            let stderr = String::from_utf8_lossy(&head_out.stderr).trim().to_string();
+            anyhow::bail!("Failed to read HEAD commit SHA after checkout: {stderr}");
+        }
+        Ok(String::from_utf8_lossy(&head_out.stdout).trim().to_string())
+    }
+
+    /// Detects merge commits (`> 1` parent) to diff against `HEAD~1`; otherwise uses `target_branch`.
+    pub async fn get_diff_target(&self, repo_path: &Path, target_branch: &str) -> String {
+        if let Ok(out) = Self::run_git(repo_path, &["log", "-1", "--format=%P", "HEAD"]).await {
+            if out.status.success() {
+                let count = String::from_utf8_lossy(&out.stdout)
+                    .split_whitespace()
+                    .count();
+                if count > 1 {
+                    return "HEAD~1".to_string();
+                }
+            }
+        }
+        target_branch.to_string()
+    }
+
+    /// Parses output from `git diff --name-status`.
+    pub fn parse_diff_name_status(output: &str) -> Vec<PrDiffFile> {
+        let mut files = Vec::new();
+        for line in output.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() < 2 {
+                continue;
+            }
+            let raw_status = parts[0].trim();
+            let status = if raw_status.starts_with('A') {
+                PrDiffStatus::Added
+            } else if raw_status.starts_with('D') {
+                PrDiffStatus::Deleted
+            } else if raw_status.starts_with('M') {
+                PrDiffStatus::Modified
+            } else if raw_status.starts_with('R') {
+                PrDiffStatus::Renamed
+            } else if raw_status.starts_with('T') {
+                PrDiffStatus::TypeChanged
+            } else {
+                PrDiffStatus::Unknown
+            };
+            let path = if status == PrDiffStatus::Renamed && parts.len() >= 3 {
+                parts[2].trim().to_string()
+            } else {
+                parts[1].trim().to_string()
+            };
+            if !path.is_empty() {
+                files.push(PrDiffFile { path, status });
+            }
+        }
+        files
+    }
+
+    /// Lists changed files in the current PR checkout against `target_branch` (or `HEAD~1` for merge commits).
+    pub async fn get_diff_files(
+        &self,
+        repo_path: &Path,
+        target_branch: &str,
+    ) -> anyhow::Result<Vec<PrDiffFile>> {
+        let diff_target = self.get_diff_target(repo_path, target_branch).await;
+        let range = format!("{diff_target}...HEAD");
+        let out = Self::run_git(repo_path, &["diff", "--name-status", &range]).await?;
+        if !out.status.success() {
+            // Fallback to two-dot diff when three-dot merge-base fails on shallow clones or orphan branches.
+            let two_dot = format!("{diff_target}..HEAD");
+            let fallback = Self::run_git(repo_path, &["diff", "--name-status", &two_dot]).await?;
+            if !fallback.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                anyhow::bail!("Failed to get diff files against '{diff_target}': {stderr}");
+            }
+            return Ok(Self::parse_diff_name_status(&String::from_utf8_lossy(
+                &fallback.stdout,
+            )));
+        }
+        Ok(Self::parse_diff_name_status(&String::from_utf8_lossy(
+            &out.stdout,
+        )))
+    }
+
+    /// Sanitizes an identifier so only ASCII alphanumerics, `-`, and `_` remain.
+    pub fn sanitize_name(raw: &str, fallback: &str) -> String {
         let sanitized: String = raw
+            .trim()
             .chars()
             .map(|c| {
                 if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
@@ -91,10 +286,19 @@ impl GitService {
             })
             .collect();
         if sanitized.is_empty() {
-            "repo".to_string()
+            fallback.to_string()
         } else {
             sanitized
         }
+    }
+
+    /// Sanitizes a repository directory name for safe use inside worktree directory names.
+    pub fn sanitize_repo_name(repo_root: &Path) -> String {
+        let raw = repo_root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("repo");
+        Self::sanitize_name(raw, "repo")
     }
 
     /// Creates a detached temporary worktree at `worktree_path` checked out to `commit_or_ref`.
@@ -342,6 +546,97 @@ mod tests {
             assert_eq!(clean.removed, 1);
             assert!(clean.errors.is_empty());
             assert!(!wt_path.exists());
+        });
+
+        let _ = std::fs::remove_dir_all(&root_tmp);
+    }
+
+    #[test]
+    fn parse_diff_name_status_maps_all_git_statuses_and_renames() {
+        let raw = "\
+A\tsrc/new_file.rs
+M\tsrc/main.rs
+D\tsrc/removed.rs
+R100\tsrc/old_name.rs\tsrc/new_name.rs
+T\tsrc/symlink_or_mode.rs
+";
+        let files = GitService::parse_diff_name_status(raw);
+        assert_eq!(
+            files,
+            vec![
+                PrDiffFile {
+                    path: "src/new_file.rs".to_string(),
+                    status: PrDiffStatus::Added,
+                },
+                PrDiffFile {
+                    path: "src/main.rs".to_string(),
+                    status: PrDiffStatus::Modified,
+                },
+                PrDiffFile {
+                    path: "src/removed.rs".to_string(),
+                    status: PrDiffStatus::Deleted,
+                },
+                PrDiffFile {
+                    path: "src/new_name.rs".to_string(),
+                    status: PrDiffStatus::Renamed,
+                },
+                PrDiffFile {
+                    path: "src/symlink_or_mode.rs".to_string(),
+                    status: PrDiffStatus::TypeChanged,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn git_pr_helpers_check_dirty_ref_restore_and_diff_files() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root_tmp = std::env::temp_dir().join(format!("stitch-rs-pr-git-test-{nanos}"));
+        std::fs::create_dir_all(&root_tmp).expect("create repo dir");
+
+        run_std_git(&root_tmp, &["init"]);
+        run_std_git(&root_tmp, &["config", "user.name", "Stitch Test"]);
+        run_std_git(&root_tmp, &["config", "user.email", "test@stitch.local"]);
+        std::fs::write(root_tmp.join("base.txt"), "base").expect("write base");
+        run_std_git(&root_tmp, &["add", "."]);
+        run_std_git(&root_tmp, &["commit", "-m", "base"]);
+        run_std_git(&root_tmp, &["branch", "-M", "main"]);
+
+        run_std_git(&root_tmp, &["checkout", "-b", "feature/test"]);
+        std::fs::write(root_tmp.join("feature.txt"), "feat").expect("write feature");
+        run_std_git(&root_tmp, &["add", "."]);
+        run_std_git(&root_tmp, &["commit", "-m", "feat"]);
+
+        let rt = crate::infrastructure::runtime::runtime();
+        rt.block_on(async {
+            let git = GitService::new();
+            assert!(!git.has_uncommitted_changes(&root_tmp).await);
+            let cur = git.get_current_ref(&root_tmp).await.expect("current ref");
+            assert_eq!(cur, "feature/test");
+
+            let diff = git.get_diff_files(&root_tmp, "main").await.expect("diff files");
+            assert_eq!(
+                diff,
+                vec![PrDiffFile {
+                    path: "feature.txt".to_string(),
+                    status: PrDiffStatus::Added,
+                }]
+            );
+
+            // Dirty repo must refuse restore_ref.
+            std::fs::write(root_tmp.join("dirty.txt"), "uncommitted").expect("dirty file");
+            assert!(git.has_uncommitted_changes(&root_tmp).await);
+            assert!(git.restore_ref(&root_tmp, "main").await.is_err());
+
+            let _ = std::fs::remove_file(root_tmp.join("dirty.txt"));
+            git.restore_ref(&root_tmp, "main").await.expect("restore main");
+            assert_eq!(
+                git.get_current_ref(&root_tmp).await.expect("restored ref"),
+                "main"
+            );
         });
 
         let _ = std::fs::remove_dir_all(&root_tmp);

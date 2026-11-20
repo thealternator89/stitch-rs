@@ -164,7 +164,15 @@ impl AppState {
                     cx,
                 )
             });
-            let pr_reviewer = cx.new(|_| PrReviewerView::new());
+            let pr_reviewer = cx.new(|cx| {
+                PrReviewerView::new(
+                    app_state_handle.clone(),
+                    &settings,
+                    git_service.clone(),
+                    window,
+                    cx,
+                )
+            });
             let usage_history = cx.new(|_| UsageHistoryView::new());
             let settings_view = cx.new(|cx| {
                 SettingsView::new(app_state_handle, &settings, git_service.clone(), window, cx)

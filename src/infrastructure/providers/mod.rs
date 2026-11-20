@@ -8,11 +8,14 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-pub use azure_devops::AzureDevOpsClient;
+pub use azure_devops::{AzureDevOpsClient, AzureDevOpsCodeReviewClient};
 pub use confluence::ConfluenceClient;
-pub use github::GitHubClient;
+pub use github::{GitHubClient, GitHubCodeReviewClient};
 
-use crate::types::{AppSettings, DocPageData, KnownDoc, TicketData};
+use crate::types::{
+    AppSettings, DocPageData, KnownDoc, ParsedPrUrl, ParsedRemoteUrl, PrMetadata, PrSearchType,
+    TicketData,
+};
 
 /// External documentation provider (e.g., Atlassian Confluence).
 #[async_trait]
@@ -40,6 +43,26 @@ pub trait IssueTrackerProvider: Send + Sync {
         edited: bool,
     ) -> anyhow::Result<Option<String>>;
     async fn add_comment(&self, ticket_id: &str, text: &str, edited: bool) -> anyhow::Result<()>;
+}
+
+/// External code-review / Pull Request provider (e.g., Azure DevOps Repos, GitHub PRs).
+#[async_trait]
+pub trait CodeReviewProvider: Send + Sync {
+    #[allow(dead_code)]
+    fn parse_pr_url(&self, url: &str) -> Option<ParsedPrUrl>;
+    fn parse_remote_url(&self, url: &str) -> Option<ParsedRemoteUrl>;
+    async fn get_pr_details(
+        &self,
+        pr_url_or_id: &str,
+        remote_url: Option<&str>,
+    ) -> anyhow::Result<PrMetadata>;
+    async fn get_project_prs(&self, search_type: PrSearchType) -> anyhow::Result<Vec<PrMetadata>>;
+    #[allow(dead_code)]
+    async fn get_linked_tickets(
+        &self,
+        pr_id: &str,
+        repository_id: Option<&str>,
+    ) -> anyhow::Result<Vec<String>>;
 }
 
 /// Builds the active `DocumentationProvider` based on `settings.sources.docs`.
@@ -74,49 +97,77 @@ pub fn build_documentation_provider(
     }
 }
 
+fn azure_devops_credentials(settings: &AppSettings) -> anyhow::Result<(&str, &str)> {
+    let org = settings.connectors.azure_dev_ops.org.trim();
+    let pat = settings
+        .connectors
+        .azure_dev_ops
+        .pat
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("");
+    if org.is_empty() || pat.is_empty() {
+        anyhow::bail!(
+            "Azure DevOps Organization URL and PAT are required. Configure them in Settings > Connectors."
+        );
+    }
+    Ok((org, pat))
+}
+
+fn github_credentials(settings: &AppSettings) -> anyhow::Result<(&str, &str)> {
+    let token = settings
+        .connectors
+        .github
+        .token
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("");
+    if token.is_empty() {
+        anyhow::bail!(
+            "GitHub Personal Access Token is required. Configure it in Settings > Connectors."
+        );
+    }
+    Ok((token, settings.connectors.github.owner.trim()))
+}
+
 /// Builds the active `IssueTrackerProvider` based on `settings.sources.issues`.
 pub fn build_issue_tracker_provider(
     settings: &AppSettings,
 ) -> anyhow::Result<Arc<dyn IssueTrackerProvider>> {
     match settings.sources.issues.trim() {
         "azureDevOps" => {
-            let org = settings.connectors.azure_dev_ops.org.trim();
-            let pat = settings
-                .connectors
-                .azure_dev_ops
-                .pat
-                .as_deref()
-                .map(str::trim)
-                .unwrap_or("");
-            if org.is_empty() || pat.is_empty() {
-                anyhow::bail!(
-                    "Azure DevOps Organization URL and PAT are required. Configure them in Settings > Connectors."
-                );
-            }
+            let (org, pat) = azure_devops_credentials(settings)?;
             Ok(Arc::new(AzureDevOpsClient::new(org, pat)))
         }
         "github" => {
-            let token = settings
-                .connectors
-                .github
-                .token
-                .as_deref()
-                .map(str::trim)
-                .unwrap_or("");
-            if token.is_empty() {
-                anyhow::bail!(
-                    "GitHub Personal Access Token is required. Configure it in Settings > Connectors."
-                );
-            }
-            Ok(Arc::new(GitHubClient::new(
-                token,
-                settings.connectors.github.owner.trim(),
-            )))
+            let (token, owner) = github_credentials(settings)?;
+            Ok(Arc::new(GitHubClient::new(token, owner)))
         }
         "" => anyhow::bail!(
             "No Issues Tracker source is configured. Open Settings > Connectors to connect Azure DevOps or GitHub and route Issues Tracker Source."
         ),
         other => anyhow::bail!("Unsupported issues tracker source: {other}"),
+    }
+}
+
+/// Builds the active `CodeReviewProvider` based on `settings.sources.code`.
+pub fn build_code_review_provider(
+    settings: &AppSettings,
+) -> anyhow::Result<Arc<dyn CodeReviewProvider>> {
+    match settings.sources.code.trim() {
+        "azureDevOps" => {
+            let (org, pat) = azure_devops_credentials(settings)?;
+            let project = settings.connectors.azure_dev_ops.project.trim();
+            Ok(Arc::new(AzureDevOpsCodeReviewClient::new(org, pat, project)))
+        }
+        "github" => {
+            let (token, owner) = github_credentials(settings)?;
+            Ok(Arc::new(GitHubCodeReviewClient::new(token, owner)))
+        }
+        "" => anyhow::bail!(
+            "No Code Source is configured. Open Settings > Connectors to connect Azure DevOps or GitHub and route Code Source."
+        ),
+        other => anyhow::bail!("Unsupported code source: {other}"),
     }
 }
 
@@ -170,6 +221,15 @@ fn summarize_error_body(raw: &str) -> String {
     } else {
         let prefix: String = compact.chars().take(MAX_LEN).collect();
         format!("{prefix}...")
+    }
+}
+
+pub(crate) fn strip_git_suffix(s: &str) -> String {
+    let trimmed = s.trim_end_matches('/');
+    if trimmed.len() >= 4 && trimmed[trimmed.len() - 4..].eq_ignore_ascii_case(".git") {
+        trimmed[..trimmed.len() - 4].to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 

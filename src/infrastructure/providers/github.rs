@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use async_trait::async_trait;
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
 use serde::{Deserialize, Serialize};
@@ -5,12 +7,30 @@ use url::Url;
 
 use crate::infrastructure::constants::get_attribution_statement;
 use crate::infrastructure::providers::{
-    IssueTrackerProvider, build_http_client, ensure_success, ensure_success_json,
+    CodeReviewProvider, IssueTrackerProvider, build_http_client, ensure_success,
+    ensure_success_json, strip_git_suffix,
 };
-use crate::types::TicketData;
+use crate::types::{ParsedPrUrl, ParsedRemoteUrl, PrHostType, PrMetadata, PrSearchType, TicketData};
 
 const GITHUB_API_BASE: &str = "https://api.github.com";
 const GITHUB_API_VERSION: &str = "2022-11-28";
+
+fn build_github_headers(token: &str) -> anyhow::Result<HeaderMap> {
+    let mut headers = HeaderMap::new();
+    let auth_val = HeaderValue::from_str(&format!("Bearer {token}"))
+        .map_err(|err| anyhow::anyhow!("Invalid GitHub token header: {err}"))?;
+    headers.insert(AUTHORIZATION, auth_val);
+    headers.insert(
+        ACCEPT,
+        HeaderValue::from_static("application/vnd.github+json"),
+    );
+    headers.insert(
+        "X-GitHub-Api-Version",
+        HeaderValue::from_static(GITHUB_API_VERSION),
+    );
+    headers.insert(USER_AGENT, HeaderValue::from_static("Stitch-App"));
+    Ok(headers)
+}
 
 /// REST client for GitHub Issues (`api.github.com`).
 pub struct GitHubClient {
@@ -29,20 +49,7 @@ impl GitHubClient {
     }
 
     fn headers(&self) -> anyhow::Result<HeaderMap> {
-        let mut headers = HeaderMap::new();
-        let auth_val = HeaderValue::from_str(&format!("Bearer {}", self.token))
-            .map_err(|err| anyhow::anyhow!("Invalid GitHub token header: {err}"))?;
-        headers.insert(AUTHORIZATION, auth_val);
-        headers.insert(
-            ACCEPT,
-            HeaderValue::from_static("application/vnd.github+json"),
-        );
-        headers.insert(
-            "X-GitHub-Api-Version",
-            HeaderValue::from_static(GITHUB_API_VERSION),
-        );
-        headers.insert(USER_AGENT, HeaderValue::from_static("Stitch-App"));
-        Ok(headers)
+        build_github_headers(&self.token)
     }
 
     /// Parses `"owner/repo/123"` or `"repo/123"` (falling back to `default_owner`).
@@ -404,6 +411,379 @@ struct GitHubSearchItem {
     body: Option<String>,
     #[serde(default)]
     repository_url: String,
+    #[serde(default)]
+    html_url: Option<String>,
+    #[serde(default)]
+    user: Option<GitHubUser>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GitHubUser {
+    #[serde(default)]
+    login: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GitHubPrBranch {
+    #[serde(rename = "ref", default)]
+    ref_name: String,
+    #[serde(default)]
+    repo: Option<GitHubPrRepo>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GitHubPrRepo {
+    id: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubPullRequest {
+    number: u64,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    html_url: Option<String>,
+    #[serde(default)]
+    head: Option<GitHubPrBranch>,
+    #[serde(default)]
+    base: Option<GitHubPrBranch>,
+    #[serde(default)]
+    user: Option<GitHubUser>,
+}
+
+/// Extracts unique numeric issue references (`#123` or `issues/123`) from a PR description.
+pub fn extract_github_linked_issue_numbers(body: &str) -> Vec<String> {
+    if body.is_empty() {
+        return Vec::new();
+    }
+    let bytes = body.as_bytes();
+    let lower = body.to_ascii_lowercase();
+    let mut result = Vec::new();
+    let mut seen = HashSet::new();
+
+    let mut i = 0;
+    while i < bytes.len() {
+        let digit_start = if bytes[i] == b'#' {
+            Some(i + 1)
+        } else if lower[i..].starts_with("issues/") {
+            Some(i + "issues/".len())
+        } else {
+            None
+        };
+
+        if let Some(start) = digit_start {
+            let mut end = start;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end > start {
+                let num_str = body[start..end].to_string();
+                if seen.insert(num_str.clone()) {
+                    result.push(num_str);
+                }
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    result
+}
+
+/// REST client for GitHub Pull Requests (`api.github.com`).
+pub struct GitHubCodeReviewClient {
+    client: reqwest::Client,
+    token: String,
+    default_owner: String,
+}
+
+impl GitHubCodeReviewClient {
+    pub fn new(token: impl Into<String>, default_owner: impl Into<String>) -> Self {
+        Self {
+            client: build_http_client(),
+            token: token.into().trim().to_string(),
+            default_owner: default_owner.into().trim().to_string(),
+        }
+    }
+
+    fn headers(&self) -> anyhow::Result<HeaderMap> {
+        build_github_headers(&self.token)
+    }
+
+    async fn run_pr_search(&self, q: &str) -> anyhow::Result<Vec<GitHubSearchItem>> {
+        let mut url = Url::parse(GITHUB_API_BASE)?;
+        url.set_path("/search/issues");
+        {
+            let mut pairs = url.query_pairs_mut();
+            pairs.append_pair("q", q);
+            pairs.append_pair("per_page", "30");
+        }
+        let response = self
+            .client
+            .get(url)
+            .headers(self.headers()?)
+            .send()
+            .await
+            .map_err(|err| anyhow::anyhow!("Failed to query PRs from GitHub: {err}"))?;
+        let payload: GitHubSearchResponse =
+            ensure_success_json(response, "GitHub PR search").await?;
+        Ok(payload.items)
+    }
+
+    fn resolve_owner_repo_and_number(
+        &self,
+        pr_url_or_id: &str,
+        remote_url: Option<&str>,
+    ) -> anyhow::Result<(String, String, u64)> {
+        let trimmed = pr_url_or_id.trim();
+        if let Some(parsed) = self.parse_pr_url(trimmed) {
+            return Ok((parsed.org, parsed.repo_name, parsed.pr_number));
+        }
+
+        let pr_number: u64 = trimmed.parse().map_err(|_| {
+            anyhow::anyhow!("Invalid Pull Request URL or ID format: \"{trimmed}\"")
+        })?;
+
+        if let Some(remote) = remote_url.and_then(|u| self.parse_remote_url(u)) {
+            return Ok((remote.org, remote.repo_name, pr_number));
+        }
+
+        anyhow::bail!(
+            "GitHub Owner and Repository could not be detected. Select a local Git repository or enter the full GitHub PR URL."
+        )
+    }
+}
+
+#[async_trait]
+impl CodeReviewProvider for GitHubCodeReviewClient {
+    fn parse_pr_url(&self, url: &str) -> Option<ParsedPrUrl> {
+        let parsed = Url::parse(url.trim()).ok()?;
+        let host = parsed.host_str()?.to_ascii_lowercase();
+        if host != "github.com" {
+            return None;
+        }
+        let segments: Vec<&str> = parsed.path_segments()?.filter(|s| !s.is_empty()).collect();
+        // /{owner}/{repo}/pull/{number}
+        if segments.len() >= 4 && segments[2].eq_ignore_ascii_case("pull") {
+            let pr_number = segments[3].parse::<u64>().ok()?;
+            return Some(ParsedPrUrl {
+                org: segments[0].to_string(),
+                project: segments[0].to_string(),
+                repo_name: segments[1].to_string(),
+                pr_number,
+            });
+        }
+        None
+    }
+
+    fn parse_remote_url(&self, url: &str) -> Option<ParsedRemoteUrl> {
+        let trimmed = url.trim();
+        if let Some(rest) = trimmed.strip_prefix("git@github.com:") {
+            let parts: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+            if parts.len() >= 2 {
+                return Some(ParsedRemoteUrl {
+                    org: parts[0].to_string(),
+                    project: parts[0].to_string(),
+                    repo_name: strip_git_suffix(parts[1]),
+                });
+            }
+            return None;
+        }
+
+        let parsed = Url::parse(trimmed).ok()?;
+        let host = parsed.host_str()?.to_ascii_lowercase();
+        if host != "github.com" {
+            return None;
+        }
+        let segments: Vec<&str> = parsed.path_segments()?.filter(|s| !s.is_empty()).collect();
+        if segments.len() >= 2 {
+            return Some(ParsedRemoteUrl {
+                org: segments[0].to_string(),
+                project: segments[0].to_string(),
+                repo_name: strip_git_suffix(segments[1]),
+            });
+        }
+        None
+    }
+
+    async fn get_pr_details(
+        &self,
+        pr_url_or_id: &str,
+        remote_url: Option<&str>,
+    ) -> anyhow::Result<PrMetadata> {
+        if self.token.is_empty() {
+            anyhow::bail!("GitHub Personal Access Token is required.");
+        }
+
+        let (owner, repo_name, pr_number) =
+            self.resolve_owner_repo_and_number(pr_url_or_id, remote_url)?;
+        let pr_str = pr_number.to_string();
+
+        let mut url = Url::parse(GITHUB_API_BASE)?;
+        {
+            let mut segs = url
+                .path_segments_mut()
+                .map_err(|()| anyhow::anyhow!("Invalid GitHub API base URL"))?;
+            segs.push("repos")
+                .push(&owner)
+                .push(&repo_name)
+                .push("pulls")
+                .push(&pr_str);
+        }
+
+        let response = self
+            .client
+            .get(url)
+            .headers(self.headers()?)
+            .send()
+            .await
+            .map_err(|err| anyhow::anyhow!("Failed to fetch PR from GitHub API: {err}"))?;
+
+        let pr: GitHubPullRequest = ensure_success_json(response, "GitHub PR").await?;
+        let author = pr.user.map(|u| u.login).unwrap_or_default();
+        let source_branch = pr
+            .head
+            .as_ref()
+            .map(|h| h.ref_name.clone())
+            .unwrap_or_default();
+        let target_branch = pr
+            .base
+            .as_ref()
+            .map(|b| b.ref_name.clone())
+            .unwrap_or_default();
+        let repo_id = pr
+            .base
+            .and_then(|b| b.repo)
+            .and_then(|r| r.id)
+            .map(|id| id.to_string());
+
+        Ok(PrMetadata {
+            id: pr.number.to_string(),
+            title: pr.title,
+            description: pr.body.unwrap_or_default(),
+            source_branch,
+            target_branch,
+            author: author.clone(),
+            author_unique_name: author,
+            repository_name: repo_name,
+            repository_id: repo_id,
+            host_type: PrHostType::GitHub,
+            url: pr.html_url,
+        })
+    }
+
+    async fn get_project_prs(&self, search_type: PrSearchType) -> anyhow::Result<Vec<PrMetadata>> {
+        if self.token.is_empty() {
+            anyhow::bail!("GitHub Personal Access Token is required.");
+        }
+        if self.default_owner.is_empty() {
+            anyhow::bail!(
+                "GitHub Owner/Organization must be configured in Settings > Connectors to fetch PRs."
+            );
+        }
+
+        let login = match search_type {
+            PrSearchType::Assigned | PrSearchType::Created => {
+                let url = Url::parse(&format!("{GITHUB_API_BASE}/user"))?;
+                let resp = self
+                    .client
+                    .get(url)
+                    .headers(self.headers()?)
+                    .send()
+                    .await
+                    .map_err(|err| anyhow::anyhow!("Failed to resolve GitHub user: {err}"))?;
+                let user: GitHubUser = ensure_success_json(resp, "GitHub user").await?;
+                if user.login.trim().is_empty() {
+                    anyhow::bail!("Could not resolve authenticated GitHub login.");
+                }
+                user.login
+            }
+            PrSearchType::All => String::new(),
+        };
+
+        let base_q = format!("user:{} is:pr is:open", self.default_owner);
+        let items: Vec<GitHubSearchItem> = match search_type {
+            PrSearchType::Created => self.run_pr_search(&format!("{base_q} author:{login}")).await?,
+            PrSearchType::Assigned => {
+                let q_rev = format!("{base_q} review-requested:{login}");
+                let q_ass = format!("{base_q} assignee:{login}");
+                let (res_rev, res_ass) =
+                    tokio::join!(self.run_pr_search(&q_rev), self.run_pr_search(&q_ass));
+                let mut combined = res_rev?;
+                combined.extend(res_ass?);
+                let mut seen = HashSet::new();
+                combined
+                    .into_iter()
+                    .filter(|item| seen.insert(format!("{}/{}", item.repository_url, item.number)))
+                    .collect()
+            }
+            PrSearchType::All => self.run_pr_search(&base_q).await?,
+        };
+
+        Ok(items
+            .into_iter()
+            .map(|item| {
+                let repo_name = extract_repo_name(&item.repository_url).to_string();
+                let login = item.user.map(|u| u.login).unwrap_or_default();
+                PrMetadata {
+                    id: item.number.to_string(),
+                    title: item.title,
+                    description: item.body.unwrap_or_default(),
+                    source_branch: String::new(),
+                    target_branch: String::new(),
+                    author: login.clone(),
+                    author_unique_name: login,
+                    repository_name: repo_name,
+                    repository_id: None,
+                    host_type: PrHostType::GitHub,
+                    url: item.html_url,
+                }
+            })
+            .collect())
+    }
+
+    async fn get_linked_tickets(
+        &self,
+        pr_id: &str,
+        repository_id: Option<&str>,
+    ) -> anyhow::Result<Vec<String>> {
+        if self.token.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let Ok((owner, repo_name, pr_number)) = self.resolve_owner_repo_and_number(
+            pr_id,
+            repository_id.filter(|s| s.contains("github.com")),
+        ) else {
+            return Ok(Vec::new());
+        };
+        let pr_str = pr_number.to_string();
+
+        let mut url = Url::parse(GITHUB_API_BASE)?;
+        {
+            let mut segs = url
+                .path_segments_mut()
+                .map_err(|()| anyhow::anyhow!("Invalid GitHub API base URL"))?;
+            segs.push("repos")
+                .push(&owner)
+                .push(&repo_name)
+                .push("pulls")
+                .push(&pr_str);
+        }
+
+        let Ok(response) = self.client.get(url).headers(self.headers()?).send().await else {
+            return Ok(Vec::new());
+        };
+        let Ok(pr) = ensure_success_json::<GitHubPullRequest>(response, "GitHub PR").await else {
+            return Ok(Vec::new());
+        };
+        Ok(extract_github_linked_issue_numbers(
+            pr.body.as_deref().unwrap_or(""),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -503,5 +883,45 @@ mod tests {
         let edited = build_add_comment_body("Edited table", true);
         assert!(edited.starts_with("Edited table\n\n"));
         assert!(edited.contains("> Assisted by "));
+    }
+
+    #[test]
+    fn parse_github_pr_and_remote_urls() {
+        let client = GitHubCodeReviewClient::new("tok", "octocat");
+
+        let parsed = client
+            .parse_pr_url("https://github.com/octocat/stitch-rs/pull/42/files")
+            .expect("GitHub PR URL");
+        assert_eq!(parsed.org, "octocat");
+        assert_eq!(parsed.repo_name, "stitch-rs");
+        assert_eq!(parsed.pr_number, 42);
+        assert!(client.parse_pr_url("https://dev.azure.com/foo/bar").is_none());
+
+        let remote_https = client
+            .parse_remote_url("https://user@github.com/octocat/stitch-rs.git")
+            .expect("HTTPS remote");
+        assert_eq!(remote_https.org, "octocat");
+        assert_eq!(remote_https.repo_name, "stitch-rs");
+
+        let remote_ssh_scp = client
+            .parse_remote_url("git@github.com:octocat/stitch-rs.git")
+            .expect("SCP SSH remote");
+        assert_eq!(remote_ssh_scp.org, "octocat");
+        assert_eq!(remote_ssh_scp.repo_name, "stitch-rs");
+
+        let remote_ssh_url = client
+            .parse_remote_url("ssh://git@github.com/octocat/stitch-rs")
+            .expect("SSH URL remote");
+        assert_eq!(remote_ssh_url.org, "octocat");
+        assert_eq!(remote_ssh_url.repo_name, "stitch-rs");
+    }
+
+    #[test]
+    fn extract_github_linked_issue_numbers_deduplicates_hashes_and_urls() {
+        let body = "Fixes #12 and relates to https://github.com/octocat/stitch-rs/issues/45, also #12 again.";
+        assert_eq!(
+            extract_github_linked_issue_numbers(body),
+            vec!["12".to_string(), "45".to_string()]
+        );
     }
 }

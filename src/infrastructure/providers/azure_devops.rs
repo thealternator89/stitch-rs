@@ -8,9 +8,10 @@ use url::Url;
 
 use crate::infrastructure::constants::get_attribution_statement;
 use crate::infrastructure::providers::{
-    IssueTrackerProvider, build_http_client, ensure_success, ensure_success_json,
+    CodeReviewProvider, IssueTrackerProvider, build_http_client, ensure_success,
+    ensure_success_json, strip_git_suffix,
 };
-use crate::types::TicketData;
+use crate::types::{ParsedPrUrl, ParsedRemoteUrl, PrHostType, PrMetadata, PrSearchType, TicketData};
 
 const API_VERSION: &str = "7.1";
 
@@ -505,6 +506,511 @@ struct AdoWorkItemType {
     name: String,
 }
 
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            ) {
+                out.push(((h << 4) | l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn build_ado_api_url(
+    base_org_url: &str,
+    segments: &[&str],
+    query_pairs: &[(&str, &str)],
+    include_api_version: bool,
+) -> anyhow::Result<Url> {
+    let mut url = Url::parse(base_org_url).map_err(|err| {
+        anyhow::anyhow!("Invalid Azure DevOps Organization URL '{base_org_url}': {err}")
+    })?;
+    {
+        let mut path_segments = url.path_segments_mut().map_err(|()| {
+            anyhow::anyhow!("Azure DevOps Organization URL cannot be a base URL: '{base_org_url}'")
+        })?;
+        path_segments.pop_if_empty();
+        for segment in segments {
+            path_segments.push(segment);
+        }
+    }
+    {
+        let mut pairs = url.query_pairs_mut();
+        for (key, value) in query_pairs {
+            pairs.append_pair(key, value);
+        }
+        if include_api_version {
+            pairs.append_pair("api-version", API_VERSION);
+        }
+    }
+    Ok(url)
+}
+
+/// REST client for Azure DevOps Git Pull Requests (`_apis/git`).
+pub struct AzureDevOpsCodeReviewClient {
+    client: reqwest::Client,
+    org: String,
+    pat: String,
+    default_project: String,
+}
+
+impl AzureDevOpsCodeReviewClient {
+    pub fn new(
+        org: impl Into<String>,
+        pat: impl Into<String>,
+        default_project: impl Into<String>,
+    ) -> Self {
+        Self {
+            client: build_http_client(),
+            org: org.into().trim().to_string(),
+            pat: pat.into().trim().to_string(),
+            default_project: default_project.into().trim().to_string(),
+        }
+    }
+
+    fn auth_header(&self) -> String {
+        let encoded = STANDARD.encode(format!(":{}", self.pat));
+        format!("Basic {encoded}")
+    }
+
+    async fn resolve_current_user_id(&self, base_org_url: &str) -> anyhow::Result<String> {
+        let url = build_ado_api_url(base_org_url, &["_apis", "connectionData"], &[], false)?;
+        let response = self
+            .client
+            .get(url)
+            .header(reqwest::header::AUTHORIZATION, self.auth_header())
+            .header(reqwest::header::ACCEPT, "application/json")
+            .send()
+            .await
+            .map_err(|err| anyhow::anyhow!("Failed to connect to Azure DevOps: {err}"))?;
+        let data: AdoConnectionData =
+            ensure_success_json(response, "Azure DevOps connectionData").await?;
+        data.authorized_user
+            .and_then(|u| u.id)
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Could not resolve current authenticated Azure DevOps user ID."))
+    }
+
+    fn map_pr_to_metadata(org_url: &str, project: &str, pr: AdoPullRequest) -> PrMetadata {
+        let clean_ref = |r: String| {
+            r.trim()
+                .strip_prefix("refs/heads/")
+                .map(str::to_string)
+                .unwrap_or_else(|| r.trim().to_string())
+        };
+        let pr_id = pr
+            .pull_request_id
+            .map(|id| id.to_string())
+            .unwrap_or_default();
+        let repo_name = pr
+            .repository
+            .as_ref()
+            .and_then(|r| r.name.clone())
+            .unwrap_or_default();
+        let repo_id = pr.repository.as_ref().and_then(|r| r.id.clone());
+        let base_trimmed = org_url.trim_end_matches('/');
+        let web_url = (!pr_id.is_empty() && !project.is_empty() && !repo_name.is_empty())
+            .then(|| format!("{base_trimmed}/{project}/_git/{repo_name}/pullrequest/{pr_id}"));
+
+        let author = pr
+            .created_by
+            .as_ref()
+            .and_then(|c| c.display_name.clone())
+            .unwrap_or_default();
+        let author_unique_name = pr
+            .created_by
+            .as_ref()
+            .and_then(|c| c.unique_name.clone())
+            .unwrap_or_default();
+
+        PrMetadata {
+            id: pr_id,
+            title: pr.title.unwrap_or_default(),
+            description: pr.description.unwrap_or_default(),
+            source_branch: clean_ref(pr.source_ref_name.unwrap_or_default()),
+            target_branch: clean_ref(pr.target_ref_name.unwrap_or_default()),
+            author,
+            author_unique_name,
+            repository_name: repo_name,
+            repository_id: repo_id,
+            host_type: PrHostType::Azure,
+            url: web_url,
+        }
+    }
+}
+
+#[async_trait]
+impl CodeReviewProvider for AzureDevOpsCodeReviewClient {
+    fn parse_pr_url(&self, url: &str) -> Option<ParsedPrUrl> {
+        let parsed = Url::parse(url.trim()).ok()?;
+        let host = parsed.host_str()?.to_ascii_lowercase();
+        let raw_segments: Vec<String> = parsed
+            .path_segments()?
+            .filter(|s| !s.is_empty())
+            .map(percent_decode)
+            .collect();
+
+        if host == "dev.azure.com" {
+            // /{org}/{project}/_git/{repo}/pullrequest/{id}
+            if raw_segments.len() >= 6
+                && raw_segments[2].eq_ignore_ascii_case("_git")
+                && raw_segments[4].eq_ignore_ascii_case("pullrequest")
+            {
+                let pr_number = raw_segments[5].parse::<u64>().ok()?;
+                return Some(ParsedPrUrl {
+                    org: raw_segments[0].clone(),
+                    project: raw_segments[1].clone(),
+                    repo_name: raw_segments[3].clone(),
+                    pr_number,
+                });
+            }
+        } else if let Some(org_prefix) = host.strip_suffix(".visualstudio.com") {
+            if !org_prefix.is_empty() {
+                let segs = if raw_segments
+                    .first()
+                    .is_some_and(|s| s.eq_ignore_ascii_case("defaultcollection"))
+                {
+                    &raw_segments[1..]
+                } else {
+                    &raw_segments[..]
+                };
+                if segs.len() >= 5
+                    && segs[1].eq_ignore_ascii_case("_git")
+                    && segs[3].eq_ignore_ascii_case("pullrequest")
+                {
+                    let pr_number = segs[4].parse::<u64>().ok()?;
+                    return Some(ParsedPrUrl {
+                        org: org_prefix.to_string(),
+                        project: segs[0].clone(),
+                        repo_name: segs[2].clone(),
+                        pr_number,
+                    });
+                }
+            }
+        }
+
+        None
+    }
+
+    fn parse_remote_url(&self, url: &str) -> Option<ParsedRemoteUrl> {
+        let trimmed = url.trim();
+        // SSH: git@ssh.dev.azure.com:v3/{org}/{project}/{repo}
+        if let Some(rest) = trimmed
+            .strip_prefix("git@ssh.dev.azure.com:v3/")
+            .or_else(|| trimmed.strip_prefix("ssh://git@ssh.dev.azure.com/v3/"))
+        {
+            let parts: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+            if parts.len() >= 3 {
+                return Some(ParsedRemoteUrl {
+                    org: percent_decode(parts[0]),
+                    project: percent_decode(parts[1]),
+                    repo_name: strip_git_suffix(&percent_decode(parts[2])),
+                });
+            }
+            return None;
+        }
+
+        let parsed = Url::parse(trimmed).ok()?;
+        let host = parsed.host_str()?.to_ascii_lowercase();
+        let raw_segments: Vec<String> = parsed
+            .path_segments()?
+            .filter(|s| !s.is_empty())
+            .map(percent_decode)
+            .collect();
+
+        if host == "dev.azure.com" {
+            // /{org}/{project}/_git/{repo}
+            if raw_segments.len() >= 4 && raw_segments[2].eq_ignore_ascii_case("_git") {
+                return Some(ParsedRemoteUrl {
+                    org: raw_segments[0].clone(),
+                    project: raw_segments[1].clone(),
+                    repo_name: strip_git_suffix(&raw_segments[3]),
+                });
+            }
+        } else if let Some(org_prefix) = host.strip_suffix(".visualstudio.com") {
+            if !org_prefix.is_empty() {
+                let segs = if raw_segments
+                    .first()
+                    .is_some_and(|s| s.eq_ignore_ascii_case("defaultcollection"))
+                {
+                    &raw_segments[1..]
+                } else {
+                    &raw_segments[..]
+                };
+                if segs.len() >= 3 && segs[1].eq_ignore_ascii_case("_git") {
+                    return Some(ParsedRemoteUrl {
+                        org: org_prefix.to_string(),
+                        project: segs[0].clone(),
+                        repo_name: strip_git_suffix(&segs[2]),
+                    });
+                }
+            }
+        }
+
+        None
+    }
+
+    async fn get_pr_details(
+        &self,
+        pr_url_or_id: &str,
+        remote_url: Option<&str>,
+    ) -> anyhow::Result<PrMetadata> {
+        if self.pat.is_empty() {
+            anyhow::bail!("Azure DevOps Personal Access Token is required.");
+        }
+
+        let trimmed = pr_url_or_id.trim();
+        let mut org = self.org.clone();
+        let mut project = self.default_project.clone();
+
+        let pr_number = if let Some(parsed) = self.parse_pr_url(trimmed) {
+            org = parsed.org;
+            project = parsed.project;
+            parsed.pr_number
+        } else {
+            let num: u64 = trimmed.parse().map_err(|_| {
+                anyhow::anyhow!("Invalid Pull Request URL or ID format: \"{trimmed}\"")
+            })?;
+            if let Some(remote) = remote_url.and_then(|u| self.parse_remote_url(u)) {
+                if org.is_empty() {
+                    org = remote.org;
+                }
+                if project.is_empty() {
+                    project = remote.project;
+                }
+            }
+            num
+        };
+
+        if org.trim().is_empty() {
+            anyhow::bail!(
+                "Azure DevOps Organization is not configured in settings and could not be detected from git remote."
+            );
+        }
+        if project.trim().is_empty() {
+            anyhow::bail!(
+                "Azure DevOps Project is not configured in settings and could not be detected from git remote."
+            );
+        }
+
+        let org_url = AzureDevOpsClient::normalize_org_url(&org);
+        let pr_str = pr_number.to_string();
+        let url = build_ado_api_url(
+            &org_url,
+            &[project.trim(), "_apis", "git", "pullrequests", &pr_str],
+            &[],
+            true,
+        )?;
+
+        let response = self
+            .client
+            .get(url)
+            .header(reqwest::header::AUTHORIZATION, self.auth_header())
+            .header(reqwest::header::ACCEPT, "application/json")
+            .send()
+            .await
+            .map_err(|err| anyhow::anyhow!("Failed to fetch PR from Azure DevOps API: {err}"))?;
+
+        let pr: AdoPullRequest = ensure_success_json(response, "Azure DevOps PR").await?;
+        if pr
+            .target_ref_name
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(|s| s.is_empty())
+        {
+            anyhow::bail!("Pull Request #{pr_number} is missing target branch ref.");
+        }
+
+        Ok(Self::map_pr_to_metadata(&org_url, project.trim(), pr))
+    }
+
+    async fn get_project_prs(&self, search_type: PrSearchType) -> anyhow::Result<Vec<PrMetadata>> {
+        if self.org.trim().is_empty() || self.pat.is_empty() {
+            anyhow::bail!("Azure DevOps Organization URL and PAT are required.");
+        }
+        if self.default_project.trim().is_empty() {
+            anyhow::bail!(
+                "Azure DevOps Project Name must be configured in Settings > Connectors to list PRs."
+            );
+        }
+
+        let org_url = AzureDevOpsClient::normalize_org_url(&self.org);
+        let mut query_pairs: Vec<(&str, String)> =
+            vec![("searchCriteria.status", "active".to_string())];
+
+        match search_type {
+            PrSearchType::Assigned => {
+                let user_id = self.resolve_current_user_id(&org_url).await?;
+                query_pairs.push(("searchCriteria.reviewerId", user_id));
+            }
+            PrSearchType::Created => {
+                let user_id = self.resolve_current_user_id(&org_url).await?;
+                query_pairs.push(("searchCriteria.creatorId", user_id));
+            }
+            PrSearchType::All => {}
+        }
+
+        let query_refs: Vec<(&str, &str)> = query_pairs
+            .iter()
+            .map(|(k, v)| (*k, v.as_str()))
+            .collect();
+        let url = build_ado_api_url(
+            &org_url,
+            &[
+                self.default_project.trim(),
+                "_apis",
+                "git",
+                "pullrequests",
+            ],
+            &query_refs,
+            true,
+        )?;
+
+        let response = self
+            .client
+            .get(url)
+            .header(reqwest::header::AUTHORIZATION, self.auth_header())
+            .header(reqwest::header::ACCEPT, "application/json")
+            .send()
+            .await
+            .map_err(|err| anyhow::anyhow!("Failed to query PRs from Azure DevOps: {err}"))?;
+
+        let list: AdoPullRequestListResponse =
+            ensure_success_json(response, "Azure DevOps PR list").await?;
+
+        Ok(list
+            .value
+            .into_iter()
+            .map(|pr| Self::map_pr_to_metadata(&org_url, self.default_project.trim(), pr))
+            .collect())
+    }
+
+    async fn get_linked_tickets(
+        &self,
+        pr_id: &str,
+        repository_id: Option<&str>,
+    ) -> anyhow::Result<Vec<String>> {
+        if self.org.trim().is_empty() || self.pat.is_empty() {
+            anyhow::bail!("Azure DevOps Organization URL and PAT are required.");
+        }
+        let repo_id = repository_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Repository ID is required to fetch linked tickets in Azure DevOps."
+                )
+            })?;
+        let pr_num: u64 = pr_id.trim().parse().map_err(|_| {
+            anyhow::anyhow!("Invalid Azure DevOps PR ID '{pr_id}'. Expected a number.")
+        })?;
+
+        let org_url = AzureDevOpsClient::normalize_org_url(&self.org);
+        let pr_str = pr_num.to_string();
+        let url = build_ado_api_url(
+            &org_url,
+            &[
+                "_apis",
+                "git",
+                "repositories",
+                repo_id,
+                "pullRequests",
+                &pr_str,
+                "workitems",
+            ],
+            &[],
+            true,
+        )?;
+
+        let response = self
+            .client
+            .get(url)
+            .header(reqwest::header::AUTHORIZATION, self.auth_header())
+            .header(reqwest::header::ACCEPT, "application/json")
+            .send()
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!("Failed to fetch linked work items from Azure DevOps: {err}")
+            })?;
+
+        let payload: AdoPrWorkItemsResponse =
+            ensure_success_json(response, "Azure DevOps PR work items").await?;
+
+        Ok(payload
+            .value
+            .into_iter()
+            .filter_map(|item| item.id)
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .collect())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdoConnectionData {
+    authorized_user: Option<AdoAuthorizedUser>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdoAuthorizedUser {
+    id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdoPullRequestListResponse {
+    #[serde(default)]
+    value: Vec<AdoPullRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdoPullRequest {
+    pull_request_id: Option<u64>,
+    title: Option<String>,
+    description: Option<String>,
+    source_ref_name: Option<String>,
+    target_ref_name: Option<String>,
+    created_by: Option<AdoIdentityRef>,
+    repository: Option<AdoGitRepository>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdoIdentityRef {
+    display_name: Option<String>,
+    unique_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdoGitRepository {
+    id: Option<String>,
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdoPrWorkItemsResponse {
+    #[serde(default)]
+    value: Vec<AdoWorkItemRefId>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdoWorkItemRefId {
+    id: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -657,5 +1163,91 @@ mod tests {
         let edited_patch = build_add_comment_patch("Edited comment", true);
         let edited_val = edited_patch[0]["value"].as_str().unwrap();
         assert!(edited_val.contains("> Assisted by "));
+    }
+
+    #[test]
+    fn parse_ado_pr_and_remote_urls() {
+        let client = AzureDevOpsCodeReviewClient::new("myorg", "pat", "CoreProj");
+
+        let parsed_dev = client
+            .parse_pr_url("https://dev.azure.com/acme/My%20Project/_git/stitch-rs/pullrequest/42")
+            .expect("dev.azure.com PR URL");
+        assert_eq!(parsed_dev.org, "acme");
+        assert_eq!(parsed_dev.project, "My Project");
+        assert_eq!(parsed_dev.repo_name, "stitch-rs");
+        assert_eq!(parsed_dev.pr_number, 42);
+
+        let parsed_vs = client
+            .parse_pr_url("https://acme.visualstudio.com/DefaultCollection/Platform/_git/api/pullrequest/99")
+            .expect("visualstudio.com PR URL");
+        assert_eq!(parsed_vs.org, "acme");
+        assert_eq!(parsed_vs.project, "Platform");
+        assert_eq!(parsed_vs.repo_name, "api");
+        assert_eq!(parsed_vs.pr_number, 99);
+
+        assert!(client.parse_pr_url("https://example.com/not-a-pr").is_none());
+
+        let remote_https = client
+            .parse_remote_url("https://user@dev.azure.com/acme/Platform/_git/service.git")
+            .expect("HTTPS remote");
+        assert_eq!(remote_https.org, "acme");
+        assert_eq!(remote_https.project, "Platform");
+        assert_eq!(remote_https.repo_name, "service");
+
+        let remote_ssh = client
+            .parse_remote_url("git@ssh.dev.azure.com:v3/acme/Platform/service.git")
+            .expect("SSH remote");
+        assert_eq!(remote_ssh.org, "acme");
+        assert_eq!(remote_ssh.project, "Platform");
+        assert_eq!(remote_ssh.repo_name, "service");
+
+        let remote_vs = client
+            .parse_remote_url("https://acme.visualstudio.com/Platform/_git/service")
+            .expect("visualstudio remote");
+        assert_eq!(remote_vs.org, "acme");
+        assert_eq!(remote_vs.project, "Platform");
+        assert_eq!(remote_vs.repo_name, "service");
+    }
+
+    #[test]
+    fn deserialize_ado_pr_responses_and_map_metadata() {
+        let json = r#"{
+            "pullRequestId": 512,
+            "title": "Add PR reviewer",
+            "description": "Implements checkout",
+            "sourceRefName": "refs/heads/feat/pr-review",
+            "targetRefName": "refs/heads/main",
+            "createdBy": { "displayName": "Jane Dev", "uniqueName": "jane@acme.com" },
+            "repository": { "id": "repo-uuid-1", "name": "stitch-rs" }
+        }"#;
+        let pr: AdoPullRequest = serde_json::from_str(json).expect("pr json");
+        let meta = AzureDevOpsCodeReviewClient::map_pr_to_metadata(
+            "https://dev.azure.com/acme",
+            "CoreProj",
+            pr,
+        );
+        assert_eq!(meta.id, "512");
+        assert_eq!(meta.source_branch, "feat/pr-review");
+        assert_eq!(meta.target_branch, "main");
+        assert_eq!(meta.author, "Jane Dev");
+        assert_eq!(meta.author_unique_name, "jane@acme.com");
+        assert_eq!(meta.repository_name, "stitch-rs");
+        assert_eq!(meta.repository_id.as_deref(), Some("repo-uuid-1"));
+        assert_eq!(
+            meta.url.as_deref(),
+            Some("https://dev.azure.com/acme/CoreProj/_git/stitch-rs/pullrequest/512")
+        );
+
+        let conn_json = r#"{"authorizedUser": {"id": "user-123"}}"#;
+        let conn: AdoConnectionData = serde_json::from_str(conn_json).expect("connectionData");
+        assert_eq!(
+            conn.authorized_user.and_then(|u| u.id).as_deref(),
+            Some("user-123")
+        );
+
+        let wi_json = r#"{"value": [{"id": "101"}, {"id": "205"}]}"#;
+        let wi: AdoPrWorkItemsResponse = serde_json::from_str(wi_json).expect("workitems");
+        let ids: Vec<_> = wi.value.into_iter().filter_map(|w| w.id).collect();
+        assert_eq!(ids, vec!["101", "205"]);
     }
 }
