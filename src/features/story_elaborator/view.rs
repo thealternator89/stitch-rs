@@ -27,6 +27,7 @@ use crate::features::story_elaborator::service::{
     ElaborationStartRequest, ElaborationStreamEvent, StoryElaboratorService,
 };
 use crate::infrastructure::copilot::CopilotService;
+use crate::infrastructure::git::GitService;
 use crate::infrastructure::providers::build_issue_tracker_provider;
 use crate::infrastructure::providers::confluence::strip_html_for_preview;
 use crate::infrastructure::runtime::{runtime, spawn_tokio};
@@ -118,10 +119,11 @@ impl StoryElaboratorView {
         app_state: Entity<AppState>,
         initial_settings: &AppSettings,
         copilot_service: Arc<CopilotService>,
+        git_service: Arc<GitService>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let service = Arc::new(StoryElaboratorService::new(copilot_service));
+        let service = Arc::new(StoryElaboratorService::new(copilot_service, git_service));
         let initial_model = if initial_settings.copilot_model.trim().is_empty() {
             "auto".to_string()
         } else {
@@ -826,11 +828,14 @@ impl StoryElaboratorView {
                         ElaborationStreamEvent::Error(msg) => {
                             this.is_generating = false;
                             if this.stage == ElaboratorStage::Elaborating {
-                                if this.feed.is_empty() {
-                                    this.stage = ElaboratorStage::Idle;
-                                    this.active_ticket_id = None;
-                                    this.ticket_search
-                                        .update(cx, |input, cx| input.set_disabled(false, cx));
+                                let has_conversation = this.feed.iter().any(|item| {
+                                    matches!(
+                                        item,
+                                        FeedItem::Chat { .. } | FeedItem::RefinedPlan { .. }
+                                    )
+                                });
+                                if !has_conversation {
+                                    this.stop_active_session_only(window, cx);
                                 } else {
                                     this.is_waiting_for_user = true;
                                 }
@@ -1191,7 +1196,7 @@ impl StoryElaboratorView {
                         div()
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .child("Part 1 operates in ticket-text mode; local worktree repository inspection arrives in Phase 8."),
+                            .child("If provided, Copilot can inspect codebase files (in an isolated Git worktree if enabled) to plan changes."),
                     ),
             )
             .when(worktree_enabled, |col| {
@@ -1210,7 +1215,7 @@ impl StoryElaboratorView {
                             div()
                                 .text_xs()
                                 .text_color(theme.muted_foreground)
-                                .child("Worktree checkout branch (defaults to develop; active in Phase 8)."),
+                                .child("The branch to checkout in the isolated worktree. Defaults to develop."),
                         ),
                 )
             })

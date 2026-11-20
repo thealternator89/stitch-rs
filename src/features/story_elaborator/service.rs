@@ -10,17 +10,19 @@ use tokio::sync::{Mutex, mpsc, watch};
 use crate::features::story_elaborator::prompts::build_story_elaborator_prompt;
 use crate::infrastructure::copilot::{
     CopilotService, SessionOptions, StreamError, StreamEvent, create_report_intent_tool,
-    resolve_model_override,
+    create_request_documentation_tool, resolve_model_override,
 };
+use crate::infrastructure::git::GitService;
+use crate::infrastructure::providers::{build_documentation_provider, discover_known_docs};
 use crate::infrastructure::runtime::runtime;
-use crate::types::{AppSettings, CopilotUsage, TicketData};
+use crate::types::{AppSettings, CopilotUsage, KnownDoc, TicketData};
+
+type TurnSenderSlot = Arc<std::sync::Mutex<Option<mpsc::UnboundedSender<ElaborationStreamEvent>>>>;
 
 #[derive(Debug, Clone)]
 pub struct ElaborationStartRequest {
     pub ticket_data: TicketData,
-    #[allow(dead_code)] // Wired to Git worktrees in Phase 8
     pub repo_path: Option<PathBuf>,
-    #[allow(dead_code)] // Wired to Git worktrees in Phase 8
     pub branch: String,
     pub additional_context: String,
     pub model_override: String,
@@ -127,6 +129,42 @@ pub fn merge_usage(cumulative: &mut CopilotUsage, turn: &CopilotUsage) {
     }
 }
 
+/// Sanitizes a ticket ID so GitHub composite IDs (`owner/repo/42`) produce flat worktree names.
+pub fn sanitize_worktree_ticket_id(ticket_id: &str) -> String {
+    let sanitized: String = ticket_id
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "unknown".to_string()
+    } else {
+        sanitized
+    }
+}
+
+/// Returns `(working_directory, available_tools)` for dual codebase vs. ticket-only session mode.
+pub fn resolve_session_tool_config(
+    effective_repo_path: Option<PathBuf>,
+) -> (Option<PathBuf>, Option<Vec<String>>) {
+    match effective_repo_path {
+        Some(dir) => (Some(dir), None),
+        None => (
+            None,
+            Some(vec![
+                "custom:request_documentation".to_string(),
+                "custom:report_intent".to_string(),
+            ]),
+        ),
+    }
+}
+
 fn normalize_ticket_key(ticket_id: Option<&str>) -> String {
     ticket_id
         .map(str::trim)
@@ -135,25 +173,57 @@ fn normalize_ticket_key(ticket_id: Option<&str>) -> String {
         .to_string()
 }
 
+async fn cleanup_worktree_slot(git: &GitService, slot: &Mutex<Option<(PathBuf, PathBuf)>>) {
+    let worktree = { slot.lock().await.take() };
+    if let Some((repo_root, worktree_path)) = worktree {
+        git.remove_worktree(Some(&repo_root), &worktree_path).await;
+    }
+}
+
+struct TurnTxGuard {
+    slot: TurnSenderSlot,
+}
+
+impl TurnTxGuard {
+    fn install(slot: TurnSenderSlot, tx: &mpsc::UnboundedSender<ElaborationStreamEvent>) -> Self {
+        if let Ok(mut guard) = slot.lock() {
+            *guard = Some(tx.clone());
+        }
+        Self { slot }
+    }
+}
+
+impl Drop for TurnTxGuard {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.slot.lock() {
+            *guard = None;
+        }
+    }
+}
+
 struct ActiveElaborationEntry {
     session_id: u64,
     cancel_tx: watch::Sender<bool>,
     session: Arc<Mutex<Option<Arc<Session>>>>,
+    worktree_info: Arc<Mutex<Option<(PathBuf, PathBuf)>>>,
     cumulative_usage: Arc<Mutex<CopilotUsage>>,
     turn_lock: Arc<Mutex<()>>,
+    current_tx: TurnSenderSlot,
 }
 
 /// Manages stateful, multi-turn Copilot elaboration sessions keyed by ticket ID.
 pub struct StoryElaboratorService {
     copilot: Arc<CopilotService>,
+    git: Arc<GitService>,
     next_session_id: AtomicU64,
     active_sessions: Mutex<HashMap<String, ActiveElaborationEntry>>,
 }
 
 impl StoryElaboratorService {
-    pub fn new(copilot: Arc<CopilotService>) -> Self {
+    pub fn new(copilot: Arc<CopilotService>, git: Arc<GitService>) -> Self {
         Self {
             copilot,
+            git,
             next_session_id: AtomicU64::new(1),
             active_sessions: Mutex::new(HashMap::new()),
         }
@@ -171,8 +241,10 @@ impl StoryElaboratorService {
             let session_id = service.next_session_id.fetch_add(1, Ordering::Relaxed);
             let (cancel_tx, cancel_rx) = watch::channel(false);
             let session_slot = Arc::new(Mutex::new(None));
+            let worktree_slot = Arc::new(Mutex::new(None));
             let cumulative_usage = Arc::new(Mutex::new(CopilotUsage::default()));
             let turn_lock = Arc::new(Mutex::new(()));
+            let current_tx_slot: TurnSenderSlot = Arc::new(std::sync::Mutex::new(None));
 
             let previous = {
                 let mut guard = service.active_sessions.lock().await;
@@ -182,8 +254,10 @@ impl StoryElaboratorService {
                         session_id,
                         cancel_tx: cancel_tx.clone(),
                         session: Arc::clone(&session_slot),
+                        worktree_info: Arc::clone(&worktree_slot),
                         cumulative_usage: Arc::clone(&cumulative_usage),
                         turn_lock: Arc::clone(&turn_lock),
+                        current_tx: Arc::clone(&current_tx_slot),
                     },
                 )
             };
@@ -194,6 +268,7 @@ impl StoryElaboratorService {
                 if let Some(s) = prev_session {
                     let _ = s.disconnect().await;
                 }
+                cleanup_worktree_slot(&service.git, &prev.worktree_info).await;
             }
 
             if *cancel_rx.borrow() {
@@ -202,17 +277,81 @@ impl StoryElaboratorService {
                 return;
             }
 
+            let effective_repo_path = match prepare_repo_directory(
+                &service.git,
+                req.repo_path.as_deref(),
+                &req.branch,
+                &ticket_key,
+                &req.settings,
+                &worktree_slot,
+                &cancel_rx,
+                &tx,
+            )
+            .await
+            {
+                Ok(dir) => dir,
+                Err(terminal) => {
+                    cleanup_worktree_slot(&service.git, &worktree_slot).await;
+                    service.remove_if_matching(&ticket_key, session_id).await;
+                    let _ = tx.send(terminal);
+                    return;
+                }
+            };
+
+            let doc_provider = build_documentation_provider(&req.settings).ok();
+            let known_docs: Vec<KnownDoc> = if let Some(ref provider) = doc_provider {
+                let ac = req.ticket_data.acceptance_criteria.as_deref().unwrap_or("");
+                let discovered =
+                    discover_known_docs(provider.as_ref(), &[&req.ticket_data.description, ac])
+                        .await;
+                if !discovered.is_empty() {
+                    let _ = tx.send(ElaborationStreamEvent::Status(format!(
+                        "Discovered {} Confluence document(s) linked in ticket.",
+                        discovered.len()
+                    )));
+                }
+                discovered
+            } else {
+                Vec::new()
+            };
+
+            if *cancel_rx.borrow() {
+                cleanup_worktree_slot(&service.git, &worktree_slot).await;
+                service.remove_if_matching(&ticket_key, session_id).await;
+                let _ = tx.send(ElaborationStreamEvent::Cancelled);
+                return;
+            }
+
+            let status_slot = Arc::clone(&current_tx_slot);
+            let status_callback: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |status| {
+                if let Ok(guard) = status_slot.lock() {
+                    if let Some(turn_tx) = guard.as_ref() {
+                        let _ = turn_tx.send(ElaborationStreamEvent::Status(status));
+                    }
+                }
+            });
+
+            let (working_directory, available_tools) =
+                resolve_session_tool_config(effective_repo_path);
+            let has_repo = working_directory.is_some();
             let effective_model =
                 resolve_model_override(&req.model_override, &req.settings.copilot_model);
+
+            let _ = tx.send(ElaborationStreamEvent::Status(
+                "Creating Copilot elaboration session...".to_string(),
+            ));
 
             let session = match service
                 .copilot
                 .create_session(SessionOptions {
                     token: req.settings.copilot_token.clone(),
                     model: Some(effective_model),
-                    working_directory: None,
-                    tools: vec![create_report_intent_tool()],
-                    available_tools: Some(vec!["custom:report_intent".to_string()]),
+                    working_directory,
+                    tools: vec![
+                        create_request_documentation_tool(doc_provider, status_callback),
+                        create_report_intent_tool(),
+                    ],
+                    available_tools,
                     streaming: true,
                     label: "Story Elaborator".to_string(),
                 })
@@ -220,6 +359,7 @@ impl StoryElaboratorService {
             {
                 Ok(session) => Arc::new(session),
                 Err(err) => {
+                    cleanup_worktree_slot(&service.git, &worktree_slot).await;
                     service.remove_if_matching(&ticket_key, session_id).await;
                     let _ = tx.send(ElaborationStreamEvent::Error(err.to_string()));
                     return;
@@ -227,6 +367,7 @@ impl StoryElaboratorService {
             };
 
             if *cancel_rx.borrow() {
+                cleanup_worktree_slot(&service.git, &worktree_slot).await;
                 service.remove_if_matching(&ticket_key, session_id).await;
                 let _ = session.disconnect().await;
                 let _ = tx.send(ElaborationStreamEvent::Cancelled);
@@ -242,11 +383,12 @@ impl StoryElaboratorService {
                 &req.ticket_data,
                 &req.additional_context,
                 &req.settings.prompts.story_elaborator.general,
-                false,
-                &[],
+                has_repo,
+                &known_docs,
             );
 
             let _turn_guard = turn_lock.lock().await;
+            let _tx_guard = TurnTxGuard::install(current_tx_slot, &tx);
             let terminal =
                 run_elaboration_turn(&session, &prompt, cancel_rx, &cumulative_usage, &tx).await;
             let _ = tx.send(terminal);
@@ -272,12 +414,15 @@ impl StoryElaboratorService {
                         Arc::clone(&entry.session),
                         Arc::clone(&entry.cumulative_usage),
                         Arc::clone(&entry.turn_lock),
+                        Arc::clone(&entry.current_tx),
                         entry.cancel_tx.subscribe(),
                     )
                 })
             };
 
-            let Some((session_slot, cumulative_usage, turn_lock, cancel_rx)) = lookup else {
+            let Some((session_slot, cumulative_usage, turn_lock, current_tx_slot, cancel_rx)) =
+                lookup
+            else {
                 let _ = tx.send(ElaborationStreamEvent::Error(
                     "No active story elaboration session found for this ticket. Please start a new session."
                         .to_string(),
@@ -294,6 +439,7 @@ impl StoryElaboratorService {
             };
 
             let _turn_guard = turn_lock.lock().await;
+            let _tx_guard = TurnTxGuard::install(current_tx_slot, &tx);
             let terminal =
                 run_elaboration_turn(&session, &answer, cancel_rx, &cumulative_usage, &tx).await;
             let _ = tx.send(terminal);
@@ -310,10 +456,11 @@ impl StoryElaboratorService {
         }?;
 
         let _ = entry.cancel_tx.send(true);
-        let session = entry.session.lock().await.take();
+        let session = { entry.session.lock().await.take() };
         if let Some(session) = session {
             let _ = session.disconnect().await;
         }
+        cleanup_worktree_slot(&self.git, &entry.worktree_info).await;
         let usage = entry.cumulative_usage.lock().await.clone();
         Some(usage)
     }
@@ -327,6 +474,114 @@ impl StoryElaboratorService {
             guard.remove(ticket_key);
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_repo_directory(
+    git: &GitService,
+    repo_path: Option<&std::path::Path>,
+    branch: &str,
+    ticket_key: &str,
+    settings: &AppSettings,
+    worktree_slot: &Mutex<Option<(PathBuf, PathBuf)>>,
+    cancel_rx: &watch::Receiver<bool>,
+    tx: &mpsc::UnboundedSender<ElaborationStreamEvent>,
+) -> Result<Option<PathBuf>, ElaborationStreamEvent> {
+    let Some(repo_dir) = repo_path else {
+        return Ok(None);
+    };
+
+    if !repo_dir.is_dir() {
+        return Err(ElaborationStreamEvent::Error(format!(
+            "Repository path does not exist or is not a directory: {}",
+            repo_dir.display()
+        )));
+    }
+
+    if !settings.git_worktree_enabled {
+        return Ok(Some(repo_dir.to_path_buf()));
+    }
+
+    let Some(base_dir) = settings.git_worktree_base_dir.clone() else {
+        return Ok(Some(repo_dir.to_path_buf()));
+    };
+
+    if !git.check_git_repo(repo_dir).await {
+        return Ok(Some(repo_dir.to_path_buf()));
+    }
+
+    let repo_root = git
+        .get_repo_root(repo_dir)
+        .await
+        .map_err(|err| ElaborationStreamEvent::Error(err.to_string()))?;
+
+    let relative_subdir = match (
+        std::fs::canonicalize(repo_dir),
+        std::fs::canonicalize(&repo_root),
+    ) {
+        (Ok(canon_repo), Ok(canon_root)) => canon_repo
+            .strip_prefix(&canon_root)
+            .map(PathBuf::from)
+            .unwrap_or_default(),
+        _ => repo_dir
+            .strip_prefix(&repo_root)
+            .map(PathBuf::from)
+            .unwrap_or_default(),
+    };
+
+    let target_branch = {
+        let b = branch.trim();
+        if b.is_empty() { "develop" } else { b }
+    };
+
+    let _ = tx.send(ElaborationStreamEvent::Status(format!(
+        "Fetching branch '{target_branch}' and creating isolated worktree..."
+    )));
+
+    if *cancel_rx.borrow() {
+        return Err(ElaborationStreamEvent::Cancelled);
+    }
+
+    let commit_or_ref = git.fetch_branch_ref(&repo_root, target_branch).await;
+    if *cancel_rx.borrow() {
+        return Err(ElaborationStreamEvent::Cancelled);
+    }
+
+    let sanitized_ticket = sanitize_worktree_ticket_id(ticket_key);
+    let worktree_name = format!(
+        "{}_ticket_{}",
+        GitService::sanitize_repo_name(&repo_root),
+        sanitized_ticket
+    );
+    let worktree_path = base_dir.join(worktree_name);
+
+    git.add_worktree(&repo_root, &worktree_path, &commit_or_ref)
+        .await
+        .map_err(|err| ElaborationStreamEvent::Error(err.to_string()))?;
+
+    {
+        let mut slot = worktree_slot.lock().await;
+        *slot = Some((repo_root, worktree_path.clone()));
+    }
+
+    if *cancel_rx.borrow() {
+        return Err(ElaborationStreamEvent::Cancelled);
+    }
+
+    let candidate_path = if relative_subdir.as_os_str().is_empty() {
+        worktree_path
+    } else {
+        worktree_path.join(&relative_subdir)
+    };
+
+    if !candidate_path.is_dir() {
+        return Err(ElaborationStreamEvent::Error(
+            "The selected directory does not exist in the checked out branch. Your local repository might be outdated. Please pull the branch and try again."
+                .to_string(),
+        ));
+    }
+
+    Ok(Some(candidate_path))
 }
 
 async fn run_elaboration_turn(
@@ -464,5 +719,33 @@ mod tests {
         assert_eq!(total.cache_read_tokens, 500);
         assert!((total.cost - 1.0).abs() < 1e-9);
         assert_eq!(total.model.as_deref(), Some("gpt-5.4"));
+    }
+
+    #[test]
+    fn sanitize_worktree_ticket_id_replaces_slashes_and_special_chars() {
+        assert_eq!(sanitize_worktree_ticket_id("421"), "421");
+        assert_eq!(
+            sanitize_worktree_ticket_id("my-org/web-app/108"),
+            "my-org_web-app_108"
+        );
+        assert_eq!(sanitize_worktree_ticket_id("   "), "unknown");
+    }
+
+    #[test]
+    fn resolve_session_tool_config_switches_between_codebase_and_ticket_only_modes() {
+        let repo = PathBuf::from("/tmp/repo");
+        let (dir, tools) = resolve_session_tool_config(Some(repo.clone()));
+        assert_eq!(dir, Some(repo));
+        assert_eq!(tools, None);
+
+        let (no_dir, locked_tools) = resolve_session_tool_config(None);
+        assert_eq!(no_dir, None);
+        assert_eq!(
+            locked_tools,
+            Some(vec![
+                "custom:request_documentation".to_string(),
+                "custom:report_intent".to_string(),
+            ])
+        );
     }
 }

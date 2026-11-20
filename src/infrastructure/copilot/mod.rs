@@ -18,7 +18,8 @@ use tokio::sync::{Mutex, watch};
 use crate::types::{CopilotAuthInfo, CopilotModelInfo, CopilotUsage};
 
 pub use tools::{
-    create_report_intent_tool, format_tool_complete, format_tool_start, parse_resilient_jsonl,
+    create_report_intent_tool, create_request_documentation_tool, format_tool_complete,
+    format_tool_start, parse_resilient_jsonl,
 };
 
 const DEFAULT_TIMEOUT_MS: u64 = 180_000;
