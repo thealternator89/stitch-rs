@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use gpui_kit::assets::IconName as LucideIcon;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::sidebar::{
@@ -20,10 +22,14 @@ use crate::ui::components::render_usage_stats_toast;
 
 const REPORT_ISSUE_URL: &str = "https://github.com/thealternator89/stitch/issues";
 const SIDEBAR_WIDTH: f32 = 224.0;
+const USAGE_TOAST_AUTO_DISMISS: Duration = Duration::from_secs(8);
 
 pub struct WorkspaceShell {
     app_state: Entity<AppState>,
     sidebar_collapsed: bool,
+    toast_seen_seq: u64,
+    toast_hovered: bool,
+    toast_timer_gen: u64,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -43,8 +49,29 @@ impl WorkspaceShell {
         Self {
             app_state,
             sidebar_collapsed: false,
+            toast_seen_seq: 0,
+            toast_hovered: false,
+            toast_timer_gen: 0,
             _subscriptions: vec![state_sub, appearance_sub],
         }
+    }
+
+    /// (Re)starts the auto-dismiss countdown for the usage toast.
+    fn start_toast_timer(&mut self, cx: &mut Context<Self>) {
+        self.toast_timer_gen += 1;
+        let generation = self.toast_timer_gen;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(USAGE_TOAST_AUTO_DISMISS).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.toast_timer_gen == generation && !this.toast_hovered {
+                    this.app_state.update(cx, |s, cx| {
+                        s.dismiss_usage_toast();
+                        cx.notify();
+                    });
+                }
+            });
+        })
+        .detach();
     }
 
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -313,13 +340,19 @@ impl WorkspaceShell {
 impl Render for WorkspaceShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let (window_progress, toast_data) = {
+        let (window_progress, toast_data, toast_seq) = {
             let state = self.app_state.read(cx);
             (
                 state.active_window_progress(),
                 state.active_usage_toast.clone(),
+                state.usage_toast_seq,
             )
         };
+        if toast_data.is_some() && toast_seq != self.toast_seen_seq {
+            self.toast_seen_seq = toast_seq;
+            self.toast_hovered = false;
+            self.start_toast_timer(cx);
+        }
         let app_state_for_toast = self.app_state.clone();
 
         v_flex()
@@ -360,6 +393,13 @@ impl Render for WorkspaceShell {
                                 let state_for_dismiss = app_state_for_toast.clone();
                                 pane.child(
                                     div()
+                                        .id("usage-toast-hover-area")
+                                        .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                                            this.toast_hovered = *hovered;
+                                            if !*hovered {
+                                                this.start_toast_timer(cx);
+                                            }
+                                        }))
                                         .absolute()
                                         .bottom_4()
                                         .right_4()

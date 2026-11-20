@@ -135,6 +135,8 @@ pub struct AppState {
     pub active_tasks: HashMap<ActiveView, String>,
     pub task_progress: HashMap<ActiveView, f32>,
     pub active_usage_toast: Option<UsageToastData>,
+    /// Incremented each time a new usage toast is shown (used for auto-dismiss timers).
+    pub usage_toast_seq: u64,
     pub version_updated_from: Option<String>,
 
     pub tshirt_estimator: Entity<TShirtEstimatorView>,
@@ -262,6 +264,7 @@ impl AppState {
                 active_tasks: HashMap::new(),
                 task_progress: HashMap::new(),
                 active_usage_toast: None,
+                usage_toast_seq: 0,
                 version_updated_from,
                 tshirt_estimator,
                 code_explainer,
@@ -394,6 +397,7 @@ impl AppState {
         };
 
         if usage.input_tokens > 0 || usage.output_tokens > 0 {
+            self.usage_toast_seq += 1;
             self.active_usage_toast = Some(UsageToastData {
                 tool_name: tool_name.to_string(),
                 context_reference: context_reference.map(str::to_string),
@@ -457,6 +461,7 @@ impl AppState {
         };
 
         if show_toast && (usage.input_tokens > 0 || usage.output_tokens > 0) {
+            self.usage_toast_seq += 1;
             self.active_usage_toast = Some(UsageToastData {
                 tool_name: tool_name.to_string(),
                 context_reference: context_reference.map(str::to_string),
