@@ -7,6 +7,7 @@ use gpui_kit::component::{Theme, WindowExt as _};
 use gpui_kit::{App, AppContext as _, Entity, Window};
 
 use crate::features::{
+    code_explainer::CodeExplainerView,
     history::UsageHistoryView,
     pr_reviewer::PrReviewerView,
     settings::{SettingsTab, SettingsView},
@@ -32,6 +33,7 @@ use crate::ui::components::auth_modal::open_copilot_auth_modal;
 pub enum ActiveView {
     #[default]
     TShirtEstimator,
+    CodeExplainer,
     StoryWriter,
     TestCaseWriter,
     StoryElaborator,
@@ -42,7 +44,10 @@ pub enum ActiveView {
 
 impl ActiveView {
     pub const LIFECYCLE_GROUPS: &'static [(LifecycleGroup, &'static [ActiveView])] = &[
-        (LifecycleGroup::Ideation, &[ActiveView::TShirtEstimator]),
+        (
+            LifecycleGroup::Ideation,
+            &[ActiveView::TShirtEstimator, ActiveView::CodeExplainer],
+        ),
         (
             LifecycleGroup::SolutionDesign,
             &[ActiveView::StoryWriter, ActiveView::TestCaseWriter],
@@ -57,6 +62,7 @@ impl ActiveView {
     pub fn label(self) -> &'static str {
         match self {
             Self::TShirtEstimator => "T-Shirt Estimator",
+            Self::CodeExplainer => "Code Explainer",
             Self::StoryWriter => "Story Writer",
             Self::TestCaseWriter => "Test Case Writer",
             Self::StoryElaborator => "Story Elaborator",
@@ -70,6 +76,9 @@ impl ActiveView {
         match self {
             Self::TShirtEstimator => {
                 "Estimate effort size (XS–XL) and implementation complexity from a local codebase."
+            }
+            Self::CodeExplainer => {
+                "Investigate a project and document how a chosen feature works, is structured, and calculates."
             }
             Self::StoryWriter => {
                 "Generate structured user stories from Confluence specifications and push to your tracker."
@@ -95,6 +104,7 @@ impl ActiveView {
     pub fn icon(self) -> LucideIcon {
         match self {
             Self::TShirtEstimator => LucideIcon::Shirt,
+            Self::CodeExplainer => LucideIcon::BookOpen,
             Self::StoryWriter => LucideIcon::FileText,
             Self::TestCaseWriter => LucideIcon::ClipboardCheck,
             Self::StoryElaborator => LucideIcon::MessageSquareText,
@@ -128,6 +138,7 @@ pub struct AppState {
     pub version_updated_from: Option<String>,
 
     pub tshirt_estimator: Entity<TShirtEstimatorView>,
+    pub code_explainer: Entity<CodeExplainerView>,
     pub story_writer: Entity<StoryWriterView>,
     pub test_case_writer: Entity<TestCaseWriterView>,
     pub story_elaborator: Entity<StoryElaboratorView>,
@@ -171,6 +182,16 @@ impl AppState {
                 TShirtEstimatorView::new(
                     app_state_handle.clone(),
                     settings.copilot_model.clone(),
+                    window,
+                    cx,
+                )
+            });
+            let code_explainer = cx.new(|cx| {
+                CodeExplainerView::new(
+                    app_state_handle.clone(),
+                    &settings,
+                    copilot_service.clone(),
+                    git_service.clone(),
                     window,
                     cx,
                 )
@@ -243,6 +264,7 @@ impl AppState {
                 active_usage_toast: None,
                 version_updated_from,
                 tshirt_estimator,
+                code_explainer,
                 story_writer,
                 test_case_writer,
                 story_elaborator,

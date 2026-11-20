@@ -156,6 +156,7 @@ pub struct CustomPromptsConfig {
     pub story_writer: StoryWriterPrompts,
     pub test_case_writer: TestCaseWriterPrompts,
     pub story_elaborator: StoryElaboratorPrompts,
+    pub code_explainer: CodeExplainerPrompts,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -181,6 +182,12 @@ pub struct TestCaseWriterPrompts {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct StoryElaboratorPrompts {
+    pub general: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CodeExplainerPrompts {
     pub general: String,
 }
 

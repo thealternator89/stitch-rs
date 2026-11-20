@@ -141,6 +141,8 @@ impl SettingsStore {
 
         settings.prompts.story_elaborator.general =
             settings.prompts.story_elaborator.general.trim().to_string();
+        settings.prompts.code_explainer.general =
+            settings.prompts.code_explainer.general.trim().to_string();
 
         for persona in &mut settings.pr_reviewer.personas {
             persona.name = persona.name.trim().to_string();
