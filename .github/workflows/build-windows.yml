@@ -1,0 +1,91 @@
+name: Build Windows Executable
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows x86_64
+    runs-on: windows-latest
+
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+      AWS_LC_SYS_PREBUILT_NASM: 1
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Enable Git longpaths
+        run: git config --system core.longpaths true
+
+      - name: Setup MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Setup NSIS
+        uses: nsis-dev/setup-nsis@v1
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-x86_64
+
+      - name: Build release executable
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -match '^v?([0-9]+\.[0-9]+\.[0-9]+.*)$') {
+              $version = $Matches[1]
+          }
+          $viVersion = if ($version -match '^([0-9]+\.[0-9]+\.[0-9]+)') { "$($Matches[1]).0" } else { "0.1.0.0" }
+          $exePath = (Resolve-Path "target\x86_64-pc-windows-msvc\release\stitch-rs.exe").Path
+          $outPath = Join-Path (Get-Location) "target\x86_64-pc-windows-msvc\release\Stitch-Setup.exe"
+          $iconPath = (Resolve-Path "assets\icon.ico").Path
+          makensis /NOCD "/DVERSION=$version" "/DVI_VERSION=$viVersion" "/DEXE_PATH=$exePath" "/DICON_PATH=$iconPath" "/DOUTPUT_FILE=$outPath" packaging\windows\installer.nsi
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: stitch-rs-windows-x86_64
+          path: |
+            target/x86_64-pc-windows-msvc/release/stitch-rs.exe
+            target/x86_64-pc-windows-msvc/release/Stitch-Setup.exe
+          if-no-files-found: error
+
+      - name: Publish Release Asset
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/x86_64-pc-windows-msvc/release/stitch-rs.exe
+            target/x86_64-pc-windows-msvc/release/Stitch-Setup.exe

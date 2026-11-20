@@ -1,87 +1,21 @@
-use std::ffi::{CStr, CString, c_char, c_double, c_int, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, anyhow, bail};
+use libsqlite3_sys::{
+    SQLITE_DONE, SQLITE_NULL, SQLITE_OK, SQLITE_OPEN_CREATE, SQLITE_OPEN_FULLMUTEX,
+    SQLITE_OPEN_READWRITE, SQLITE_ROW, SQLITE_TRANSIENT, sqlite3, sqlite3_bind_double,
+    sqlite3_bind_int64, sqlite3_bind_null, sqlite3_bind_text, sqlite3_changes, sqlite3_close,
+    sqlite3_column_bytes, sqlite3_column_double, sqlite3_column_int64, sqlite3_column_text,
+    sqlite3_column_type, sqlite3_errmsg, sqlite3_exec, sqlite3_finalize, sqlite3_free,
+    sqlite3_last_insert_rowid, sqlite3_open_v2, sqlite3_prepare_v2, sqlite3_step, sqlite3_stmt,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::types::CopilotUsage;
-
-const SQLITE_OK: c_int = 0;
-const SQLITE_ROW: c_int = 100;
-const SQLITE_DONE: c_int = 101;
-const SQLITE_NULL: c_int = 5;
-
-const SQLITE_OPEN_READWRITE: c_int = 0x0000_0002;
-const SQLITE_OPEN_CREATE: c_int = 0x0000_0004;
-const SQLITE_OPEN_FULLMUTEX: c_int = 0x0001_0000;
-
-type SqliteDestructor = Option<unsafe extern "C" fn(*mut c_void)>;
-
-fn sqlite_transient() -> SqliteDestructor {
-    // SQLITE_TRANSIENT is defined as ((sqlite3_destructor_type)-1)
-    unsafe { std::mem::transmute::<isize, SqliteDestructor>(-1) }
-}
-
-#[repr(C)]
-struct sqlite3 {
-    _private: [u8; 0],
-}
-
-#[repr(C)]
-struct sqlite3_stmt {
-    _private: [u8; 0],
-}
-
-#[link(name = "sqlite3")]
-unsafe extern "C" {
-    fn sqlite3_open_v2(
-        filename: *const c_char,
-        pp_db: *mut *mut sqlite3,
-        flags: c_int,
-        z_vfs: *const c_char,
-    ) -> c_int;
-    fn sqlite3_close_v2(db: *mut sqlite3) -> c_int;
-    fn sqlite3_exec(
-        db: *mut sqlite3,
-        sql: *const c_char,
-        callback: Option<
-            unsafe extern "C" fn(*mut c_void, c_int, *mut *mut c_char, *mut *mut c_char) -> c_int,
-        >,
-        arg: *mut c_void,
-        errmsg: *mut *mut c_char,
-    ) -> c_int;
-    fn sqlite3_free(ptr: *mut c_void);
-    fn sqlite3_errmsg(db: *mut sqlite3) -> *const c_char;
-    fn sqlite3_changes(db: *mut sqlite3) -> c_int;
-    fn sqlite3_last_insert_rowid(db: *mut sqlite3) -> i64;
-    fn sqlite3_prepare_v2(
-        db: *mut sqlite3,
-        z_sql: *const c_char,
-        n_byte: c_int,
-        pp_stmt: *mut *mut sqlite3_stmt,
-        pz_tail: *mut *const c_char,
-    ) -> c_int;
-    fn sqlite3_finalize(p_stmt: *mut sqlite3_stmt) -> c_int;
-    fn sqlite3_step(p_stmt: *mut sqlite3_stmt) -> c_int;
-    fn sqlite3_bind_int64(p_stmt: *mut sqlite3_stmt, idx: c_int, val: i64) -> c_int;
-    fn sqlite3_bind_double(p_stmt: *mut sqlite3_stmt, idx: c_int, val: c_double) -> c_int;
-    fn sqlite3_bind_null(p_stmt: *mut sqlite3_stmt, idx: c_int) -> c_int;
-    fn sqlite3_bind_text(
-        p_stmt: *mut sqlite3_stmt,
-        idx: c_int,
-        val: *const c_char,
-        n_bytes: c_int,
-        destructor: SqliteDestructor,
-    ) -> c_int;
-    fn sqlite3_column_type(p_stmt: *mut sqlite3_stmt, i_col: c_int) -> c_int;
-    fn sqlite3_column_int64(p_stmt: *mut sqlite3_stmt, i_col: c_int) -> i64;
-    fn sqlite3_column_double(p_stmt: *mut sqlite3_stmt, i_col: c_int) -> c_double;
-    fn sqlite3_column_text(p_stmt: *mut sqlite3_stmt, i_col: c_int) -> *const u8;
-    fn sqlite3_column_bytes(p_stmt: *mut sqlite3_stmt, i_col: c_int) -> c_int;
-}
 
 struct SqliteConn {
     raw: *mut sqlite3,
@@ -94,7 +28,7 @@ impl Drop for SqliteConn {
     fn drop(&mut self) {
         if !self.raw.is_null() {
             unsafe {
-                sqlite3_close_v2(self.raw);
+                sqlite3_close(self.raw);
             }
             self.raw = ptr::null_mut();
         }
@@ -131,7 +65,7 @@ impl SqliteConn {
             } else {
                 let err = unsafe { db_error_message(raw) };
                 unsafe {
-                    sqlite3_close_v2(raw);
+                    sqlite3_close(raw);
                 }
                 err
             };
@@ -242,7 +176,7 @@ impl<'a> SqliteStmt<'a> {
         } else {
             bytes.as_ptr() as *const c_char
         };
-        let rc = unsafe { sqlite3_bind_text(self.raw, idx, ptr, len, sqlite_transient()) };
+        let rc = unsafe { sqlite3_bind_text(self.raw, idx, ptr, len, SQLITE_TRANSIENT()) };
         if rc != SQLITE_OK {
             let msg = unsafe { db_error_message(self.conn.raw) };
             bail!("sqlite3_bind_text failed at index {idx}: {msg}");
