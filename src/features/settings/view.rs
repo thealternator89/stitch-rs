@@ -646,10 +646,12 @@ impl SettingsView {
                             .items_center()
                             .justify_between()
                             .gap_4()
+                            .w_full()
                             .child(
                                 v_flex()
                                     .gap_1()
                                     .flex_1()
+                                    .min_w_0()
                                     .child(
                                         div()
                                             .text_sm()
@@ -664,7 +666,7 @@ impl SettingsView {
                                     ),
                             )
                             .child(
-                                Switch::new("worktree-enabled-switch")
+                                div().flex_shrink_0().child(Switch::new("worktree-enabled-switch")
                                     .checked(worktree_enabled)
                                     .on_change(move |checked, _, cx| {
                                         app_state_for_switch.update(cx, |state, cx| {
@@ -676,7 +678,7 @@ impl SettingsView {
                                             }
                                             cx.notify();
                                         });
-                                    }),
+                                    })),
                             ),
                     )
                     .child(div().h(px(1.)).w_full().bg(theme.border))

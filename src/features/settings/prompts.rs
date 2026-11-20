@@ -599,9 +599,8 @@ impl PromptsSettingsView {
         theme: &gpui_kit::component::Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        h_flex()
-            .items_center()
-            .justify_between()
+        v_flex()
+            .items_start()
             .gap_3()
             .child(
                 div()
@@ -614,7 +613,9 @@ impl PromptsSettingsView {
                 h_flex()
                     .items_center()
                     .gap_2()
-                    .flex_shrink_0()
+                    .flex_wrap()
+                    .w_full()
+                    .justify_end()
                     .child(
                         Button::new(format!("{id_prefix}-check"))
                             .small()
@@ -944,9 +945,8 @@ impl PromptsSettingsView {
         v_flex()
             .gap_4()
             .child(
-                h_flex()
-                    .items_center()
-                    .justify_between()
+                v_flex()
+                    .items_start()
                     .gap_3()
                     .child(
                         div()
@@ -959,7 +959,9 @@ impl PromptsSettingsView {
                         h_flex()
                             .items_center()
                             .gap_2()
-                            .flex_shrink_0()
+                            .flex_wrap()
+                    .w_full()
+                    .justify_end()
                             .child(
                                 Button::new("prompts-elaborator-reset")
                                     .ghost()
