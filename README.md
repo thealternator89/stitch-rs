@@ -25,6 +25,7 @@ Stitch is an AI-powered desktop assistant for senior engineers, technical busine
 - **Deep Code-Aware Ticket Elaboration**: Run interactive Q&A sessions with Copilot that can inspect your workspace, retrieve linked Confluence docs and write implementation plans into your repo.
 - **Accelerate Planning and Testing**: Generate user stories and test cases from tickets, then push them back to Azure DevOps or GitHub.
 - **Rapid T-Shirt Estimation**: Estimate the size (XS–XL) and complexity of a change by letting Copilot inspect your repo through isolated git worktrees.
+- **Instant Code Documentation**: Have Copilot investigate any part of a codebase and write structured, diagram-rich technical documentation you can save as Markdown.
 
 ## Core Features
 
@@ -33,8 +34,12 @@ Stitch is an AI-powered desktop assistant for senior engineers, technical busine
 - **T-Shirt Size Estimator**
   - Estimates effort (XS, S, M, L, XL) and complexity for a proposed change.
   - Uses Copilot with local repository access to analyse the codebase before estimating.
-  - **Git worktree isolation**: Fetches the remote target branch and inspects it in a temporary worktree, so your working files are never modified.
   - Streams live status updates showing tool steps and intermediate thoughts.
+- **Code Explainer**
+  - Generates comprehensive technical documentation for one part of a project. Pick a project directory, describe the feature or area in your own words, and Copilot investigates the code.
+  - Copilot asks a few one-at-a-time questions to confirm scope and depth.
+  - Produces documentation covering overview, architecture and components (with mermaid diagrams), data flow, key algorithms, data models, configuration, error handling, testing and open questions.
+  - Request changes or expansions to the result, copy it to the clipboard, or Save as Markdown.
 
 ### Solution Design
 
@@ -58,8 +63,7 @@ Stitch is an AI-powered desktop assistant for senior engineers, technical busine
   - Two modes: with repository file access, or text context only.
   - Automatically retrieves Confluence pages linked from the ticket.
   - Save the plan to the repo (e.g. `implementation_plan.md`) and/or post it as a ticket comment.
-- **Code Explainer**
-  - Describe an area of the solution and Copilot investigates the local codebase to produce technical documentation for it.
+  - Request changes or expansions to the result, copy it to the clipboard, or Save as Markdown.
 
 ### Review
 
