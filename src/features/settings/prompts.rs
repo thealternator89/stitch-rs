@@ -26,7 +26,9 @@ use crate::features::test_case_writer::prompts::{
     DEFAULT_TC_PRECONDITIONS_PROMPT, DEFAULT_TC_STEPS_PROMPT, SYSTEM_TC_PRIORITY_PROMPT,
 };
 use crate::infrastructure::runtime::spawn_tokio;
-use crate::types::{AppSettings, StoryWriterPrompts, TestCaseWriterPrompts};
+use crate::types::{
+    AppSettings, StoryElaboratorPrompts, StoryWriterPrompts, TestCaseWriterPrompts,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PromptsSubTab {
@@ -94,6 +96,7 @@ pub struct PromptsSettingsView {
     is_checking_tc: bool,
     last_checked_tc_key: Option<String>,
     cached_tc_result: Option<Result<PromptValidationResult, String>>,
+    elaborator_general_input: Entity<TextareaState>,
     feedback: Option<PromptFeedback>,
     _subscriptions: Vec<Subscription>,
 }
@@ -107,6 +110,7 @@ impl PromptsSettingsView {
     ) -> Self {
         let sw = &initial_settings.prompts.story_writer;
         let tc = &initial_settings.prompts.test_case_writer;
+        let se = &initial_settings.prompts.story_elaborator;
 
         let story_general_input = cx.new(|cx| {
             TextareaState::new(window, cx)
@@ -160,6 +164,12 @@ impl PromptsSettingsView {
                 .default_value(tc.expected_result.clone())
         });
 
+        let elaborator_general_input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .placeholder("Optional general instructions inserted into the system instructions for Story Elaborator (e.g., 'Target a clean architecture, write plans in a very structured way with clear file trees.')")
+                .default_value(se.general.clone())
+        });
+
         let mut subs = Vec::new();
         for input in [
             &story_general_input,
@@ -209,6 +219,22 @@ impl PromptsSettingsView {
             subs.push(sub);
         }
 
+        let elaborator_sub = cx.subscribe(&elaborator_general_input, |this, _, event, cx| {
+            match event {
+                InputEvent::Blur => {
+                    if this.is_elaborator_dirty(cx) {
+                        this.save_elaborator_prompts(false, cx);
+                    }
+                }
+                InputEvent::Change => {
+                    this.feedback = None;
+                    cx.notify();
+                }
+                _ => {}
+            }
+        });
+        subs.push(elaborator_sub);
+
         let state_sub = cx.observe(&app_state, |_, _, cx| cx.notify());
         subs.push(state_sub);
 
@@ -231,6 +257,7 @@ impl PromptsSettingsView {
             is_checking_tc: false,
             last_checked_tc_key: None,
             cached_tc_result: None,
+            elaborator_general_input,
             feedback: None,
             _subscriptions: subs,
         }
@@ -856,49 +883,124 @@ impl PromptsSettingsView {
             )
     }
 
-    fn render_future_subtab(
-        &self,
-        title: &'static str,
-        phase: &'static str,
-        description: &'static str,
-        cx: &App,
-    ) -> impl IntoElement {
-        let theme = cx.theme();
+    fn current_elaborator_prompts(&self, cx: &App) -> StoryElaboratorPrompts {
+        StoryElaboratorPrompts {
+            general: self
+                .elaborator_general_input
+                .read(cx)
+                .value()
+                .trim()
+                .to_string(),
+        }
+    }
+
+    fn is_elaborator_dirty(&self, cx: &App) -> bool {
+        let current = self.current_elaborator_prompts(cx);
+        let saved = &self.app_state.read(cx).settings.prompts.story_elaborator;
+        &current != saved
+    }
+
+    fn save_elaborator_prompts(&mut self, show_saved_banner: bool, cx: &mut Context<Self>) {
+        let next = self.current_elaborator_prompts(cx);
+        let res = self.app_state.update(cx, |state, cx| {
+            state.settings.prompts.story_elaborator = next;
+            let save_res = state.save_settings();
+            cx.notify();
+            save_res
+        });
+
+        self.apply_save_outcome(
+            res,
+            show_saved_banner.then_some("Story Elaborator custom prompt saved."),
+            "Failed to save custom prompt",
+            cx,
+        );
+    }
+
+    fn reset_elaborator_defaults(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.elaborator_general_input.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+        });
+
+        let res = self.app_state.update(cx, |state, cx| {
+            state.settings.prompts.story_elaborator = StoryElaboratorPrompts::default();
+            let save_res = state.save_settings();
+            cx.notify();
+            save_res
+        });
+
+        self.apply_save_outcome(
+            res,
+            Some("Story Elaborator prompt reset to default."),
+            "Failed to reset custom prompt",
+            cx,
+        );
+    }
+
+    fn render_story_elaborator_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let is_dirty = self.is_elaborator_dirty(cx);
+
         v_flex()
-            .gap_3()
-            .p_5()
-            .rounded(theme.radius_lg)
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.sidebar)
+            .gap_4()
             .child(
                 h_flex()
                     .items_center()
                     .justify_between()
+                    .gap_3()
                     .child(
                         div()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .px_2p5()
-                            .py_0p5()
-                            .rounded(theme.radius)
-                            .bg(theme.secondary)
-                            .border_1()
-                            .border_color(theme.border)
+                            .flex_1()
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .child(phase),
+                            .child("Customize the guidelines and instructions sent to Copilot when elaborating user stories."),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .flex_shrink_0()
+                            .child(
+                                Button::new("prompts-elaborator-reset")
+                                    .ghost()
+                                    .small()
+                                    .icon(Icon::new(LucideIcon::RotateCcw).small())
+                                    .label("Reset Defaults")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.reset_elaborator_defaults(window, cx);
+                                    })),
+                            )
+                            .child({
+                                let btn = Button::new("prompts-elaborator-save")
+                                    .small()
+                                    .disabled(!is_dirty)
+                                    .icon(Icon::new(LucideIcon::Save).small())
+                                    .label("Save Changes")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.save_elaborator_prompts(true, cx);
+                                    }));
+                                if is_dirty { btn.primary() } else { btn.ghost() }
+                            }),
                     ),
             )
+            .when_some(self.render_feedback_row(self.feedback.clone(), &theme), |col, banner| {
+                col.child(banner)
+            })
             .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(description),
+                v_flex()
+                    .p_5()
+                    .gap_4()
+                    .rounded(theme.radius_lg)
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.sidebar)
+                    .child(render_prompt_field(
+                        "General Instructions",
+                        "Appended to the Story Elaborator system instructions to steer questioning style and plan structure.",
+                        &self.elaborator_general_input,
+                        120.0,
+                        &theme,
+                    )),
             )
     }
 }
@@ -912,14 +1014,9 @@ impl Render for PromptsSettingsView {
             PromptsSubTab::TestCaseWriter => {
                 self.render_test_case_writer_panel(cx).into_any_element()
             }
-            PromptsSubTab::StoryElaborator => self
-                .render_future_subtab(
-                    "Story Elaborator Prompts",
-                    "Scheduled for Phase 7",
-                    "Customize general instructions injected into Story Elaborator's Q&A and implementation plan drafting sessions.",
-                    cx,
-                )
-                .into_any_element(),
+            PromptsSubTab::StoryElaborator => {
+                self.render_story_elaborator_panel(cx).into_any_element()
+            }
         };
 
         v_flex()

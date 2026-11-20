@@ -154,7 +154,15 @@ impl AppState {
             let test_case_writer = cx.new(|cx| {
                 TestCaseWriterView::new(app_state_handle.clone(), &settings, window, cx)
             });
-            let story_elaborator = cx.new(|_| StoryElaboratorView::new());
+            let story_elaborator = cx.new(|cx| {
+                StoryElaboratorView::new(
+                    app_state_handle.clone(),
+                    &settings,
+                    copilot_service.clone(),
+                    window,
+                    cx,
+                )
+            });
             let pr_reviewer = cx.new(|_| PrReviewerView::new());
             let usage_history = cx.new(|_| UsageHistoryView::new());
             let settings_view = cx.new(|cx| {

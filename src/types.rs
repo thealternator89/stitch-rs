@@ -178,7 +178,7 @@ pub struct TestCaseWriterPrompts {
     pub expected_result: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct StoryElaboratorPrompts {
     pub general: String,
@@ -369,4 +369,12 @@ pub struct TestCase {
     pub priority: String,
     #[serde(default)]
     pub deleted: bool,
+}
+
+/// Metadata for a documentation page discovered in a ticket or PR.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KnownDoc {
+    pub id: String,
+    pub title: String,
 }
