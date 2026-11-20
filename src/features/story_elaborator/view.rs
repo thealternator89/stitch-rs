@@ -28,6 +28,7 @@ use crate::features::story_elaborator::service::{
 };
 use crate::infrastructure::copilot::CopilotService;
 use crate::infrastructure::git::GitService;
+use crate::infrastructure::notifications::NotificationService;
 use crate::infrastructure::providers::build_issue_tracker_provider;
 use crate::infrastructure::providers::confluence::strip_html_for_preview;
 use crate::infrastructure::runtime::{runtime, spawn_tokio};
@@ -104,6 +105,7 @@ pub struct StoryElaboratorView {
     is_refining: bool,
     refinement_input: Entity<TextareaState>,
     cumulative_usage: Option<CopilotUsage>,
+    active_db_session_id: Option<i64>,
     is_posting: bool,
     publish_feedback: Option<Result<String, String>>,
     copied: bool,
@@ -254,6 +256,7 @@ impl StoryElaboratorView {
             is_refining: false,
             refinement_input,
             cumulative_usage: None,
+            active_db_session_id: None,
             is_posting: false,
             publish_feedback: None,
             copied: false,
@@ -762,6 +765,11 @@ impl StoryElaboratorView {
                                 state.set_task_status(ActiveView::StoryElaborator, None);
                                 cx.notify();
                             });
+                            NotificationService::show_if_unfocused(
+                                window,
+                                "Story Elaborator Question",
+                                "Copilot has a clarifying question for your ticket.",
+                            );
                             cx.notify();
                         }
                         ElaborationStreamEvent::Plan { text, file_path } => {
@@ -777,6 +785,11 @@ impl StoryElaboratorView {
                                 state.set_task_status(ActiveView::StoryElaborator, None);
                                 cx.notify();
                             });
+                            NotificationService::show_if_unfocused(
+                                window,
+                                "Story Elaborator Complete",
+                                "Implementation plan is ready for review.",
+                            );
                             cx.notify();
                         }
                         ElaborationStreamEvent::TurnCompleted {
@@ -784,12 +797,37 @@ impl StoryElaboratorView {
                             received_plan,
                             cumulative_usage,
                         } => {
+                            let ctx_ref = this
+                                .active_ticket_id
+                                .as_deref()
+                                .or(this.selected_ticket_id.as_deref())
+                                .map(|id| format!("Ticket - {id}"));
+                            let ai_output = if this.stage == ElaboratorStage::PlanCompleted || received_plan {
+                                "Implementation Plan"
+                            } else {
+                                "Elaboration Session"
+                            };
+                            let model_id = this.selected_model.clone();
+                            let existing_sid = this.active_db_session_id;
+                            let updated_sid = app_state.update(cx, |state, cx| {
+                                state.set_task_status(ActiveView::StoryElaborator, None);
+                                let sid = state.upsert_tool_session_usage(
+                                    existing_sid,
+                                    "Story Elaborator",
+                                    ctx_ref.as_deref(),
+                                    Some(ai_output),
+                                    "Story Elaboration Session",
+                                    &model_id,
+                                    &cumulative_usage,
+                                    received_plan,
+                                    cx,
+                                );
+                                cx.notify();
+                                sid
+                            });
+                            this.active_db_session_id = updated_sid;
                             this.cumulative_usage = Some(cumulative_usage);
                             this.is_generating = false;
-                            app_state.update(cx, |state, cx| {
-                                state.set_task_status(ActiveView::StoryElaborator, None);
-                                cx.notify();
-                            });
                             if !received_question
                                 && !received_plan
                                 && this.stage == ElaboratorStage::Elaborating
@@ -910,6 +948,7 @@ impl StoryElaboratorView {
         self.is_posting = false;
         self.publish_feedback = None;
         self.cumulative_usage = None;
+        self.active_db_session_id = None;
         self.copied = false;
         self.validation_error = None;
         self.last_retry_turn = None;
@@ -1051,9 +1090,16 @@ impl StoryElaboratorView {
                 let _ = cx.update(|_, cx| {
                     view.update(cx, |this, cx| {
                         this.is_posting = false;
+                        let succeeded = outcome.is_ok();
+                        let sid_opt = this.active_db_session_id;
                         this.publish_feedback = Some(outcome);
                         app_state.update(cx, |state, cx| {
                             state.set_task_status(ActiveView::StoryElaborator, None);
+                            if succeeded {
+                                if let Some(sid) = sid_opt {
+                                    state.record_push_for_session(sid, "1 comment", cx);
+                                }
+                            }
                             cx.notify();
                         });
                         cx.notify();

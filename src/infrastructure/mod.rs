@@ -1,6 +1,8 @@
 pub mod constants;
 pub mod copilot;
+pub mod database;
 pub mod git;
+pub mod notifications;
 pub mod providers;
 pub mod runtime;
 pub mod settings;

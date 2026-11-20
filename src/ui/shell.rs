@@ -11,11 +11,12 @@ use gpui_kit::component::{
 use gpui_kit::{
     AnyElement, App, Context, Entity, FontWeight, InteractiveElement as _, IntoElement,
     ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _, Subscription, Window,
-    div, hsla, prelude::FluentBuilder as _, px,
+    div, hsla, prelude::FluentBuilder as _, px, relative,
 };
 
 use crate::app_state::{ActiveView, AppState, apply_theme, refresh_copilot_status};
 use crate::types::{CopilotAuthStatus, ThemeMode};
+use crate::ui::components::render_usage_stats_toast;
 
 const REPORT_ISSUE_URL: &str = "https://github.com/thealternator89/stitch/issues";
 const SIDEBAR_WIDTH: f32 = 224.0;
@@ -260,6 +261,38 @@ impl WorkspaceShell {
             .child(div().text_xs().child(auth_label));
 
         let version_label = format!("Version {}", env!("CARGO_PKG_VERSION"));
+        let version_updated_from = state.version_updated_from.clone();
+        let app_state_for_version = self.app_state.clone();
+        let green = hsla(152.0 / 360.0, 0.76, 0.40, 1.0);
+        let green_bg = hsla(152.0 / 360.0, 0.76, 0.40, 0.14);
+
+        let right_slot = h_flex()
+            .items_center()
+            .gap_2()
+            .when_some(version_updated_from, |row, prev_ver| {
+                row.child(
+                    h_flex()
+                        .id("version-update-notice")
+                        .items_center()
+                        .gap_1()
+                        .px_1p5()
+                        .py_0p5()
+                        .rounded(px(4.))
+                        .bg(green_bg)
+                        .text_xs()
+                        .text_color(green)
+                        .cursor_pointer()
+                        .on_click(move |_, _, cx| {
+                            app_state_for_version.update(cx, |state, cx| {
+                                state.dismiss_version_notice();
+                                cx.notify();
+                            });
+                        })
+                        .child(format!("Updated from v{prev_ver}"))
+                        .child(Icon::new(LucideIcon::X).xsmall().text_color(green)),
+                )
+            })
+            .child(div().text_xs().child(version_label));
 
         StatusBar::new()
             .left(auth_slot)
@@ -272,17 +305,42 @@ impl WorkspaceShell {
                         .child(div().text_xs().child(summary)),
                 )
             })
-            .right(div().text_xs().child(version_label))
+            .right(right_slot)
     }
 }
 
 impl Render for WorkspaceShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let (window_progress, toast_data) = {
+            let state = self.app_state.read(cx);
+            (
+                state.active_window_progress(),
+                state.active_usage_toast.clone(),
+            )
+        };
+        let app_state_for_toast = self.app_state.clone();
+
         v_flex()
             .size_full()
-            .bg(cx.theme().background)
-            .text_color(cx.theme().foreground)
+            .bg(theme.background)
+            .text_color(theme.foreground)
             .child(self.render_title_bar(cx))
+            .when_some(window_progress, |shell, progress| {
+                shell.child(
+                    div()
+                        .w_full()
+                        .h(px(2.5))
+                        .bg(theme.secondary)
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .w(relative(progress.clamp(0.05, 1.0)))
+                                .h_full()
+                                .bg(theme.primary),
+                        ),
+                )
+            })
             .child(
                 h_flex()
                     .flex_1()
@@ -291,11 +349,31 @@ impl Render for WorkspaceShell {
                     .child(self.render_activity_rail(window, cx))
                     .child(
                         div()
+                            .relative()
                             .flex_1()
                             .min_w_0()
                             .h_full()
                             .overflow_hidden()
-                            .child(self.render_active_view(cx)),
+                            .child(self.render_active_view(cx))
+                            .when_some(toast_data, |pane, toast| {
+                                let state_for_dismiss = app_state_for_toast.clone();
+                                pane.child(
+                                    div()
+                                        .absolute()
+                                        .bottom_4()
+                                        .right_4()
+                                        .child(render_usage_stats_toast(
+                                            &toast,
+                                            move |_, cx| {
+                                                state_for_dismiss.update(cx, |s, cx| {
+                                                    s.dismiss_usage_toast();
+                                                    cx.notify();
+                                                });
+                                            },
+                                            cx,
+                                        )),
+                                )
+                            }),
                     ),
             )
             .child(self.render_footer(cx))

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui_kit::assets::IconName as LucideIcon;
 use gpui_kit::component::{Theme, WindowExt as _};
@@ -15,12 +16,15 @@ use crate::features::{
     tshirt_estimator::TShirtEstimatorView,
 };
 use crate::infrastructure::copilot::CopilotService;
+use crate::infrastructure::database::UsageDatabase;
 use crate::infrastructure::git::GitService;
 use crate::infrastructure::runtime::spawn_tokio;
 use crate::infrastructure::settings::SettingsStore;
 use crate::types::{
-    AppSettings, CopilotAuthInfo, CopilotAuthStatus, CopilotModelInfo, LifecycleGroup, ThemeMode,
+    AppSettings, CopilotAuthInfo, CopilotAuthStatus, CopilotModelInfo, CopilotUsage,
+    LifecycleGroup, ThemeMode,
 };
+use crate::ui::components::UsageToastData;
 use crate::ui::components::auth_modal::open_copilot_auth_modal;
 
 /// Identifies which singleton tool view is currently active in the workspace.
@@ -111,6 +115,7 @@ pub struct AppState {
     pub settings: AppSettings,
     pub copilot_service: Arc<CopilotService>,
     pub git_service: Arc<GitService>,
+    pub usage_db: Arc<UsageDatabase>,
     pub copilot_auth: CopilotAuthStatus,
     pub copilot_models: Vec<CopilotModelInfo>,
     pub models_loading: bool,
@@ -118,6 +123,9 @@ pub struct AppState {
     pub startup_auth_modal_shown: bool,
     pub auth_modal_open: bool,
     pub active_tasks: HashMap<ActiveView, String>,
+    pub task_progress: HashMap<ActiveView, f32>,
+    pub active_usage_toast: Option<UsageToastData>,
+    pub version_updated_from: Option<String>,
 
     pub tshirt_estimator: Entity<TShirtEstimatorView>,
     pub story_writer: Entity<StoryWriterView>,
@@ -134,9 +142,28 @@ impl AppState {
             let app_state_handle = cx.entity();
 
             let settings_store = Arc::new(SettingsStore::new());
-            let settings = settings_store.load();
+            let mut settings = settings_store.load();
             let copilot_service = Arc::new(CopilotService::new());
             let git_service = Arc::new(GitService::new());
+            let usage_db = Arc::new(
+                UsageDatabase::new().unwrap_or_else(|err| {
+                    eprintln!(
+                        "Warning: failed to open history.db ({err}); falling back to in-memory SQLite."
+                    );
+                    UsageDatabase::open(":memory:").expect("open in-memory SQLite fallback")
+                }),
+            );
+
+            // Check & update version status on startup
+            let current_version = env!("CARGO_PKG_VERSION").to_string();
+            let version_updated_from = match settings.last_run_version.as_deref() {
+                Some(prev) if prev != current_version => Some(prev.to_string()),
+                _ => None,
+            };
+            if settings.last_run_version.as_deref() != Some(current_version.as_str()) {
+                settings.last_run_version = Some(current_version);
+                let _ = settings_store.save(&mut settings);
+            }
 
             apply_theme(settings.theme, Some(window), cx);
 
@@ -174,10 +201,29 @@ impl AppState {
                     cx,
                 )
             });
-            let usage_history = cx.new(|_| UsageHistoryView::new());
+            let usage_history =
+                cx.new(|cx| UsageHistoryView::new(usage_db.clone(), window, cx));
             let settings_view = cx.new(|cx| {
                 SettingsView::new(app_state_handle, &settings, git_service.clone(), window, cx)
             });
+
+            // 2-second delayed startup retention cleanup (pruning records older than 30 days)
+            let db_for_cleanup = usage_db.clone();
+            let history_for_cleanup = usage_history.clone();
+            cx.spawn(async move |_, cx| {
+                cx.background_executor().timer(Duration::from_secs(2)).await;
+                let pruned = spawn_tokio(async move { db_for_cleanup.prune_expired_sessions() })
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or(0);
+                if pruned > 0 {
+                    let _ = history_for_cleanup.update(cx, |view, cx| {
+                        view.refresh_from_db(cx);
+                    });
+                }
+            })
+            .detach();
 
             Self {
                 active_view: ActiveView::default(),
@@ -185,6 +231,7 @@ impl AppState {
                 settings,
                 copilot_service,
                 git_service,
+                usage_db,
                 copilot_auth: CopilotAuthStatus::Checking,
                 copilot_models: Vec::new(),
                 models_loading: false,
@@ -192,6 +239,9 @@ impl AppState {
                 startup_auth_modal_shown: false,
                 auth_modal_open: false,
                 active_tasks: HashMap::new(),
+                task_progress: HashMap::new(),
+                active_usage_toast: None,
+                version_updated_from,
                 tshirt_estimator,
                 story_writer,
                 test_case_writer,
@@ -243,12 +293,198 @@ impl AppState {
             }
             None => {
                 self.active_tasks.remove(&view);
+                self.task_progress.remove(&view);
+            }
+        }
+    }
+
+    pub fn set_task_progress(&mut self, view: ActiveView, progress: Option<f32>) {
+        match progress {
+            Some(p) => {
+                self.task_progress.insert(view, p.clamp(0.0, 1.0));
+            }
+            None => {
+                self.task_progress.remove(&view);
             }
         }
     }
 
     pub fn is_task_running(&self, view: ActiveView) -> bool {
         self.active_tasks.contains_key(&view)
+    }
+
+    /// Returns the active window progress bar fraction (`0.0..=1.0`) if a task is running.
+    pub fn active_window_progress(&self) -> Option<f32> {
+        if self.active_tasks.is_empty() {
+            return None;
+        }
+        if let Some(&p) = self.task_progress.get(&self.active_view) {
+            return Some(p);
+        }
+        if let Some(&p) = self.task_progress.values().next() {
+            return Some(p);
+        }
+        // Indeterminate task running: show a 35% active progress bar indicator
+        Some(0.35)
+    }
+
+    /// Looks up the billing multiplier for `model_id` from the cached Copilot models list.
+    pub fn model_billing_multiplier(&self, model_id: &str) -> Option<f64> {
+        let trimmed = model_id.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
+            return Some(1.0);
+        }
+        self.copilot_models
+            .iter()
+            .find(|m| m.id.eq_ignore_ascii_case(trimmed) || m.name.eq_ignore_ascii_case(trimmed))
+            .and_then(|m| m.billing_multiplier)
+            .or(Some(1.0))
+    }
+
+    /// Persists a completed tool session and its [`CopilotUsage`] to SQLite, displays the floating
+    /// **`UsageStatsToast`**, refreshes [`UsageHistoryView`], and returns the `usage_sessions.id`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_completed_tool_session(
+        &mut self,
+        tool_name: &str,
+        context_reference: Option<&str>,
+        ai_output: Option<&str>,
+        default_label: &str,
+        default_model: &str,
+        usage: &CopilotUsage,
+        cx: &mut App,
+    ) -> Option<i64> {
+        let multiplier = self.model_billing_multiplier(default_model);
+        let session_id = match self.usage_db.log_completed_session(
+            tool_name,
+            context_reference,
+            ai_output,
+            default_label,
+            default_model,
+            usage,
+            multiplier,
+        ) {
+            Ok(id) => Some(id),
+            Err(err) => {
+                eprintln!("Warning: failed to log usage session for {tool_name}: {err}");
+                None
+            }
+        };
+
+        if usage.input_tokens > 0 || usage.output_tokens > 0 {
+            self.active_usage_toast = Some(UsageToastData {
+                tool_name: tool_name.to_string(),
+                context_reference: context_reference.map(str::to_string),
+                default_label: default_label.to_string(),
+                default_model: default_model.to_string(),
+                default_multiplier: multiplier,
+                usage: usage.clone(),
+            });
+        }
+
+        self.usage_history.update(cx, |view, cx| {
+            view.refresh_from_db(cx);
+        });
+
+        session_id
+    }
+
+    /// Creates or updates a multi-turn session in SQLite (used by Story Elaborator across Q&A and plan refinements).
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_tool_session_usage(
+        &mut self,
+        existing_session_id: Option<i64>,
+        tool_name: &str,
+        context_reference: Option<&str>,
+        ai_output: Option<&str>,
+        default_label: &str,
+        default_model: &str,
+        usage: &CopilotUsage,
+        show_toast: bool,
+        cx: &mut App,
+    ) -> Option<i64> {
+        let multiplier = self.model_billing_multiplier(default_model);
+        let session_id = match existing_session_id {
+            Some(id) => {
+                if let Some(out) = ai_output {
+                    let _ = self.usage_db.update_session_output(id, out);
+                }
+                if let Err(err) = self.usage_db.replace_session_copilot_usage(
+                    id,
+                    default_label,
+                    default_model,
+                    usage,
+                    multiplier,
+                ) {
+                    eprintln!("Warning: failed to update session {id} usage: {err}");
+                }
+                Some(id)
+            }
+            None => self
+                .usage_db
+                .log_completed_session(
+                    tool_name,
+                    context_reference,
+                    ai_output,
+                    default_label,
+                    default_model,
+                    usage,
+                    multiplier,
+                )
+                .ok(),
+        };
+
+        if show_toast && (usage.input_tokens > 0 || usage.output_tokens > 0) {
+            self.active_usage_toast = Some(UsageToastData {
+                tool_name: tool_name.to_string(),
+                context_reference: context_reference.map(str::to_string),
+                default_label: default_label.to_string(),
+                default_model: default_model.to_string(),
+                default_multiplier: multiplier,
+                usage: usage.clone(),
+            });
+        }
+
+        self.usage_history.update(cx, |view, cx| {
+            view.refresh_from_db(cx);
+        });
+
+        session_id
+    }
+
+    pub fn record_push_for_session(&mut self, session_id: i64, text: &str, cx: &mut App) {
+        if let Err(err) = self.usage_db.record_push(session_id, text) {
+            eprintln!("Warning: failed to record push on session {session_id}: {err}");
+        }
+        self.usage_history.update(cx, |view, cx| {
+            view.refresh_from_db(cx);
+        });
+    }
+
+    pub fn increment_story_push_for_session(&mut self, session_id: i64, cx: &mut App) {
+        if let Err(err) = self.usage_db.increment_pushed_story_count(session_id) {
+            eprintln!("Warning: failed to increment pushed story count on session {session_id}: {err}");
+        }
+        self.usage_history.update(cx, |view, cx| {
+            view.refresh_from_db(cx);
+        });
+    }
+
+    pub fn increment_pr_comment_push_for_session(&mut self, session_id: i64, cx: &mut App) {
+        if let Err(err) = self.usage_db.increment_pushed_comment_count(session_id) {
+            eprintln!("Warning: failed to increment pushed PR comment count on session {session_id}: {err}");
+        }
+        self.usage_history.update(cx, |view, cx| {
+            view.refresh_from_db(cx);
+        });
+    }
+
+    pub fn dismiss_usage_toast(&mut self) {
+        self.active_usage_toast = None;
+    }
+
+    pub fn dismiss_version_notice(&mut self) {
+        self.version_updated_from = None;
     }
 
     /// Returns a summary string for the Footer Status Bar if any background task is active.

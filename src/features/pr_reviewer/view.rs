@@ -35,6 +35,7 @@ use crate::features::pr_reviewer::service::{
 use crate::features::settings::SettingsTab;
 use crate::infrastructure::copilot::CopilotService;
 use crate::infrastructure::git::GitService;
+use crate::infrastructure::notifications::NotificationService;
 use crate::infrastructure::providers::build_code_review_provider;
 use crate::infrastructure::runtime::{runtime, spawn_tokio};
 use crate::types::{
@@ -142,6 +143,17 @@ fn pr_author_key(pr: &PrMetadata) -> String {
     pr.author.trim().to_string()
 }
 
+fn compute_phase_progress_fraction(phases: &[PhaseProgress]) -> f32 {
+    if phases.is_empty() {
+        return 0.0;
+    }
+    let done = phases
+        .iter()
+        .filter(|p| matches!(p.status, PhaseRunStatus::Completed | PhaseRunStatus::Skipped))
+        .count();
+    (done as f32 / phases.len() as f32).clamp(0.05, 1.0)
+}
+
 #[derive(Debug, Clone)]
 struct PhaseChecklistItem {
     phase: ReviewPhase,
@@ -203,6 +215,7 @@ pub struct PrReviewerView {
     phase_progress: Vec<PhaseProgress>,
     last_status_time: Option<String>,
     last_usage: Option<CopilotUsage>,
+    last_db_session_id: Option<i64>,
     comments: Vec<ReviewComment>,
     critiqued_comments: Vec<ReviewComment>,
     comment_view_mode: CommentViewMode,
@@ -444,6 +457,7 @@ impl PrReviewerView {
             phase_progress: Vec::new(),
             last_status_time: None,
             last_usage: None,
+            last_db_session_id: None,
             comments: Vec::new(),
             critiqued_comments: Vec::new(),
             comment_view_mode: if initial_settings.pr_reviewer.critic_enabled {
@@ -701,6 +715,7 @@ impl PrReviewerView {
         self.phase_progress.clear();
         self.last_status_time = None;
         self.last_usage = None;
+        self.last_db_session_id = None;
         self.review_error = None;
         self.post_error = None;
         self.is_reviewing = false;
@@ -1127,11 +1142,13 @@ impl PrReviewerView {
         let (pipeline_tx, mut pipeline_rx) = mpsc::unbounded_channel::<ReviewPipelineEvent>();
 
         let pr_id_for_status = checked.pr.id.clone();
+        self.last_db_session_id = None;
         self.app_state.update(cx, |state, cx| {
             state.set_task_status(
                 ActiveView::PrReviewer,
                 Some(format!("Reviewing PR #{pr_id_for_status}...")),
             );
+            state.set_task_progress(ActiveView::PrReviewer, Some(0.05));
             cx.notify();
         });
         cx.notify();
@@ -1255,7 +1272,7 @@ impl PrReviewerView {
             .spawn(cx, async move |cx| {
                 while let Some(pipeline_event) = pipeline_rx.recv().await {
                     let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
-                    let _ = cx.update(|_, cx| {
+                    let _ = cx.update(|window, cx| {
                         view.update(cx, |this, cx| {
                             this.last_status_time = Some(timestamp);
                             match pipeline_event {
@@ -1274,6 +1291,11 @@ impl PrReviewerView {
                                             p.status = PhaseRunStatus::Skipped;
                                             p.reason = Some(reason);
                                         }
+                                        let frac = compute_phase_progress_fraction(&this.phase_progress);
+                                        app_state.update(cx, |state, cx| {
+                                            state.set_task_progress(ActiveView::PrReviewer, Some(frac));
+                                            cx.notify();
+                                        });
                                     }
                                     PrReviewStreamEvent::PhaseStarted {
                                         phase_id,
@@ -1319,13 +1341,18 @@ impl PrReviewerView {
                                             p.status = PhaseRunStatus::Completed;
                                             p.comment_count = comment_count;
                                         }
+                                        let frac = compute_phase_progress_fraction(&this.phase_progress);
+                                        app_state.update(cx, |state, cx| {
+                                            state.set_task_progress(ActiveView::PrReviewer, Some(frac));
+                                            cx.notify();
+                                        });
                                     }
                                     PrReviewStreamEvent::Finished {
                                         comments,
                                         usage,
                                         cleaned_up,
                                     } => {
-                                        this.last_usage = Some(usage);
+                                        this.last_usage = Some(usage.clone());
                                         if this.comments.is_empty() && !comments.is_empty() {
                                             this.comments = comments;
                                         }
@@ -1338,10 +1365,32 @@ impl PrReviewerView {
                                             this.is_reviewing = false;
                                             this.has_reviewed = true;
                                             this.review_cancel_tx = None;
-                                            app_state.update(cx, |state, cx| {
+                                            let comment_count = this.comments.len();
+                                            let ai_output = format!("{comment_count} comment(s)");
+                                            let ctx_ref = format!("PR - {pr_id_for_status}");
+                                            let model_id = this.selected_model.clone();
+                                            let sid = app_state.update(cx, |state, cx| {
                                                 state.set_task_status(ActiveView::PrReviewer, None);
+                                                let sid = state.record_completed_tool_session(
+                                                    "PR Reviewer",
+                                                    Some(&ctx_ref),
+                                                    Some(&ai_output),
+                                                    "PR Review",
+                                                    &model_id,
+                                                    &usage,
+                                                    cx,
+                                                );
                                                 cx.notify();
+                                                sid
                                             });
+                                            this.last_db_session_id = sid;
+                                            NotificationService::show_if_unfocused(
+                                                window,
+                                                "PR Review Complete",
+                                                format!(
+                                                    "PR #{pr_id_for_status} review finished with {ai_output}."
+                                                ),
+                                            );
                                         }
                                     }
                                     PrReviewStreamEvent::Cancelled { cleaned_up } => {
@@ -1480,10 +1529,33 @@ impl PrReviewerView {
                                                 co.checkout_cleaned_up = true;
                                             }
                                         }
-                                        app_state.update(cx, |state, cx| {
+                                        let ai_output = format!("{active_count} comment(s)");
+                                        let ctx_ref = format!("PR - {pr_id_for_status}");
+                                        let model_id = this.selected_model.clone();
+                                        let combined_usage =
+                                            this.last_usage.clone().unwrap_or_default();
+                                        let sid = app_state.update(cx, |state, cx| {
                                             state.set_task_status(ActiveView::PrReviewer, None);
+                                            let sid = state.record_completed_tool_session(
+                                                "PR Reviewer",
+                                                Some(&ctx_ref),
+                                                Some(&ai_output),
+                                                "PR Review",
+                                                &model_id,
+                                                &combined_usage,
+                                                cx,
+                                            );
                                             cx.notify();
+                                            sid
                                         });
+                                        this.last_db_session_id = sid;
+                                        NotificationService::show_if_unfocused(
+                                            window,
+                                            "PR Review & Critic Complete",
+                                            format!(
+                                                "PR #{pr_id_for_status} review finished with {ai_output}."
+                                            ),
+                                        );
                                     }
                                     PrCriticStreamEvent::Cancelled { cleaned_up } => {
                                         this.is_critiquing = false;
@@ -1531,10 +1603,27 @@ impl PrReviewerView {
                                                 co.checkout_cleaned_up = true;
                                             }
                                         }
-                                        app_state.update(cx, |state, cx| {
+                                        let raw_count = this.comments.len();
+                                        let ai_output = format!("{raw_count} comment(s)");
+                                        let ctx_ref = format!("PR - {pr_id_for_status}");
+                                        let model_id = this.selected_model.clone();
+                                        let combined_usage =
+                                            this.last_usage.clone().unwrap_or_default();
+                                        let sid = app_state.update(cx, |state, cx| {
                                             state.set_task_status(ActiveView::PrReviewer, None);
+                                            let sid = state.record_completed_tool_session(
+                                                "PR Reviewer",
+                                                Some(&ctx_ref),
+                                                Some(&ai_output),
+                                                "PR Review",
+                                                &model_id,
+                                                &combined_usage,
+                                                cx,
+                                            );
                                             cx.notify();
+                                            sid
                                         });
+                                        this.last_db_session_id = sid;
                                     }
                                 },
                             }
@@ -1642,6 +1731,12 @@ impl PrReviewerView {
                             this.comment_render_rev = this.comment_render_rev.wrapping_add(1);
                         }
                         this.collapsed_comments.insert(comment_id);
+                        if let Some(sid) = this.last_db_session_id {
+                            this.app_state.update(cx, |state, cx| {
+                                state.increment_pr_comment_push_for_session(sid, cx);
+                                cx.notify();
+                            });
+                        }
                     }
                     Ok(Err(err)) => {
                         this.post_error = Some(format!("Failed to post PR comment: {err}"));

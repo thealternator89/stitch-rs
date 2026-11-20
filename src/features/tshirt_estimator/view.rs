@@ -20,6 +20,7 @@ use crate::app_state::{ActiveView, AppState};
 use crate::features::tshirt_estimator::service::{
     self, ActiveEstimationHandle, EstimationRequest, EstimationResult, EstimationStreamEvent,
 };
+use crate::infrastructure::notifications::NotificationService;
 use crate::ui::components::{
     ModelDropdown, ModelDropdownEvent, ModelDropdownMode, open_timeout_modal,
 };
@@ -252,12 +253,29 @@ impl TShirtEstimatorView {
                                 cx.notify();
                             }
                             EstimationStreamEvent::Completed(result) => {
+                                let size_label = result.size.label();
+                                let usage = result.usage.clone();
+                                let model_id = this.selected_model.clone();
                                 this.active_handle = None;
                                 this.stage = EstimatorStage::Completed(result);
                                 app_state.update(cx, |state, cx| {
                                     state.set_task_status(ActiveView::TShirtEstimator, None);
+                                    state.record_completed_tool_session(
+                                        "T-Shirt Size Estimator",
+                                        None,
+                                        Some("T-Shirt Estimate"),
+                                        "T-Shirt Estimation Session",
+                                        &model_id,
+                                        &usage,
+                                        cx,
+                                    );
                                     cx.notify();
                                 });
+                                NotificationService::show_if_unfocused(
+                                    window,
+                                    "T-Shirt Estimation Complete",
+                                    format!("Estimated effort size: {size_label}"),
+                                );
                                 cx.notify();
                             }
                             EstimationStreamEvent::TimedOut { timeout_secs } => {

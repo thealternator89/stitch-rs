@@ -22,6 +22,7 @@ use crate::features::settings::SettingsTab;
 use crate::features::test_case_writer::service::{
     self, ActiveTestCaseGenerationHandle, TestCaseGenerationRequest, TestCaseGenerationStreamEvent,
 };
+use crate::infrastructure::notifications::NotificationService;
 use crate::infrastructure::providers::build_issue_tracker_provider;
 use crate::infrastructure::providers::confluence::strip_html_for_preview;
 use crate::infrastructure::runtime::spawn_tokio;
@@ -108,6 +109,7 @@ pub struct TestCaseWriterView {
     generation_id: u64,
     active_handle: Option<ActiveTestCaseGenerationHandle>,
     generation_usage: Option<CopilotUsage>,
+    last_db_session_id: Option<i64>,
     posting_action: Option<PublishAction>,
     publish_feedback: Option<Result<String, String>>,
     copied: bool,
@@ -209,6 +211,7 @@ impl TestCaseWriterView {
             generation_id: 0,
             active_handle: None,
             generation_usage: None,
+            last_db_session_id: None,
             posting_action: None,
             publish_feedback: None,
             copied: false,
@@ -383,6 +386,7 @@ impl TestCaseWriterView {
         self.selected_row_uid = None;
         self.test_cases_modified = false;
         self.generation_usage = None;
+        self.last_db_session_id = None;
         self.copied = false;
         self.is_generating = true;
         self.fetching_ticket = true;
@@ -513,11 +517,38 @@ impl TestCaseWriterView {
                                 }
                                 TestCaseGenerationStreamEvent::Completed { count, usage } => {
                                     this.finish_generation_ui(fetch_gen, cx);
+                                    let active_count = this.active_test_case_count().max(count);
+                                    let ai_output = format!("{active_count} test case(s)");
+                                    let ctx_ref = this
+                                        .selected_ticket_id
+                                        .as_deref()
+                                        .map(|id| format!("Ticket - {id}"));
+                                    let model_id = this.selected_model.clone();
+                                    let db_session_id = app_state.update(cx, |state, cx| {
+                                        let sid = state.record_completed_tool_session(
+                                            "Test Case Writer",
+                                            ctx_ref.as_deref(),
+                                            Some(&ai_output),
+                                            "Test Case Generation",
+                                            &model_id,
+                                            &usage,
+                                            cx,
+                                        );
+                                        cx.notify();
+                                        sid
+                                    });
+                                    this.last_db_session_id = db_session_id;
                                     this.generation_usage = Some(usage);
                                     if count == 0 {
                                         this.validation_error = Some(
                                             "Copilot completed without returning any structured test cases. Please review the ticket content and try again."
                                                 .to_string(),
+                                        );
+                                    } else {
+                                        NotificationService::show_if_unfocused(
+                                            window,
+                                            "Test Case Writer Complete",
+                                            format!("Generated {ai_output}."),
                                         );
                                     }
                                     cx.notify();
@@ -844,9 +875,20 @@ impl TestCaseWriterView {
                 let _ = cx.update(|_, cx| {
                     view.update(cx, |this, cx| {
                         this.posting_action = None;
+                        let succeeded = outcome.is_ok();
                         this.publish_feedback = Some(outcome);
+                        let sid_opt = this.last_db_session_id;
                         app_state.update(cx, |state, cx| {
                             state.set_task_status(ActiveView::TestCaseWriter, None);
+                            if succeeded {
+                                if let Some(sid) = sid_opt {
+                                    let pushed_label = match action {
+                                        PublishAction::Comment => "1 comment",
+                                        PublishAction::Task => "1 task",
+                                    };
+                                    state.record_push_for_session(sid, pushed_label, cx);
+                                }
+                            }
                             cx.notify();
                         });
                         cx.notify();

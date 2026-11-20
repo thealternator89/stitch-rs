@@ -4,6 +4,7 @@ use gpui_kit::{App, IntoElement, ParentElement as _, Styled as _, div, px};
 use crate::app_state::ActiveView;
 
 /// Renders a consistent, themed placeholder layout for tools not yet implemented.
+#[allow(dead_code)]
 pub fn render_tool_placeholder(
     view: ActiveView,
     phase_label: &'static str,

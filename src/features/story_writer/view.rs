@@ -20,6 +20,7 @@ use crate::features::settings::SettingsTab;
 use crate::features::story_writer::service::{
     self, ActiveStoryGenerationHandle, StoryGenerationRequest, StoryGenerationStreamEvent,
 };
+use crate::infrastructure::notifications::NotificationService;
 use crate::infrastructure::providers::confluence::strip_html_for_preview;
 use crate::infrastructure::providers::{build_documentation_provider, build_issue_tracker_provider};
 use crate::infrastructure::runtime::spawn_tokio;
@@ -77,6 +78,7 @@ pub struct StoryWriterView {
     generation_id: u64,
     active_handle: Option<ActiveStoryGenerationHandle>,
     generation_usage: Option<CopilotUsage>,
+    last_db_session_id: Option<i64>,
     card_errors: HashMap<usize, String>,
     created_ticket_ids: HashMap<usize, String>,
     validation_error: Option<String>,
@@ -196,6 +198,7 @@ impl StoryWriterView {
             generation_id: 0,
             active_handle: None,
             generation_usage: None,
+            last_db_session_id: None,
             card_errors: HashMap::new(),
             created_ticket_ids: HashMap::new(),
             validation_error: None,
@@ -517,6 +520,7 @@ impl StoryWriterView {
         self.card_errors.clear();
         self.created_ticket_ids.clear();
         self.generation_usage = None;
+        self.last_db_session_id = None;
         self.is_generating = true;
         self.fetching_page = true;
         self.fetching_feature = true;
@@ -659,11 +663,42 @@ impl StoryWriterView {
                                 }
                                 StoryGenerationStreamEvent::Completed { story_count, usage } => {
                                     this.finish_generation_ui(page_gen, feature_gen, cx);
+                                    let count = this.stories.len().max(story_count);
+                                    let ai_output = if count == 1 {
+                                        "1 story".to_string()
+                                    } else {
+                                        format!("{count} stories")
+                                    };
+                                    let ctx_ref = this
+                                        .selected_page_id
+                                        .as_deref()
+                                        .map(|id| format!("Confluence - {id}"));
+                                    let model_id = this.selected_model.clone();
+                                    let db_session_id = app_state.update(cx, |state, cx| {
+                                        let sid = state.record_completed_tool_session(
+                                            "Story Writer",
+                                            ctx_ref.as_deref(),
+                                            Some(&ai_output),
+                                            "Story Generation",
+                                            &model_id,
+                                            &usage,
+                                            cx,
+                                        );
+                                        cx.notify();
+                                        sid
+                                    });
+                                    this.last_db_session_id = db_session_id;
                                     this.generation_usage = Some(usage);
                                     if story_count == 0 {
                                         this.validation_error = Some(
                                             "Copilot completed without returning any structured user stories. Please check the page content and try again."
                                                 .to_string(),
+                                        );
+                                    } else {
+                                        NotificationService::show_if_unfocused(
+                                            window,
+                                            "Story Writer Complete",
+                                            format!("Generated {ai_output}."),
                                         );
                                     }
                                     cx.notify();
@@ -910,6 +945,12 @@ impl StoryWriterView {
                                 this.card_errors.remove(&card_id);
                                 if let Some(id) = created_id {
                                     this.created_ticket_ids.insert(card_id, id);
+                                }
+                                if let Some(sid) = this.last_db_session_id {
+                                    this.app_state.update(cx, |state, cx| {
+                                        state.increment_story_push_for_session(sid, cx);
+                                        cx.notify();
+                                    });
                                 }
                             }
                             Ok(Err(err)) => {
