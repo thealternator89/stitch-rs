@@ -114,7 +114,9 @@ fn format_timestamp_ms(timestamp_ms: i64) -> String {
 
 fn icon_for_tool(tool_name: &str) -> LucideIcon {
     let lower = tool_name.to_ascii_lowercase();
-    if lower.contains("pr") || lower.contains("review") {
+    if lower.contains("explainer") {
+        LucideIcon::BookOpen
+    } else if lower.contains("pr") || lower.contains("review") {
         LucideIcon::GitPullRequest
     } else if lower.contains("story writer") {
         LucideIcon::FileText
@@ -1239,6 +1241,7 @@ fn build_tool_select_items(sessions: &[DbSession]) -> Vec<ToolFilterOption> {
         "Story Writer".to_string(),
         "Test Case Writer".to_string(),
         "Story Elaborator".to_string(),
+        "Code Explainer".to_string(),
         "PR Reviewer".to_string(),
     ];
     for s in sessions {

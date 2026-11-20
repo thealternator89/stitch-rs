@@ -27,7 +27,7 @@ use crate::features::test_case_writer::prompts::{
 };
 use crate::infrastructure::runtime::spawn_tokio;
 use crate::types::{
-    AppSettings, StoryElaboratorPrompts, StoryWriterPrompts, TestCaseWriterPrompts,
+    AppSettings, CodeExplainerPrompts, StoryElaboratorPrompts, StoryWriterPrompts, TestCaseWriterPrompts,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -36,6 +36,7 @@ pub enum PromptsSubTab {
     StoryWriter,
     TestCaseWriter,
     StoryElaborator,
+    CodeExplainer,
 }
 
 impl PromptsSubTab {
@@ -43,6 +44,7 @@ impl PromptsSubTab {
         Self::StoryWriter,
         Self::TestCaseWriter,
         Self::StoryElaborator,
+        Self::CodeExplainer,
     ];
 
     fn id(self) -> &'static str {
@@ -50,6 +52,7 @@ impl PromptsSubTab {
             Self::StoryWriter => "prompts-subtab-story-writer",
             Self::TestCaseWriter => "prompts-subtab-test-case-writer",
             Self::StoryElaborator => "prompts-subtab-story-elaborator",
+            Self::CodeExplainer => "prompts-subtab-code-explainer",
         }
     }
 
@@ -58,6 +61,7 @@ impl PromptsSubTab {
             Self::StoryWriter => "Story Writer",
             Self::TestCaseWriter => "Test Case Writer",
             Self::StoryElaborator => "Story Elaborator",
+            Self::CodeExplainer => "Code Explainer",
         }
     }
 
@@ -66,6 +70,7 @@ impl PromptsSubTab {
             Self::StoryWriter => LucideIcon::FileText,
             Self::TestCaseWriter => LucideIcon::ClipboardCheck,
             Self::StoryElaborator => LucideIcon::MessageSquareText,
+            Self::CodeExplainer => LucideIcon::BookOpen,
         }
     }
 }
@@ -97,6 +102,7 @@ pub struct PromptsSettingsView {
     last_checked_tc_key: Option<String>,
     cached_tc_result: Option<Result<PromptValidationResult, String>>,
     elaborator_general_input: Entity<TextareaState>,
+    explainer_general_input: Entity<TextareaState>,
     feedback: Option<PromptFeedback>,
     _subscriptions: Vec<Subscription>,
 }
@@ -111,6 +117,7 @@ impl PromptsSettingsView {
         let sw = &initial_settings.prompts.story_writer;
         let tc = &initial_settings.prompts.test_case_writer;
         let se = &initial_settings.prompts.story_elaborator;
+        let ce = &initial_settings.prompts.code_explainer;
 
         let story_general_input = cx.new(|cx| {
             TextareaState::new(window, cx)
@@ -168,6 +175,12 @@ impl PromptsSettingsView {
             TextareaState::new(window, cx)
                 .placeholder("Optional general instructions inserted into the system instructions for Story Elaborator (e.g., 'Target a clean architecture, write plans in a very structured way with clear file trees.')")
                 .default_value(se.general.clone())
+        });
+
+        let explainer_general_input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .placeholder("Optional general instructions inserted into the system instructions for Code Explainer (e.g., 'Write for new joiners. Always include a glossary and worked calculation examples.')")
+                .default_value(ce.general.clone())
         });
 
         let mut subs = Vec::new();
@@ -235,6 +248,22 @@ impl PromptsSettingsView {
         });
         subs.push(elaborator_sub);
 
+        let explainer_sub = cx.subscribe(&explainer_general_input, |this, _, event, cx| {
+            match event {
+                InputEvent::Blur => {
+                    if this.is_explainer_dirty(cx) {
+                        this.save_explainer_prompts(false, cx);
+                    }
+                }
+                InputEvent::Change => {
+                    this.feedback = None;
+                    cx.notify();
+                }
+                _ => {}
+            }
+        });
+        subs.push(explainer_sub);
+
         let state_sub = cx.observe(&app_state, |_, _, cx| cx.notify());
         subs.push(state_sub);
 
@@ -258,6 +287,7 @@ impl PromptsSettingsView {
             last_checked_tc_key: None,
             cached_tc_result: None,
             elaborator_general_input,
+            explainer_general_input,
             feedback: None,
             _subscriptions: subs,
         }
@@ -1005,6 +1035,125 @@ impl PromptsSettingsView {
                     )),
             )
     }
+
+    fn current_explainer_prompts(&self, cx: &App) -> CodeExplainerPrompts {
+        CodeExplainerPrompts {
+            general: self
+                .explainer_general_input
+                .read(cx)
+                .value()
+                .trim()
+                .to_string(),
+        }
+    }
+
+    fn is_explainer_dirty(&self, cx: &App) -> bool {
+        let current = self.current_explainer_prompts(cx);
+        let saved = &self.app_state.read(cx).settings.prompts.code_explainer;
+        &current != saved
+    }
+
+    fn save_explainer_prompts(&mut self, show_saved_banner: bool, cx: &mut Context<Self>) {
+        let next = self.current_explainer_prompts(cx);
+        let res = self.app_state.update(cx, |state, cx| {
+            state.settings.prompts.code_explainer = next;
+            let save_res = state.save_settings();
+            cx.notify();
+            save_res
+        });
+        self.apply_save_outcome(
+            res,
+            show_saved_banner.then_some("Code Explainer custom prompt saved."),
+            "Failed to save custom prompt",
+            cx,
+        );
+    }
+
+    fn reset_explainer_defaults(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.explainer_general_input.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+        });
+        let res = self.app_state.update(cx, |state, cx| {
+            state.settings.prompts.code_explainer = CodeExplainerPrompts::default();
+            let save_res = state.save_settings();
+            cx.notify();
+            save_res
+        });
+        self.apply_save_outcome(
+            res,
+            Some("Code Explainer prompt reset to default."),
+            "Failed to reset custom prompt",
+            cx,
+        );
+    }
+
+    fn render_code_explainer_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let is_dirty = self.is_explainer_dirty(cx);
+
+        v_flex()
+            .gap_4()
+            .child(
+                v_flex()
+                    .items_start()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child("Customize the guidelines and instructions sent to Copilot when documenting a part of a project."),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .flex_wrap()
+                            .w_full()
+                            .justify_end()
+                            .child(
+                                Button::new("prompts-explainer-reset")
+                                    .ghost()
+                                    .small()
+                                    .icon(Icon::new(LucideIcon::RotateCcw).small())
+                                    .label("Reset Defaults")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.reset_explainer_defaults(window, cx);
+                                    })),
+                            )
+                            .child({
+                                let btn = Button::new("prompts-explainer-save")
+                                    .small()
+                                    .disabled(!is_dirty)
+                                    .icon(Icon::new(LucideIcon::Save).small())
+                                    .label("Save Changes")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.save_explainer_prompts(true, cx);
+                                    }));
+                                if is_dirty { btn.primary() } else { btn.ghost() }
+                            }),
+                    ),
+            )
+            .when_some(self.render_feedback_row(self.feedback.clone(), &theme), |col, banner| {
+                col.child(banner)
+            })
+            .child(
+                v_flex()
+                    .p_5()
+                    .gap_4()
+                    .rounded(theme.radius_lg)
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.sidebar)
+                    .child(render_prompt_field(
+                        "General Instructions",
+                        "Appended to the Code Explainer system instructions to steer investigation focus, audience, and documentation style.",
+                        &self.explainer_general_input,
+                        120.0,
+                        &theme,
+                    )),
+            )
+    }
 }
 
 impl Render for PromptsSettingsView {
@@ -1018,6 +1167,9 @@ impl Render for PromptsSettingsView {
             }
             PromptsSubTab::StoryElaborator => {
                 self.render_story_elaborator_panel(cx).into_any_element()
+            }
+            PromptsSubTab::CodeExplainer => {
+                self.render_code_explainer_panel(cx).into_any_element()
             }
         };
 

@@ -1,3 +1,4 @@
+pub mod code_explainer;
 pub mod history;
 pub mod placeholder;
 pub mod pr_reviewer;
