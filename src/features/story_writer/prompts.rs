@@ -1,7 +1,7 @@
 use crate::types::StoryWriterPrompts;
 
 pub const DEFAULT_STORY_TITLE_PROMPT: &str = "The title of the story";
-pub const DEFAULT_STORY_DESCRIPTION_PROMPT: &str = "Description. This should contain a statement in the format \"As a... I want to... So that...\" followed by 2 blank lines and then a longer description of the changes required for story.";
+pub const DEFAULT_STORY_DESCRIPTION_PROMPT: &str = "A user story statement (\"As a... I want to... So that...\"), followed by a blank line and a detailed description of the required changes.";
 pub const DEFAULT_STORY_AC_PROMPT: &str = "Formatted as a markdown list.";
 pub const DEFAULT_STORY_NOTES_PROMPT: &str =
     "Any additional notes or assumptions (Optional, can be empty)";
@@ -21,7 +21,7 @@ pub fn build_story_prompt(
     let general_block = if general.is_empty() {
         String::new()
     } else {
-        format!("\n{general}\n")
+        format!("\n<custom_instructions>\n{general}\n</custom_instructions>\n")
     };
 
     let title_prompt = non_empty_or_default(&prompts.title, DEFAULT_STORY_TITLE_PROMPT);
@@ -40,36 +40,31 @@ pub fn build_story_prompt(
     };
 
     format!(
-        r#"Generate a set of user stories based on the following functional requirements from a Confluence page.
+        r#"Generate user stories from the functional requirements in the Confluence page below.
 {general_block}
-Page Title: {page_title}
-Page Content: {page_content}
+<confluence_page>
+Title: {page_title}
+Content:
+{page_content}
+</confluence_page>
 
-Additional Context: {context_str}
+<additional_context>
+{context_str}
+</additional_context>
 
-Please format the output as JSON Lines (JSONL), where each line is a valid JSON object.
-Do NOT wrap the JSON objects inside a JSON array. Each line MUST be a standalone JSON object.
+## Output Format
+Output the user stories directly in your response as JSON Lines (JSONL), where each line is a single, standalone, valid JSON object. Do not wrap the objects in a JSON array, create any files, use markdown code fences, or include any surrounding prose.
 
-Do NOT use markdown code blocks, fences, or any formatting other than plain JSON objects. All newlines within string values must be represented as `\n` (double backslash-n), not as actual newlines.
-
-Each JSON object must have exactly the following keys:
+Each JSON object must contain exactly these keys:
 - "title": (string) {title_prompt}
 - "description": (string) {description_prompt}
 - "acceptanceCriteria": (string) {ac_prompt}
 - "notes": (string) {notes_prompt}
 
-For any fields containing markdown, these MUST be formatted and escaped for JSON.
+Inside JSON string values, escape newlines as `\n` (no raw literal newlines) and double quotes as `\"`. Markdown inside string values (such as bullet lists in `acceptanceCriteria`) is allowed where requested by the field instructions.
 
-For example:
-{{"title": "Title text", "description": "First line\\n\\nSecond line", "acceptanceCriteria": "* AC 1\\n* AC 2\\n* AC 3", "notes": "First line\\nSecond Line\\nThird Line"}}
-
-All double quotes inside string values must be escaped as \".
-Do not use markdown formatting or syntax; only plain text is allowed.
-Do not use actual newlines inside string values; use \n instead.
-Bullet points or numbers should be plain text only (e.g., "1. Step one\n2. Step two").
-
-DO NOT create any files, directly output the user stories in your response here.
-DO NOT include any other text in your response (no explanation, no intro, no outro, no markdown fences)."#
+Example line:
+{{"title": "Title text", "description": "As a user...\n\nDetailed description of the change.", "acceptanceCriteria": "* AC 1\n* AC 2\n* AC 3", "notes": "Assumption 1\nAssumption 2"}}"#
     )
 }
 
@@ -82,13 +77,15 @@ mod tests {
         let prompts = StoryWriterPrompts::default();
         let prompt = build_story_prompt("Auth Spec", "<p>Body</p>", "   ", &prompts);
 
-        assert!(prompt.contains("Page Title: Auth Spec"));
-        assert!(prompt.contains("Page Content: <p>Body</p>"));
-        assert!(prompt.contains("Additional Context: None provided"));
+        assert!(prompt.contains("<confluence_page>\nTitle: Auth Spec\nContent:\n<p>Body</p>\n</confluence_page>"));
+        assert!(prompt.contains("<additional_context>\nNone provided\n</additional_context>"));
+        assert!(!prompt.contains("<custom_instructions>"));
         assert!(prompt.contains(DEFAULT_STORY_TITLE_PROMPT));
         assert!(prompt.contains(DEFAULT_STORY_DESCRIPTION_PROMPT));
         assert!(prompt.contains(DEFAULT_STORY_AC_PROMPT));
         assert!(prompt.contains(DEFAULT_STORY_NOTES_PROMPT));
+        assert!(!prompt.contains("\\\\n"));
+        assert!(!prompt.contains("only plain text is allowed"));
     }
 
     #[test]
@@ -102,8 +99,8 @@ mod tests {
         };
         let prompt = build_story_prompt("Billing", "<p>Specs</p>", "Split by API", &prompts);
 
-        assert!(prompt.contains("\nFocus on Rust services.\n"));
-        assert!(prompt.contains("Additional Context: Split by API"));
+        assert!(prompt.contains("<custom_instructions>\nFocus on Rust services.\n</custom_instructions>"));
+        assert!(prompt.contains("<additional_context>\nSplit by API\n</additional_context>"));
         assert!(prompt.contains("- \"title\": (string) Use verb-noun titles."));
         assert!(prompt.contains(DEFAULT_STORY_DESCRIPTION_PROMPT));
         assert!(prompt.contains("- \"acceptanceCriteria\": (string) Given/When/Then list."));

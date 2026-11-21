@@ -1,6 +1,6 @@
 use crate::types::{KnownDoc, TicketData};
 
-/// Builds the Story Elaborator system + task prompt matching the Electron specification.
+/// Builds the Story Elaborator prompt.
 pub fn build_story_elaborator_prompt(
     ticket_data: &TicketData,
     additional_context: &str,
@@ -12,7 +12,7 @@ pub fn build_story_elaborator_prompt(
     let custom_general_block = if custom_general_trimmed.is_empty() {
         String::new()
     } else {
-        format!("\n{custom_general_trimmed}\n")
+        format!("\n<custom_instructions>\n{custom_general_trimmed}\n</custom_instructions>\n")
     };
 
     let ticket_id = ticket_data
@@ -21,6 +21,9 @@ pub fn build_story_elaborator_prompt(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or("N/A");
+
+    let title = &ticket_data.title;
+    let description = &ticket_data.description;
 
     let acceptance_criteria = ticket_data
         .acceptance_criteria
@@ -39,16 +42,9 @@ pub fn build_story_elaborator_prompt(
     };
 
     let repo_instructions = if has_repo {
-        r#"
-You have access to the local codebase of the project through your built-in tools (such as reading files and browsing directories).
-Use these tools to search, analyze, and inspect the codebase files to understand the project structure and existing implementations before formulating questions or plans.
-"#
+        "Read-only access to the local repository: inspect existing code to ground your questions and implementation plan without modifying, creating, or deleting any files or running mutating commands."
     } else {
-        r#"
-You DO NOT have access to a local codebase or repository.
-Base all your questions, architectural assumptions, and the final plan entirely on the details provided in the ticket and user inputs.
-Do NOT attempt to run any filesystem or command tools, as no repository context is available.
-"#
+        "No local repository is attached: base all questions, architectural assumptions, and the final plan solely on the ticket, additional context, and linked documentation, and do not invoke filesystem or command tools."
     };
 
     let docs_instructions = if known_docs.is_empty() {
@@ -60,52 +56,41 @@ Do NOT attempt to run any filesystem or command tools, as no repository context 
             .collect::<Vec<_>>()
             .join("\n");
         format!(
-            "\nYou have identified the following documentation links in this ticket. You can request the content of any of these documents using the \"request_documentation\" tool with the corresponding document ID:\n{docs_list}\n"
+            "\n<available_documentation>\nFetch any of these documents with the `request_documentation` tool using its ID:\n{docs_list}\n</available_documentation>\n"
         )
     };
 
     format!(
-        r##"You are a Story Elaborator. Your task is to elaborate the following user story / ticket into a detailed implementation plan.
+        r##"Elaborate the ticket below into a concise, actionable Markdown implementation plan.
 {custom_general_block}
-Ticket ID: {ticket_id}
-Title: {}
-Description: {}
+<ticket>
+ID: {ticket_id}
+Title: {title}
+Description: {description}
 Acceptance Criteria: {acceptance_criteria}
+</ticket>
 
-Additional Context: {context_str}
-
-{repo_instructions}
+<additional_context>
+{context_str}
+</additional_context>
 {docs_instructions}
+## Environment
+{repo_instructions}
 
-Once you have enough information, generate the final plan in markdown format and output it in a "plan" message.
-If you have access to the repository you are forbidden from modifying, creating, or deleting any files. You must only read.
+## Process & Constraints
+- Ask clarifying questions one at a time when requirements or architectural choices are genuinely ambiguous, stopping after each question to wait for the user's answer (optionally providing `suggestedAnswers`).
+- Once open questions are resolved, deliver the final plan in a `"plan"` message. Because the plan will be posted as a comment on the ticket, keep it concise, avoid repeating the ticket contents verbatim, and focus on concrete changes and steps.
+- Progress updates: call `report_intent` (e.g., `report_intent(intent: "Analyzing codebase and Cargo.toml...")`); do not emit status updates as text or JSON lines.
+- Every turn where you do not call a tool must emit either a single `"question"` object or the final `"plan"` object.
 
-Your communication protocol with the host application is strictly JSON Lines (JSONL).
-Every output line MUST be a single, standalone, valid JSON object. Do NOT wrap the JSON objects in an array. Do NOT output markdown fences (like ```json) wrapping your JSONL output.
-All double quotes inside string values must be escaped as \". All actual newlines inside string values must be escaped as \n.
+## Output Format
+Respond strictly in JSON Lines (JSONL): every line must be a single, standalone, valid JSON object, with no wrapping array, markdown code fences, or surrounding prose. Escape double quotes as `\"` and newlines as `\n` inside string values.
 
-For any status updates, progress updates, or internal thoughts that you want to show to the user, you MUST call the "report_intent" tool with the details of what you are doing (e.g., calling report_intent(intent: "Analyzing codebase / reading package.json...")). You are forbidden from outputting status updates as JSON lines.
-
-You must choose one of the following JSON formats for each line you output:
-1. Questions (if you need clarification on requirements, architectural choices, styling preferences, or codebase details from the user). Ask exactly ONE question at a time and then STOP. Do not output anything else in that turn. You can optionally provide a list of suggested answers if you are able to guess or suggest sensible options:
-   `{{"type": "question", "text": "Should we use React state or Redux to store this new field?", "suggestedAnswers": ["React State", "Redux", "Context API"]}}`
-
-2. The Final Plan (when all questions are answered and the plan is ready. In this case, output a single JSON object):
-   `{{"type": "plan", "text": "# Detailed Implementation Plan\n\n### Proposed Changes..."}}`
-
-Follow this process:
-1. Analyze the ticket, and if a repository is available, inspect the files using your tools.
-2. If you want to request the content of any of the known documents, use the "request_documentation" tool to fetch its content.
-3. If you are still analyzing or reading files, call your filesystem/grep tools to continue. Each turn where you do not call a tool must ask the user a clarifying question or present the final plan. Do not stop without either calling a tool or asking a question/presenting the plan.
-4. Ask clarifying questions one by one, stopping after each question to wait for the user's response.
-5. Once all details are resolved, draft the detailed implementation plan and return the "plan" message in JSONL format.
-
-You are forbidden from ending the interaction without returning the "plan" message in JSONL format.
-
-Start by analyzing the ticket details and/or repository, and ask your first question or call the "report_intent" tool followed by a tool call or question.
-
-Your plan will be written as a comment on the ticket, so be concise and avoid repeating the ticket contents. Ideally your output is a list of things that need to be done to complete this ticket."##,
-        ticket_data.title, ticket_data.description
+Choose one of these schemas:
+- Question (one per turn, then stop to wait for the answer; `suggestedAnswers` is optional):
+  `{{"type": "question", "text": "Should we store this new field in local state or the global store?", "suggestedAnswers": ["Local state", "Global store"]}}`
+- Final plan:
+  `{{"type": "plan", "text": "# Implementation Plan\n\n### Proposed Changes\n..."}}"##
     )
 }
 
@@ -124,14 +109,16 @@ mod tests {
 
         let prompt = build_story_elaborator_prompt(&ticket, "   ", "", false, &[]);
 
-        assert!(prompt.contains("Ticket ID: N/A"));
+        assert!(prompt.contains("ID: N/A"));
         assert!(prompt.contains("Title: Export audit logs"));
         assert!(prompt.contains("Description: Allow CSV download from history page."));
         assert!(prompt.contains("Acceptance Criteria: N/A"));
-        assert!(prompt.contains("Additional Context: None provided"));
-        assert!(prompt.contains("You DO NOT have access to a local codebase or repository."));
-        assert!(prompt.contains("Do NOT attempt to run any filesystem or command tools"));
-        assert!(!prompt.contains("You have identified the following documentation links"));
+        assert!(prompt.contains("<additional_context>\nNone provided\n</additional_context>"));
+        assert!(prompt.contains("No local repository is attached"));
+        assert!(prompt.contains("do not invoke filesystem or command tools"));
+        assert!(!prompt.contains("<available_documentation>"));
+        assert!(!prompt.contains("<custom_instructions>"));
+        assert!(!prompt.contains("You are "));
     }
 
     #[test]
@@ -155,11 +142,13 @@ mod tests {
             &docs,
         );
 
-        assert!(prompt.contains("\nKeep plan concise with bullet points.\n"));
-        assert!(prompt.contains("Ticket ID: 108"));
-        assert!(prompt.contains("Acceptance Criteria: * Redirects to IdP"));
-        assert!(prompt.contains("Additional Context: Prioritize PKCE flow"));
-        assert!(prompt.contains("You have access to the local codebase of the project"));
+        assert!(prompt.contains("<custom_instructions>\nKeep plan concise with bullet points.\n</custom_instructions>"));
+        assert!(prompt.contains("<ticket>\nID: 108"));
+        assert!(prompt.contains("Acceptance Criteria: * Redirects to IdP\n</ticket>"));
+        assert!(prompt.contains("<additional_context>\nPrioritize PKCE flow\n</additional_context>"));
+        assert!(prompt.contains("Read-only access to the local repository"));
+        assert!(prompt.contains("<available_documentation>"));
         assert!(prompt.contains(r#"- "Auth Architecture" (ID: 5544)"#));
+        assert!(!prompt.contains("You are "));
     }
 }

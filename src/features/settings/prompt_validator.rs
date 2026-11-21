@@ -73,41 +73,33 @@ pub fn build_prompt_complexity_check_prompt(
     let prompt_trimmed = prompt_to_check.trim();
 
     format!(
-        r#"You are an expert AI prompt engineer and validator.
-Review the following complete prompt template (which is intended to guide an AI to generate JSON Lines (JSONL) output), focusing SPECIFICALLY on the user-customized statements listed at the end.
+        r#"Evaluate whether the user-customized statements in `<custom_statements>` are likely to confuse the model or break the JSON Lines (JSONL) output contract of `<prompt_template>`.
 
-Your task is to identify if there is anything in the user-customized statements that is likely to confuse the LLM or cause it to violate the requirements specified in the overall template (such as the requirement to produce valid JSONL).
+## Evaluation Scope
+- Evaluate only `<custom_statements>`; do not flag or invent issues for the fixed default parts of `<prompt_template>`.
+- Focus on concrete, high-probability risks to JSONL validity or schema compliance (such as encouraging markdown code fences around output, unescaped double quotes, raw newlines inside JSON string values, or instructions that contradict the required keys).
+- Be lenient on style preferences and low-risk phrasing; do not invent issues when the custom statements are clear and safe.
 
-CRITICAL INSTRUCTIONS:
-1. ONLY evaluate and flag issues present in the user-customized statements listed in the "USER-CUSTOMIZED STATEMENTS TO EVALUATE" section below.
-2. DO NOT flag or invent issues for the fixed, default parts of the template.
-3. Assess the user-customized statements in relation to the rules and structure of the overall prompt template. Specifically check if any custom inputs might encourage code blocks, markdown fences, unescaped double quotes, or raw newlines inside JSON properties.
-4. Avoid being unnecessarily pessimistic. If the user-customized statements are clear and safe, DO NOT invent potential issues.
-
-CRITICAL FORMATTING REQUIREMENT:
-You MUST start your response with either "PASS:", "FAIL:", or no prefix at all.
-- Start with "PASS:" (followed by a space and then your feedback/confirmation) if, on balance, the custom prompt statements are likely to work correctly without causing issues. Be lenient; do not fail prompts for minor style preferences or low-risk phrasing.
-- Start with "FAIL:" (followed by a space and then your feedback/issues list) ONLY if there are significant, high-probability risks to the output format (such as violating the requirement to produce valid JSONL, causing unescaped quotes, or breaking JSON syntax).
-- Start with NO prefix (e.g., start directly with your markdown text feedback) if you are uncertain, or if there are mild issues that do not justify a full FAIL but aren't a clean PASS. An uncertain or mild issue is better off without a prefix than an overzealous FAIL.
+## Output Format
+Format your feedback as brief, clear Markdown, starting with one of:
+- `PASS: ` followed by a short confirmation if the custom statements are safe and compatible with the JSONL contract.
+- `FAIL: ` followed by a concise list of issues only if there are significant, high-probability risks to JSONL validity or schema compliance.
+- No prefix (begin directly with your Markdown feedback) if there are only mild concerns or you are uncertain.
 
 Example PASS response:
-PASS: The custom prompt statements are clear and fully compliant.
+PASS: The custom prompt statements are clear and compatible with the JSONL format.
 
 Example FAIL response:
-FAIL: The customized statements contain formatting risks.
-- **general**: Avoid requesting raw newlines as it may break JSONL structures.
+FAIL: The customized statements introduce JSONL formatting risks.
+- **general**: Avoid requesting raw newlines or fenced code blocks, as they can break JSONL parsing.
 
-Keep your response brief, clear, and formatted nicely as markdown.
-
-OVERALL PROMPT TEMPLATE CONTEXT:
-"""
+<prompt_template>
 {prompt_trimmed}
-"""
+</prompt_template>
 
-USER-CUSTOMIZED STATEMENTS TO EVALUATE:
-"""
+<custom_statements>
 {active_inputs_list}
-""""#
+</custom_statements>"#
     )
 }
 
@@ -231,12 +223,14 @@ mod tests {
         ];
         let meta = build_prompt_complexity_check_prompt("TEMPLATE", &inputs);
 
-        assert!(meta.contains("OVERALL PROMPT TEMPLATE CONTEXT:\n\"\"\"\nTEMPLATE\n\"\"\""));
+        assert!(meta.contains("<prompt_template>\nTEMPLATE\n</prompt_template>"));
+        assert!(meta.contains("<custom_statements>"));
         assert!(meta.contains("[Customized Field: general]\nKeep stories concise."));
         assert!(!meta.contains("[Customized Field: title]"));
         assert!(meta.contains("[Customized Field: notes]\nInclude risks"));
+        assert!(!meta.contains("You are "));
 
         let empty_meta = build_prompt_complexity_check_prompt("TEMPLATE", &[("general", " ")]);
-        assert!(empty_meta.contains("No custom prompt statements entered."));
+        assert!(empty_meta.contains("<custom_statements>\nNo custom prompt statements entered.\n</custom_statements>"));
     }
 }

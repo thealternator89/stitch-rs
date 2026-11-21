@@ -24,7 +24,7 @@ pub fn build_test_case_prompt(
     let general_block = if general.is_empty() {
         String::new()
     } else {
-        format!("\n{general}\n")
+        format!("\n<custom_instructions>\n{general}\n</custom_instructions>\n")
     };
 
     let description_prompt =
@@ -50,39 +50,33 @@ pub fn build_test_case_prompt(
     };
 
     format!(
-        r#"Generate a set of comprehensive test cases for the following user story/ticket.
+        r#"Generate comprehensive test cases for the user story/ticket below.
 {general_block}
-Ticket ID: {ticket_id}
+<ticket>
+ID: {ticket_id}
 Title: {ticket_title}
 Description: {ticket_description}
 Acceptance Criteria: {ac_str}
+</ticket>
 
-Additional Context: {context_str}
+<additional_context>
+{context_str}
+</additional_context>
 
-Please format the output as JSON Lines (JSONL), where each line is a valid JSON object.
-Do NOT wrap the JSON objects inside a JSON array. Each line MUST be a standalone JSON object.
+## Output Format
+Output the test cases directly in your response as JSON Lines (JSONL), where each line is a single, standalone, valid JSON object. Do not wrap the objects in a JSON array, create any files, use markdown code fences, or include any surrounding prose.
 
-Do NOT use markdown code blocks, fences, or any formatting other than plain JSON objects. All newlines within string values must be represented as `\n` (double backslash-n), not as actual newlines.
-
-Each JSON object must have exactly the following keys:
+Each JSON object must contain exactly these keys (do not include an `"id"` key):
 - "description": (string) {description_prompt}
 - "preConditions": (string) {pre_conditions_prompt}
 - "steps": (string) {steps_prompt}
 - "expectedResult": (string) {expected_result_prompt}
 - "priority": (string) {SYSTEM_TC_PRIORITY_PROMPT}
 
-DO NOT include an "id" key in the JSON object.
+Because field values are rendered inside a Markdown table, keep values as concise plain text (simple `-` bullets or `1.` numbered steps separated by `\n` are fine; avoid headings, fenced code blocks, or tables). Inside JSON string values, escape newlines as `\n` (no raw literal newlines) and double quotes as `\"`.
 
-For example:
-{{"description": "It works", "preConditions": "* One\\n* Two\\n* Three", "steps": "1. Step 1\\n2. Step 2\\n3. Step 3", "expectedResult": "Nothing", "priority": "High"}}
-
-All double quotes inside string values must be escaped as \".
-Do not use markdown formatting or syntax; only plain text is allowed.
-Do not use actual newlines inside string values; use \n instead.
-Bullet points or numbers should be plain text only (e.g., "1. Step one\\n2. Step two").
-
-DO NOT create any files, directly output the test cases in your response here.
-DO NOT include any other text in your response (no explanation, no intro, no outro, no markdown fences)."#
+Example line:
+{{"description": "Verify login with valid credentials", "preConditions": "- Account exists\n- User is signed out", "steps": "1. Open login page\n2. Submit valid credentials", "expectedResult": "User is redirected to dashboard", "priority": "High"}}"#
     )
 }
 
@@ -102,17 +96,16 @@ mod tests {
             &prompts,
         );
 
-        assert!(prompt.contains("Ticket ID: 42"));
-        assert!(prompt.contains("Title: Checkout Flow"));
-        assert!(prompt.contains("Description: <p>User pays via card</p>"));
-        assert!(prompt.contains("Acceptance Criteria: N/A"));
-        assert!(prompt.contains("Additional Context: None provided"));
+        assert!(prompt.contains("<ticket>\nID: 42\nTitle: Checkout Flow\nDescription: <p>User pays via card</p>\nAcceptance Criteria: N/A\n</ticket>"));
+        assert!(prompt.contains("<additional_context>\nNone provided\n</additional_context>"));
+        assert!(!prompt.contains("<custom_instructions>"));
         assert!(prompt.contains(DEFAULT_TC_DESCRIPTION_PROMPT));
         assert!(prompt.contains(DEFAULT_TC_PRECONDITIONS_PROMPT));
         assert!(prompt.contains(DEFAULT_TC_STEPS_PROMPT));
         assert!(prompt.contains(DEFAULT_TC_EXPECTED_RESULT_PROMPT));
         assert!(prompt.contains(SYSTEM_TC_PRIORITY_PROMPT));
-        assert!(prompt.contains(r#"DO NOT include an "id" key in the JSON object."#));
+        assert!(prompt.contains(r#"do not include an `"id"` key"#));
+        assert!(!prompt.contains("\\\\n"));
     }
 
     #[test]
@@ -133,9 +126,9 @@ mod tests {
             &prompts,
         );
 
-        assert!(prompt.contains("\nFocus on accessibility checks.\n"));
-        assert!(prompt.contains("Acceptance Criteria: * Focus ring visible"));
-        assert!(prompt.contains("Additional Context: Include screen readers"));
+        assert!(prompt.contains("<custom_instructions>\nFocus on accessibility checks.\n</custom_instructions>"));
+        assert!(prompt.contains("Acceptance Criteria: * Focus ring visible\n</ticket>"));
+        assert!(prompt.contains("<additional_context>\nInclude screen readers\n</additional_context>"));
         assert!(prompt.contains("- \"description\": (string) Include negative cases."));
         assert!(prompt.contains(DEFAULT_TC_PRECONDITIONS_PROMPT));
         assert!(prompt.contains("- \"steps\": (string) Use Given/When/Then format."));
