@@ -28,6 +28,10 @@
   !define EXE_PATH "target\x86_64-pc-windows-msvc\release\stitch-rs.exe"
 !endif
 
+!ifndef RUNTIME_DIR
+  !define RUNTIME_DIR "target\copilot-runtime"
+!endif
+
 !ifndef OUTPUT_FILE
   !define OUTPUT_FILE "target\x86_64-pc-windows-msvc\release\Stitch-Setup.exe"
 !endif
@@ -70,13 +74,19 @@ ShowInstDetails nevershow
 ; Installer Section
 ; --------------------------------------------------
 Section "MainSection" SEC01
-  ; Terminate running instance if any to allow replacing binary cleanly
-  nsExec::Exec 'taskkill /F /IM ${EXECUTABLE_NAME}'
+  ; Terminate running instance and any child Copilot runtime processes before replacing files
+  nsExec::Exec 'taskkill /F /T /IM ${EXECUTABLE_NAME}'
 
   ; Set output destination and copy executable and icon
   SetOutPath "$INSTDIR"
   File "/oname=${EXECUTABLE_NAME}" "${EXE_PATH}"
   File "/oname=icon.ico" "${ICON_PATH}"
+
+  ; Replace bundled Copilot runtime cleanly on upgrades
+  RMDir /r "$INSTDIR\copilot-runtime"
+  SetOutPath "$INSTDIR\copilot-runtime"
+  File /r /x "*.staging-*" /x ".hostless-runtime-assets-v1" "${RUNTIME_DIR}\*"
+  SetOutPath "$INSTDIR"
 
   ; Write uninstaller
   WriteUninstaller "$INSTDIR\uninstall.exe"
@@ -104,8 +114,8 @@ SectionEnd
 ; Uninstaller Section
 ; --------------------------------------------------
 Section "Uninstall"
-  ; Terminate running instance before deleting files
-  nsExec::Exec 'taskkill /F /IM ${EXECUTABLE_NAME}'
+  ; Terminate running instance and any child Copilot runtime processes before deleting files
+  nsExec::Exec 'taskkill /F /T /IM ${EXECUTABLE_NAME}'
 
   ; Remove Start Menu shortcut and folder
   Delete "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME}.lnk"
@@ -115,6 +125,7 @@ Section "Uninstall"
   Delete "$INSTDIR\${EXECUTABLE_NAME}"
   Delete "$INSTDIR\icon.ico"
   Delete "$INSTDIR\uninstall.exe"
+  RMDir /r "$INSTDIR\copilot-runtime"
   RMDir "$INSTDIR"
 
   ; Remove Add/Remove Programs registry key

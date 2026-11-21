@@ -29,6 +29,7 @@ jobs:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
       AWS_LC_SYS_PREBUILT_NASM: 1
+      COPILOT_CLI_EXTRACT_DIR: ${{ github.workspace }}\target\copilot-runtime
 
     steps:
       - name: Checkout repository
@@ -69,23 +70,33 @@ jobs:
           }
           $viVersion = if ($version -match '^([0-9]+\.[0-9]+\.[0-9]+)') { "$($Matches[1]).0" } else { "0.1.0.0" }
           $exePath = (Resolve-Path "target\x86_64-pc-windows-msvc\release\stitch-rs.exe").Path
+          $runtimeDir = (Resolve-Path $env:COPILOT_CLI_EXTRACT_DIR).Path
+          foreach ($required in @("copilot-runtime.exe", "runtime.node")) {
+              if (-not (Test-Path (Join-Path $runtimeDir $required) -PathType Leaf)) {
+                  throw "Expected packaged Copilot runtime file '$required' in '$runtimeDir'"
+              }
+          }
           $outPath = Join-Path (Get-Location) "target\x86_64-pc-windows-msvc\release\Stitch-Setup.exe"
           $iconPath = (Resolve-Path "assets\icon.ico").Path
-          makensis /NOCD "/DVERSION=$version" "/DVI_VERSION=$viVersion" "/DEXE_PATH=$exePath" "/DICON_PATH=$iconPath" "/DOUTPUT_FILE=$outPath" packaging\windows\installer.nsi
+          makensis /NOCD "/DVERSION=$version" "/DVI_VERSION=$viVersion" "/DEXE_PATH=$exePath" "/DRUNTIME_DIR=$runtimeDir" "/DICON_PATH=$iconPath" "/DOUTPUT_FILE=$outPath" packaging\windows\installer.nsi
+          if ($LASTEXITCODE -ne 0) {
+              throw "makensis failed with exit code $LASTEXITCODE"
+          }
+          foreach ($artifact in @($exePath, $outPath)) {
+              $item = Get-Item $artifact
+              $sizeMb = [math]::Round($item.Length / 1MB, 2)
+              Write-Host "$($item.Name): $sizeMb MB ($($item.Length) bytes)"
+          }
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
         with:
           name: stitch-rs-windows-x86_64
-          path: |
-            target/x86_64-pc-windows-msvc/release/stitch-rs.exe
-            target/x86_64-pc-windows-msvc/release/Stitch-Setup.exe
+          path: target/x86_64-pc-windows-msvc/release/Stitch-Setup.exe
           if-no-files-found: error
 
       - name: Publish Release Asset
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            target/x86_64-pc-windows-msvc/release/stitch-rs.exe
-            target/x86_64-pc-windows-msvc/release/Stitch-Setup.exe
+          files: target/x86_64-pc-windows-msvc/release/Stitch-Setup.exe

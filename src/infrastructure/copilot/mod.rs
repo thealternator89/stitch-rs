@@ -2,7 +2,7 @@ pub mod tools;
 
 use std::collections::HashMap;
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use github_copilot_sdk::session::Session;
@@ -12,7 +12,7 @@ use github_copilot_sdk::session_events::{
 };
 use github_copilot_sdk::subscription::RecvErrorKind;
 use github_copilot_sdk::types::{SessionConfig, Tool, WorkingDirectoryTrust};
-use github_copilot_sdk::{Client, ClientInfo, ClientOptions};
+use github_copilot_sdk::{CliProgram, Client, ClientInfo, ClientOptions};
 use tokio::sync::{Mutex, watch};
 
 use crate::types::{CopilotAuthInfo, CopilotModelInfo, CopilotUsage};
@@ -24,6 +24,26 @@ pub use tools::{
 };
 
 const DEFAULT_TIMEOUT_MS: u64 = 180_000;
+const BUNDLED_RUNTIME_DIR_NAME: &str = "copilot-runtime";
+#[cfg(windows)]
+const RUNTIME_WRAPPER_NAME: &str = "copilot-runtime.exe";
+#[cfg(not(windows))]
+const RUNTIME_WRAPPER_NAME: &str = "copilot-runtime";
+const RUNTIME_NODE_NAME: &str = "runtime.node";
+
+/// Locates a packaged Copilot runtime adjacent to the running executable
+/// (`<exe_dir>/copilot-runtime/copilot-runtime[.exe]` + sibling `runtime.node`),
+/// returning `None` when absent so the SDK falls back to `CliProgram::Resolve`.
+fn resolve_packaged_runtime_near_exe(exe_path: &Path) -> Option<PathBuf> {
+    let runtime_dir = exe_path.parent()?.join(BUNDLED_RUNTIME_DIR_NAME);
+    let wrapper = runtime_dir.join(RUNTIME_WRAPPER_NAME);
+    let runtime_node = runtime_dir.join(RUNTIME_NODE_NAME);
+    if wrapper.is_file() && runtime_node.is_file() {
+        Some(wrapper)
+    } else {
+        None
+    }
+}
 
 struct ManagedClient {
     token: Option<String>,
@@ -83,6 +103,18 @@ impl CopilotService {
                 .with_application_name("Stitch")
                 .with_application_version(env!("CARGO_PKG_VERSION")),
         );
+
+        let has_explicit_cli_env =
+            std::env::var_os("COPILOT_CLI_PATH").is_some_and(|value| !value.is_empty());
+        if !has_explicit_cli_env {
+            if let Some(program) = std::env::current_exe()
+                .ok()
+                .as_deref()
+                .and_then(resolve_packaged_runtime_near_exe)
+            {
+                options = options.with_program(CliProgram::Path(program));
+            }
+        }
 
         if let Some(tok) = token {
             options = options.with_github_token(tok).with_use_logged_in_user(false);
@@ -548,7 +580,12 @@ fn log_prompt_if_configured(prompt: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_session_model;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{
+        BUNDLED_RUNTIME_DIR_NAME, RUNTIME_NODE_NAME, RUNTIME_WRAPPER_NAME,
+        resolve_packaged_runtime_near_exe, resolve_session_model,
+    };
 
     #[test]
     fn resolve_session_model_passes_auto_and_trims_custom_models() {
@@ -559,5 +596,33 @@ mod tests {
             resolve_session_model(Some(" claude-sonnet-4.5 ")),
             "claude-sonnet-4.5"
         );
+    }
+
+    #[test]
+    fn resolve_packaged_runtime_near_exe_finds_valid_bundle_and_ignores_incomplete_dirs() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "stitch-rs-copilot-runtime-test-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp root");
+
+        let fake_exe = root.join("stitch-rs");
+        assert_eq!(resolve_packaged_runtime_near_exe(&fake_exe), None);
+
+        let runtime_dir = root.join(BUNDLED_RUNTIME_DIR_NAME);
+        std::fs::create_dir_all(&runtime_dir).expect("create runtime dir");
+        let wrapper = runtime_dir.join(RUNTIME_WRAPPER_NAME);
+        std::fs::write(&wrapper, b"wrapper").expect("write wrapper");
+        assert_eq!(resolve_packaged_runtime_near_exe(&fake_exe), None);
+
+        let runtime_node = runtime_dir.join(RUNTIME_NODE_NAME);
+        std::fs::write(&runtime_node, b"runtime").expect("write runtime.node");
+        assert_eq!(resolve_packaged_runtime_near_exe(&fake_exe), Some(wrapper));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
