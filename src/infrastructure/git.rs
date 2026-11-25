@@ -22,10 +22,14 @@ impl GitService {
     }
 
     async fn run_git(dir: &Path, args: &[&str]) -> anyhow::Result<Output> {
-        Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
+        let mut cmd = Command::new("git");
+        cmd.current_dir(dir).args(args);
+        #[cfg(windows)]
+        {
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        cmd.output()
             .await
             .with_context(|| format!("failed to execute git {} in {}", args.join(" "), dir.display()))
     }
