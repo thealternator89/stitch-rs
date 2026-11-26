@@ -24,7 +24,8 @@ use crate::infrastructure::sleep_guard::SleepGuard;
 use crate::types::{
     AppSettings, CodeContextLine, CopilotModelInfo, CopilotUsage, KnownDoc, PhaseUsage,
     PostPrCommentRequest, PrDiffFile, PrHostType, PrMetadata, ReviewComment, ReviewCommentStatus,
-    ReviewCommentType, ReviewPhase, TicketData, resolve_effective_parallelism, system_cpu_count,
+    ReviewCommentType, ReviewPhase, TicketData, resolve_billing_multiplier,
+    resolve_effective_parallelism, system_cpu_count,
 };
 
 const MAX_CONTEXT_LINES: usize = 25;
@@ -1140,6 +1141,7 @@ impl PrReviewerService {
                 output_tokens: outcome.total_output_tokens,
                 cache_read_tokens: outcome.total_cache_read_tokens,
                 cost: outcome.total_cost,
+                multiplier: None,
                 model: None,
                 phases: Some(outcome.phase_usages),
             };
@@ -1457,6 +1459,11 @@ impl PrReviewerService {
                             let raw_model = usage.model.clone().unwrap_or(resolved_model);
                             let display_model =
                                 resolve_model_display_name(&raw_model, &available_models);
+                            let multiplier = resolve_billing_multiplier(
+                                &available_models,
+                                &raw_model,
+                                usage.multiplier,
+                            );
                             usages_acc.lock().await.push(PhaseUsage {
                                 phase_title: phase.title.clone(),
                                 model: display_model,
@@ -1464,7 +1471,7 @@ impl PrReviewerService {
                                 output_tokens: usage.output_tokens,
                                 cache_read_tokens: usage.cache_read_tokens,
                                 cost: usage.cost,
-                                multiplier: usage.cost,
+                                multiplier,
                             });
                             let _ = tx.send(PrReviewStreamEvent::PhaseCompleted {
                                 phase_id: phase.id.clone(),
@@ -1689,6 +1696,11 @@ impl PrReviewerService {
                 );
                 let raw_model = usage.model.clone().unwrap_or(resolved_model);
                 let display_model = resolve_model_display_name(&raw_model, &req.available_models);
+                let multiplier = resolve_billing_multiplier(
+                    &req.available_models,
+                    &raw_model,
+                    usage.multiplier,
+                );
                 usage.phases = Some(vec![PhaseUsage {
                     phase_title: "Critic".to_string(),
                     model: display_model,
@@ -1696,7 +1708,7 @@ impl PrReviewerService {
                     output_tokens: usage.output_tokens,
                     cache_read_tokens: usage.cache_read_tokens,
                     cost: usage.cost,
-                    multiplier: usage.cost,
+                    multiplier,
                 }]);
                 CriticOutcome::Finished {
                     comments: critiqued,

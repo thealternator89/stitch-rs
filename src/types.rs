@@ -303,8 +303,40 @@ pub struct CopilotUsage {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cost: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multiplier: Option<f64>,
     pub model: Option<String>,
     pub phases: Option<Vec<PhaseUsage>>,
+}
+
+/// Looks up the catalog billing multiplier for `model_id` (matching by ID or display name).
+pub fn lookup_model_billing_multiplier(
+    models: &[CopilotModelInfo],
+    model_id: &str,
+) -> Option<f64> {
+    let trimmed = model_id.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
+        return None;
+    }
+    models
+        .iter()
+        .find(|m| m.id.eq_ignore_ascii_case(trimmed) || m.name.eq_ignore_ascii_case(trimmed))
+        .and_then(|m| m.billing_multiplier)
+}
+
+/// Resolves the billing multiplier for a completed Copilot turn or phase:
+/// 1. Prefers the per-request multiplier reported by Copilot (`assistant.usage.cost`).
+/// 2. Falls back to the catalog billing multiplier for `model_id` in `models`.
+/// 3. Falls back to `1.0` (baseline) if neither is available.
+pub fn resolve_billing_multiplier(
+    models: &[CopilotModelInfo],
+    model_id: &str,
+    reported_multiplier: Option<f64>,
+) -> f64 {
+    if let Some(m) = reported_multiplier {
+        return m;
+    }
+    lookup_model_billing_multiplier(models, model_id).unwrap_or(1.0)
 }
 
 /// Per-phase token and billing breakdown (used by multi-phase tools such as PR Reviewer).
@@ -705,5 +737,61 @@ mod tests {
                 .expect("content alias json");
         assert_eq!(with_content.name, "Perf");
         assert_eq!(with_content.guidelines, "Watch allocations.");
+    }
+
+    #[test]
+    fn billing_multiplier_lookup_and_resolution_handle_reported_catalog_and_auto() {
+        let models = vec![
+            CopilotModelInfo {
+                id: "mai-code-flash".to_string(),
+                name: "MAI Code Flash".to_string(),
+                billing_multiplier: Some(0.25),
+            },
+            CopilotModelInfo {
+                id: "gpt-4.1".to_string(),
+                name: "GPT-4.1".to_string(),
+                billing_multiplier: Some(0.0),
+            },
+            CopilotModelInfo {
+                id: "unknown-mult".to_string(),
+                name: "Unknown Mult".to_string(),
+                billing_multiplier: None,
+            },
+        ];
+
+        assert_eq!(
+            lookup_model_billing_multiplier(&models, "mai-code-flash"),
+            Some(0.25)
+        );
+        assert_eq!(
+            lookup_model_billing_multiplier(&models, "MAI Code Flash"),
+            Some(0.25)
+        );
+        assert_eq!(lookup_model_billing_multiplier(&models, "gpt-4.1"), Some(0.0));
+        assert_eq!(lookup_model_billing_multiplier(&models, "auto"), None);
+        assert_eq!(lookup_model_billing_multiplier(&models, ""), None);
+        assert_eq!(
+            lookup_model_billing_multiplier(&models, "unknown-mult"),
+            None
+        );
+
+        // Prefers explicitly reported multiplier (including 0x and sub-1x values)
+        assert_eq!(
+            resolve_billing_multiplier(&models, "auto", Some(0.33)),
+            0.33
+        );
+        assert_eq!(
+            resolve_billing_multiplier(&models, "mai-code-flash", Some(0.0)),
+            0.0
+        );
+        // Falls back to catalog lookup when reported multiplier is None
+        assert_eq!(
+            resolve_billing_multiplier(&models, "mai-code-flash", None),
+            0.25
+        );
+        assert_eq!(resolve_billing_multiplier(&models, "gpt-4.1", None), 0.0);
+        // Falls back to 1.0 baseline when neither is available
+        assert_eq!(resolve_billing_multiplier(&models, "auto", None), 1.0);
+        assert_eq!(resolve_billing_multiplier(&models, "missing", None), 1.0);
     }
 }

@@ -514,8 +514,11 @@ fn accumulate_usage(usage: &mut CopilotUsage, data: AssistantUsageData) {
             .and_then(|v| u64::try_from(v).ok())
             .unwrap_or(0),
     );
-    if let Some(cost) = data.cost {
-        usage.cost += cost;
+    if let Some(cost) = data.cost.filter(|c| c.is_finite() && *c >= 0.0) {
+        if cost > 0.0 || usage.multiplier.is_none() {
+            usage.cost = cost;
+            usage.multiplier = Some(cost);
+        }
     }
     if !data.model.is_empty() {
         usage.model = Some(data.model);
@@ -583,9 +586,80 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        BUNDLED_RUNTIME_DIR_NAME, RUNTIME_NODE_NAME, RUNTIME_WRAPPER_NAME,
+        BUNDLED_RUNTIME_DIR_NAME, RUNTIME_NODE_NAME, RUNTIME_WRAPPER_NAME, accumulate_usage,
         resolve_packaged_runtime_near_exe, resolve_session_model,
     };
+    use crate::types::CopilotUsage;
+    use github_copilot_sdk::session_events::AssistantUsageData;
+
+    fn make_assistant_usage(
+        input_tokens: i64,
+        output_tokens: i64,
+        cache_read_tokens: i64,
+        cost: Option<f64>,
+        model: &str,
+    ) -> AssistantUsageData {
+        serde_json::from_value(serde_json::json!({
+            "inputTokens": input_tokens,
+            "outputTokens": output_tokens,
+            "cacheReadTokens": cache_read_tokens,
+            "cost": cost,
+            "model": model,
+        }))
+        .expect("valid AssistantUsageData json")
+    }
+
+    #[test]
+    fn accumulate_usage_sums_tokens_but_does_not_sum_billing_multiplier_across_calls() {
+        let mut usage = CopilotUsage::default();
+        for _ in 0..6 {
+            accumulate_usage(
+                &mut usage,
+                make_assistant_usage(100, 25, 40, Some(0.25), "mai-code-flash"),
+            );
+        }
+
+        assert_eq!(usage.input_tokens, 600);
+        assert_eq!(usage.output_tokens, 150);
+        assert_eq!(usage.cache_read_tokens, 240);
+        assert!((usage.cost - 0.25).abs() < 1e-9);
+        assert_eq!(usage.multiplier, Some(0.25));
+        assert_eq!(usage.model.as_deref(), Some("mai-code-flash"));
+    }
+
+    #[test]
+    fn accumulate_usage_preserves_nonzero_multiplier_and_supports_free_0x_and_omitted_cost() {
+        let mut usage = CopilotUsage::default();
+        accumulate_usage(
+            &mut usage,
+            make_assistant_usage(100, 20, 0, Some(0.25), "mai-code-flash"),
+        );
+        accumulate_usage(
+            &mut usage,
+            make_assistant_usage(50, 10, 0, None, "mai-code-flash"),
+        );
+        accumulate_usage(
+            &mut usage,
+            make_assistant_usage(25, 5, 0, Some(0.0), "mai-code-flash"),
+        );
+        assert_eq!(usage.multiplier, Some(0.25));
+        assert!((usage.cost - 0.25).abs() < 1e-9);
+
+        let mut free_usage = CopilotUsage::default();
+        accumulate_usage(
+            &mut free_usage,
+            make_assistant_usage(100, 20, 0, Some(0.0), "gpt-4.1"),
+        );
+        assert_eq!(free_usage.multiplier, Some(0.0));
+        assert!((free_usage.cost - 0.0).abs() < 1e-9);
+
+        let mut omitted_usage = CopilotUsage::default();
+        accumulate_usage(
+            &mut omitted_usage,
+            make_assistant_usage(100, 20, 0, None, "mai-code-flash"),
+        );
+        assert_eq!(omitted_usage.multiplier, None);
+    }
 
     #[test]
     fn resolve_session_model_passes_auto_and_trims_custom_models() {

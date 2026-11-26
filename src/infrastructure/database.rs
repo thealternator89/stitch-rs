@@ -824,6 +824,7 @@ mod tests {
             output_tokens: 4_000,
             cache_read_tokens: 10_000,
             cost: 0.25,
+            multiplier: Some(1.0),
             model: Some("gpt-5".to_string()),
             phases: Some(vec![
                 PhaseUsage {

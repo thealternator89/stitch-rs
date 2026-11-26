@@ -124,6 +124,11 @@ pub fn merge_usage(cumulative: &mut CopilotUsage, turn: &CopilotUsage) {
         .cache_read_tokens
         .saturating_add(turn.cache_read_tokens);
     cumulative.cost += turn.cost;
+    if let Some(multiplier) = turn.multiplier.filter(|m| m.is_finite() && *m >= 0.0) {
+        if multiplier > 0.0 || cumulative.multiplier.is_none() {
+            cumulative.multiplier = Some(multiplier);
+        }
+    }
     if let Some(model) = &turn.model {
         cumulative.model = Some(model.clone());
     }
@@ -698,6 +703,7 @@ mod tests {
                 output_tokens: 250,
                 cache_read_tokens: 400,
                 cost: 0.25,
+                multiplier: Some(0.25),
                 model: Some("gpt-5.4".to_string()),
                 phases: None,
             },
@@ -708,7 +714,8 @@ mod tests {
                 input_tokens: 500,
                 output_tokens: 150,
                 cache_read_tokens: 100,
-                cost: 0.75,
+                cost: 0.25,
+                multiplier: Some(0.25),
                 model: None,
                 phases: None,
             },
@@ -717,7 +724,8 @@ mod tests {
         assert_eq!(total.input_tokens, 1500);
         assert_eq!(total.output_tokens, 400);
         assert_eq!(total.cache_read_tokens, 500);
-        assert!((total.cost - 1.0).abs() < 1e-9);
+        assert!((total.cost - 0.5).abs() < 1e-9);
+        assert_eq!(total.multiplier, Some(0.25));
         assert_eq!(total.model.as_deref(), Some("gpt-5.4"));
     }
 

@@ -23,7 +23,7 @@ use crate::infrastructure::runtime::spawn_tokio;
 use crate::infrastructure::settings::SettingsStore;
 use crate::types::{
     AppSettings, CopilotAuthInfo, CopilotAuthStatus, CopilotModelInfo, CopilotUsage,
-    LifecycleGroup, ThemeMode,
+    LifecycleGroup, ThemeMode, resolve_billing_multiplier,
 };
 use crate::ui::components::UsageToastData;
 use crate::ui::components::auth_modal::open_copilot_auth_modal;
@@ -353,17 +353,24 @@ impl AppState {
         Some(0.35)
     }
 
-    /// Looks up the billing multiplier for `model_id` from the cached Copilot models list.
-    pub fn model_billing_multiplier(&self, model_id: &str) -> Option<f64> {
-        let trimmed = model_id.trim();
-        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
-            return Some(1.0);
-        }
-        self.copilot_models
-            .iter()
-            .find(|m| m.id.eq_ignore_ascii_case(trimmed) || m.name.eq_ignore_ascii_case(trimmed))
-            .and_then(|m| m.billing_multiplier)
-            .or(Some(1.0))
+    /// Resolves the billing multiplier for a completed session/turn using Copilot's reported
+    /// multiplier first, then the cached catalog entry for the resolved or default model.
+    pub fn resolve_usage_multiplier(
+        &self,
+        default_model: &str,
+        usage: &CopilotUsage,
+    ) -> Option<f64> {
+        let effective_model = usage
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .unwrap_or(default_model);
+        Some(resolve_billing_multiplier(
+            &self.copilot_models,
+            effective_model,
+            usage.multiplier,
+        ))
     }
 
     /// Persists a completed tool session and its [`CopilotUsage`] to SQLite, displays the floating
@@ -379,7 +386,7 @@ impl AppState {
         usage: &CopilotUsage,
         cx: &mut App,
     ) -> Option<i64> {
-        let multiplier = self.model_billing_multiplier(default_model);
+        let multiplier = self.resolve_usage_multiplier(default_model, usage);
         let session_id = match self.usage_db.log_completed_session(
             tool_name,
             context_reference,
@@ -429,7 +436,7 @@ impl AppState {
         show_toast: bool,
         cx: &mut App,
     ) -> Option<i64> {
-        let multiplier = self.model_billing_multiplier(default_model);
+        let multiplier = self.resolve_usage_multiplier(default_model, usage);
         let session_id = match existing_session_id {
             Some(id) => {
                 if let Some(out) = ai_output {
