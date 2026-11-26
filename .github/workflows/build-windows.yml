@@ -6,7 +6,8 @@ on:
       - main
       - master
     tags:
-      - 'v*'
+      - 'v[0-9]*.*.*'
+      - '[0-9]*.*.*'
   pull_request:
     branches:
       - main
@@ -58,17 +59,48 @@ jobs:
         with:
           key: windows-x86_64
 
+      - name: Resolve build version
+        id: version
+        shell: pwsh
+        run: |
+          $cargoTomlMatch = Get-Content Cargo.toml | Select-String '^version = "([^"]+)"' | Select-Object -First 1
+          $version = $cargoTomlMatch.Matches[0].Groups[1].Value
+          $isVersionTag = 'false'
+          $isPrerelease = 'false'
+
+          $semverPattern = '^v?(([0-9]+)\.([0-9]+)\.([0-9]+)(?:-((?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)$'
+
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -cmatch $semverPattern) {
+            $version = $Matches[1]
+            $isVersionTag = 'true'
+            if (-not [string]::IsNullOrEmpty($Matches[5])) {
+              $isPrerelease = 'true'
+            }
+          }
+
+          $viVersion = '0.1.0.0'
+          if ($version -cmatch $semverPattern) {
+            $viMajor = [Math]::Min([uint64]$Matches[2], [uint64]65535)
+            $viMinor = [Math]::Min([uint64]$Matches[3], [uint64]65535)
+            $viPatch = [Math]::Min([uint64]$Matches[4], [uint64]65535)
+            $viVersion = "$viMajor.$viMinor.$viPatch.0"
+          }
+
+          Write-Host "Resolved version=$version vi_version=$viVersion is_version_tag=$isVersionTag is_prerelease=$isPrerelease"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "version=$version"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "vi_version=$viVersion"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "is_version_tag=$isVersionTag"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "is_prerelease=$isPrerelease"
+
       - name: Build release executable
         run: cargo build --release --target x86_64-pc-windows-msvc
 
       - name: Build Windows installer
         shell: pwsh
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
+          APP_VI_VERSION: ${{ steps.version.outputs.vi_version }}
         run: |
-          $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
-          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -match '^v?([0-9]+\.[0-9]+\.[0-9]+.*)$') {
-              $version = $Matches[1]
-          }
-          $viVersion = if ($version -match '^([0-9]+\.[0-9]+\.[0-9]+)') { "$($Matches[1]).0" } else { "0.1.0.0" }
           $exePath = (Resolve-Path "target\x86_64-pc-windows-msvc\release\stitch-rs.exe").Path
           $runtimeDir = (Resolve-Path $env:COPILOT_CLI_EXTRACT_DIR).Path
           foreach ($required in @("copilot-runtime.exe", "runtime.node")) {
@@ -78,7 +110,7 @@ jobs:
           }
           $outPath = Join-Path (Get-Location) "target\x86_64-pc-windows-msvc\release\Stitch-Setup.exe"
           $iconPath = (Resolve-Path "assets\icon.ico").Path
-          makensis /NOCD "/DVERSION=$version" "/DVI_VERSION=$viVersion" "/DEXE_PATH=$exePath" "/DRUNTIME_DIR=$runtimeDir" "/DICON_PATH=$iconPath" "/DOUTPUT_FILE=$outPath" packaging\windows\installer.nsi
+          makensis /NOCD "/DVERSION=$env:APP_VERSION" "/DVI_VERSION=$env:APP_VI_VERSION" "/DEXE_PATH=$exePath" "/DRUNTIME_DIR=$runtimeDir" "/DICON_PATH=$iconPath" "/DOUTPUT_FILE=$outPath" packaging\windows\installer.nsi
           if ($LASTEXITCODE -ne 0) {
               throw "makensis failed with exit code $LASTEXITCODE"
           }
@@ -96,7 +128,8 @@ jobs:
           if-no-files-found: error
 
       - name: Publish Release Asset
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: steps.version.outputs.is_version_tag == 'true'
         uses: softprops/action-gh-release@v2
         with:
+          prerelease: ${{ steps.version.outputs.is_prerelease == 'true' }}
           files: target/x86_64-pc-windows-msvc/release/Stitch-Setup.exe
