@@ -48,6 +48,7 @@ pub struct CheckoutResult {
 #[derive(Debug, Clone)]
 pub enum CheckoutError {
     DirtyRepo(String),
+    Cancelled,
     Other(String),
 }
 
@@ -55,6 +56,7 @@ impl std::fmt::Display for CheckoutError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::DirtyRepo(msg) | Self::Other(msg) => f.write_str(msg),
+            Self::Cancelled => f.write_str("Checkout cancelled."),
         }
     }
 }
@@ -72,6 +74,7 @@ pub struct PrReviewRequest {
     pub settings: AppSettings,
     pub available_models: Vec<CopilotModelInfo>,
     pub skip_cleanup: bool,
+    pub prefetched_diff_files: Option<Vec<PrDiffFile>>,
 }
 
 /// Streaming progress, draft comment, and completion events from `PrReviewerService::review_pr`.
@@ -805,30 +808,8 @@ impl PrReviewerService {
             .unwrap_or(repo_root)
     }
 
-    pub async fn has_active_checkout(&self, repo_path: &Path) -> bool {
-        let repo_root = self
-            .git
-            .get_repo_root(repo_path)
-            .await
-            .unwrap_or_else(|_| repo_path.to_path_buf());
-        let repo_key = canonical_or_raw(&repo_root);
-
-        let has_wt = {
-            let map = self.active_worktrees.lock().await;
-            map.contains_key(&repo_key)
-                || map.contains_key(repo_path)
-                || map.contains_key(&repo_root)
-        };
-        if has_wt {
-            return true;
-        }
-        let map = self.active_checkouts.lock().await;
-        map.contains_key(&repo_key)
-            || map.contains_key(repo_path)
-            || map.contains_key(&repo_root)
-    }
-
-    pub async fn checkout_pr(
+    #[allow(clippy::too_many_arguments)]
+    pub async fn checkout_pr_with_progress<F>(
         &self,
         repo_path: &Path,
         pr_number: u64,
@@ -836,7 +817,18 @@ impl PrReviewerService {
         expected_repo_name: Option<&str>,
         code_provider: Option<&dyn crate::infrastructure::providers::CodeReviewProvider>,
         settings: &AppSettings,
-    ) -> Result<CheckoutResult, CheckoutError> {
+        cancel_rx: Option<watch::Receiver<bool>>,
+        on_status: F,
+    ) -> Result<CheckoutResult, CheckoutError>
+    where
+        F: Fn(String) + Send + Sync,
+    {
+        let is_cancelled = || cancel_rx.as_ref().is_some_and(|rx| *rx.borrow());
+        if is_cancelled() {
+            return Err(CheckoutError::Cancelled);
+        }
+
+        on_status("Verifying Git repository...".to_string());
         if !self.git.check_git_repo(repo_path).await {
             return Err(CheckoutError::Other(
                 "The selected path is not a valid Git repository.".to_string(),
@@ -854,6 +846,7 @@ impl PrReviewerService {
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
+            on_status("Checking repository remote...".to_string());
             if let (Some(provider), Some(remote_url)) =
                 (code_provider, self.git.get_remote_url(&repo_root).await)
             {
@@ -873,6 +866,10 @@ impl PrReviewerService {
             eprintln!("Warning: cleanup before PR checkout failed: {err}");
         }
 
+        if is_cancelled() {
+            return Err(CheckoutError::Cancelled);
+        }
+
         if settings.git_worktree_enabled {
             if let Some(base_dir) = settings.git_worktree_base_dir.clone() {
                 if !base_dir.exists() {
@@ -884,11 +881,16 @@ impl PrReviewerService {
                     })?;
                 }
 
+                on_status(format!("Fetching PR #{pr_number} from origin..."));
                 let commit_sha = self
                     .git
                     .fetch_pr(&repo_root, pr_number)
                     .await
                     .map_err(|err| CheckoutError::Other(err.to_string()))?;
+
+                if is_cancelled() {
+                    return Err(CheckoutError::Cancelled);
+                }
 
                 let repo_slug = expected_repo_name
                     .map(str::trim)
@@ -899,6 +901,7 @@ impl PrReviewerService {
                 let worktree_name = format!("{repo_slug}_pr_{pr_number}");
                 let worktree_path = base_dir.join(worktree_name);
 
+                on_status("Creating temporary Git worktree...".to_string());
                 self.git
                     .add_worktree(&repo_root, &worktree_path, &commit_sha)
                     .await
@@ -909,11 +912,19 @@ impl PrReviewerService {
                     map.insert(repo_key, worktree_path.clone());
                 }
 
-                let diff_files = self
-                    .git
-                    .get_diff_files(&worktree_path, target_branch)
-                    .await
-                    .map_err(|err| CheckoutError::Other(err.to_string()))?;
+                if is_cancelled() {
+                    let _ = self.cleanup_checkout(&repo_root).await;
+                    return Err(CheckoutError::Cancelled);
+                }
+
+                on_status("Computing changed files...".to_string());
+                let diff_files = match self.git.get_diff_files(&worktree_path, target_branch).await {
+                    Ok(files) => files,
+                    Err(err) => {
+                        let _ = self.cleanup_checkout(&repo_root).await;
+                        return Err(CheckoutError::Other(err.to_string()));
+                    }
+                };
 
                 return Ok(CheckoutResult {
                     commit_sha,
@@ -924,6 +935,7 @@ impl PrReviewerService {
             }
         }
 
+        on_status("Checking working tree status...".to_string());
         if self.git.has_uncommitted_changes(&repo_root).await {
             return Err(CheckoutError::DirtyRepo(
                 "The local git repository has uncommitted changes. Please commit, stash, or revert them first."
@@ -937,6 +949,11 @@ impl PrReviewerService {
             .await
             .map_err(|err| CheckoutError::Other(err.to_string()))?;
 
+        if is_cancelled() {
+            return Err(CheckoutError::Cancelled);
+        }
+
+        on_status(format!("Fetching & checking out PR #{pr_number}..."));
         let commit_sha = self
             .git
             .fetch_and_checkout_pr(&repo_root, pr_number)
@@ -948,11 +965,19 @@ impl PrReviewerService {
             map.insert(repo_key, original_ref);
         }
 
-        let diff_files = self
-            .git
-            .get_diff_files(&repo_root, target_branch)
-            .await
-            .map_err(|err| CheckoutError::Other(err.to_string()))?;
+        if is_cancelled() {
+            let _ = self.cleanup_checkout(&repo_root).await;
+            return Err(CheckoutError::Cancelled);
+        }
+
+        on_status("Computing changed files...".to_string());
+        let diff_files = match self.git.get_diff_files(&repo_root, target_branch).await {
+            Ok(files) => files,
+            Err(err) => {
+                let _ = self.cleanup_checkout(&repo_root).await;
+                return Err(CheckoutError::Other(err.to_string()));
+            }
+        };
 
         Ok(CheckoutResult {
             commit_sha,
@@ -1189,16 +1214,20 @@ impl PrReviewerService {
         } else {
             req.pr.target_branch.trim()
         };
-        let diff_files = match self
-            .git
-            .get_diff_files(&effective_repo_path, target_branch)
-            .await
-        {
-            Ok(files) => files,
-            Err(err) => {
-                return ReviewExecutionOutcome::error(format!(
-                    "Failed to collect PR diff files: {err}"
-                ));
+        let diff_files = if let Some(ref pre) = req.prefetched_diff_files {
+            pre.clone()
+        } else {
+            match self
+                .git
+                .get_diff_files(&effective_repo_path, target_branch)
+                .await
+            {
+                Ok(files) => files,
+                Err(err) => {
+                    return ReviewExecutionOutcome::error(format!(
+                        "Failed to collect PR diff files: {err}"
+                    ));
+                }
             }
         };
 
@@ -1985,6 +2014,81 @@ mod tests {
         // 7: Unhandled fallback -> Approved
         assert_eq!(out[5].status, Some(ReviewCommentStatus::Approved));
         assert_eq!(out[5].comment, "Unhandled fallback");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn checkout_pr_with_progress_handles_cancel_non_git_and_dirty_repo_with_status() {
+        let tmp = unique_temp_dir("stitch-rs-checkout-progress");
+        let non_git = tmp.join("not-a-repo");
+        let dirty_repo = tmp.join("dirty-repo");
+        std::fs::create_dir_all(&non_git).expect("mkdir non-git");
+        std::fs::create_dir_all(&dirty_repo).expect("mkdir dirty");
+
+        let run_git = |args: &[&str]| {
+            let out = StdCommand::new("git")
+                .current_dir(&dirty_repo)
+                .args(args)
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "git {:?} failed", args);
+        };
+        run_git(&["init"]);
+        run_git(&["config", "user.name", "Test"]);
+        run_git(&["config", "user.email", "test@stitch.local"]);
+        std::fs::write(dirty_repo.join("base.txt"), "base").expect("write");
+        run_git(&["add", "."]);
+        run_git(&["commit", "-m", "init"]);
+        std::fs::write(dirty_repo.join("dirty.txt"), "uncommitted").expect("dirty");
+
+        crate::infrastructure::runtime::runtime().block_on(async {
+            let git = Arc::new(GitService::new());
+            let copilot = Arc::new(CopilotService::new());
+            let service = PrReviewerService::new(git, copilot);
+            let mut settings = AppSettings::default();
+            settings.git_worktree_enabled = false;
+
+            // 1. Pre-cancelled returns Cancelled immediately.
+            let (_tx, rx) = watch::channel(true);
+            let res = service
+                .checkout_pr_with_progress(&dirty_repo, 1, "main", None, None, &settings, Some(rx), |_| {})
+                .await;
+            assert!(matches!(res, Err(CheckoutError::Cancelled)));
+
+            // 2. Non-git directory returns Other.
+            let res = service
+                .checkout_pr_with_progress(&non_git, 1, "main", None, None, &settings, None, |_| {})
+                .await;
+            assert!(matches!(res, Err(CheckoutError::Other(_))));
+
+            // 3. Dirty repo emits expected statuses and returns DirtyRepo without mutating HEAD.
+            let statuses = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let statuses_cb = Arc::clone(&statuses);
+            let res = service
+                .checkout_pr_with_progress(
+                    &dirty_repo,
+                    42,
+                    "main",
+                    None,
+                    None,
+                    &settings,
+                    None,
+                    move |msg| {
+                        statuses_cb.lock().expect("lock").push(msg);
+                    },
+                )
+                .await;
+            assert!(matches!(res, Err(CheckoutError::DirtyRepo(_))));
+            let recorded = statuses.lock().expect("lock").clone();
+            assert_eq!(
+                recorded,
+                vec![
+                    "Verifying Git repository...".to_string(),
+                    "Checking working tree status...".to_string(),
+                ]
+            );
+        });
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

@@ -29,8 +29,8 @@ use crate::features::pr_reviewer::phase_loader::{
     load_phases_from_disk, open_directory_in_os, pr_reviewer_root_dir,
 };
 use crate::features::pr_reviewer::service::{
-    CheckoutError, PrCriticRequest, PrCriticStreamEvent, PrReviewRequest, PrReviewStreamEvent,
-    PrReviewerService, verify_repo_path,
+    CheckoutError, CheckoutResult, PrCriticRequest, PrCriticStreamEvent, PrReviewRequest,
+    PrReviewStreamEvent, PrReviewerService, VerifiedRepoPath, verify_repo_path,
 };
 use crate::features::settings::SettingsTab;
 use crate::infrastructure::copilot::CopilotService;
@@ -49,7 +49,15 @@ use crate::ui::components::{
     open_reset_confirm_modal, render_tool_reset_button,
 };
 
+const CHECKOUT_PHASE_ID: &str = "checkout-phase";
 const CRITIC_PHASE_ID: &str = "critic-phase";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ReviewerStage {
+    #[default]
+    Setup,
+    Workspace,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum CommentViewMode {
@@ -60,6 +68,12 @@ enum CommentViewMode {
 
 #[derive(Debug, Clone)]
 enum ReviewPipelineEvent {
+    CheckoutStatus(String),
+    CheckoutCompleted {
+        verified: VerifiedRepoPath,
+        checkout: CheckoutResult,
+    },
+    CheckoutFailed(CheckoutError),
     Review(PrReviewStreamEvent),
     CriticStarted,
     Critic(PrCriticStreamEvent),
@@ -164,20 +178,30 @@ struct PhaseChecklistItem {
 }
 
 #[derive(Debug, Clone)]
-struct CheckedOutState {
-    pr: PrMetadata,
-    repo_path: PathBuf,
+struct SessionCheckoutInfo {
     commit_sha: String,
     effective_repo_path: PathBuf,
     diff_files: Vec<PrDiffFile>,
     using_worktree: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveReviewSession {
+    pr: PrMetadata,
+    repo_path: PathBuf,
+    checkout: Option<SessionCheckoutInfo>,
     checkout_cleaned_up: bool,
+    model: String,
+    parallelism: usize,
+    persona: String,
+    custom_instructions: String,
 }
 
 pub struct PrReviewerView {
     app_state: Entity<AppState>,
     git_service: Arc<GitService>,
     pr_service: Arc<PrReviewerService>,
+    stage: ReviewerStage,
     active_tab: PrSelectorTab,
     pr_list: Vec<PrMetadata>,
     is_loading_prs: bool,
@@ -193,12 +217,11 @@ pub struct PrReviewerView {
     loading_pr_details: bool,
     phases: Vec<PhaseChecklistItem>,
     critic_enabled: bool,
-    is_loading_checkout: bool,
-    loading_status: Option<String>,
     checkout_error: Option<String>,
     status_notice: Option<String>,
-    checked_out: Option<CheckedOutState>,
-    is_header_collapsed: bool,
+    active_session: Option<ActiveReviewSession>,
+    is_preparing_checkout: bool,
+    context_expanded: bool,
     model_dropdown: Entity<ModelDropdown>,
     selected_model: String,
     user_overrode_model: bool,
@@ -227,7 +250,6 @@ pub struct PrReviewerView {
     expanded_rejected_comments: HashSet<String>,
     posting_comment_ids: HashSet<String>,
     comment_render_rev: u64,
-    checkout_gen: u64,
     review_gen: u64,
     post_gen: u64,
     review_error: Option<String>,
@@ -365,10 +387,9 @@ impl PrReviewerView {
                 let chosen = value.clone();
                 this.selected_persona = chosen.clone();
                 let active_pr = this
-                    .checked_out
+                    .selected_pr
                     .as_ref()
-                    .map(|c| &c.pr)
-                    .or(this.selected_pr.as_ref());
+                    .or_else(|| this.active_session.as_ref().map(|s| &s.pr));
                 if let Some(author_key) = active_pr.map(pr_author_key).filter(|k| !k.is_empty()) {
                     this.app_state.update(cx, |state, cx| {
                         state.settings.author_personas.insert(author_key, chosen);
@@ -442,6 +463,7 @@ impl PrReviewerView {
             app_state,
             git_service,
             pr_service,
+            stage: ReviewerStage::Setup,
             active_tab: PrSelectorTab::Assigned,
             pr_list: Vec::new(),
             is_loading_prs: false,
@@ -457,12 +479,11 @@ impl PrReviewerView {
             loading_pr_details: false,
             phases,
             critic_enabled: initial_settings.pr_reviewer.critic_enabled,
-            is_loading_checkout: false,
-            loading_status: None,
             checkout_error: None,
             status_notice: None,
-            checked_out: None,
-            is_header_collapsed: false,
+            active_session: None,
+            is_preparing_checkout: false,
+            context_expanded: false,
             model_dropdown,
             selected_model,
             user_overrode_model: false,
@@ -495,7 +516,6 @@ impl PrReviewerView {
             expanded_rejected_comments: HashSet::new(),
             posting_comment_ids: HashSet::new(),
             comment_render_rev: 0,
-            checkout_gen: 0,
             review_gen: 0,
             post_gen: 0,
             review_error: None,
@@ -717,11 +737,25 @@ impl PrReviewerView {
     }
 
     fn select_pr(&mut self, pr: PrMetadata, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(cancel_tx) = self.review_cancel_tx.take() {
+        let was_reviewing = if let Some(cancel_tx) = self.review_cancel_tx.take() {
             let _ = cancel_tx.send(true);
+            true
+        } else {
+            false
+        };
+        if let Some(session) = self.active_session.take()
+            && !session.checkout_cleaned_up
+            && !was_reviewing
+        {
+            let pr_service = Arc::clone(&self.pr_service);
+            let repo_path = session.repo_path;
+            runtime().spawn(async move {
+                if let Err(err) = pr_service.cleanup_checkout(&repo_path).await {
+                    eprintln!("Warning: failed to clean up PR checkout on PR switch: {err}");
+                }
+            });
         }
         self.review_gen = self.review_gen.wrapping_add(1);
-        self.checkout_gen = self.checkout_gen.wrapping_add(1);
         self.post_gen = self.post_gen.wrapping_add(1);
 
         let needs_details =
@@ -735,8 +769,9 @@ impl PrReviewerView {
         };
 
         self.selected_pr = Some(pr.clone());
-        self.checked_out = None;
-        self.is_header_collapsed = false;
+        self.stage = ReviewerStage::Setup;
+        self.is_preparing_checkout = false;
+        self.context_expanded = false;
         self.repo_path_modified = false;
         self.checkout_error = None;
         self.status_notice = None;
@@ -815,7 +850,7 @@ impl PrReviewerView {
     }
 
     fn browse_repo_dir(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.is_loading_checkout {
+        if self.is_reviewing {
             return;
         }
         let receiver = cx.prompt_for_paths(PathPromptOptions {
@@ -860,11 +895,114 @@ impl PrReviewerView {
             .detach();
     }
 
-    fn handle_checkout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.is_loading_checkout {
+    fn handle_cleanup_checkout(&mut self, cx: &mut Context<Self>) {
+        if self.is_reviewing {
             return;
         }
-        let Some(pr) = self.selected_pr.clone() else {
+        let Some(session) = self.active_session.clone() else {
+            return;
+        };
+        let Some(checkout) = session.checkout.as_ref() else {
+            return;
+        };
+        let using_worktree = checkout.using_worktree;
+        let repo_path = session.repo_path.clone();
+        let pr_service = Arc::clone(&self.pr_service);
+        let view = cx.entity();
+        let run_gen = self.review_gen;
+
+        cx.spawn(async move |_, cx| {
+            let res =
+                spawn_tokio(async move { pr_service.cleanup_checkout(&repo_path).await })
+                    .await;
+
+            let _ = view.update(cx, |this, cx| {
+                if this.review_gen != run_gen {
+                    return;
+                }
+                match res {
+                    Ok(Ok(())) => {
+                        if let Some(ref mut active) = this.active_session {
+                            active.checkout_cleaned_up = true;
+                        }
+                        this.checkout_error = None;
+                        this.status_notice = Some(if using_worktree {
+                            "Removed temporary PR worktree.".to_string()
+                        } else {
+                            "Restored repository to previous branch/ref.".to_string()
+                        });
+                    }
+                    Ok(Err(err)) => {
+                        this.checkout_error = Some(err.to_string());
+                    }
+                    Err(err) => {
+                        this.checkout_error = Some(err.to_string());
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn general_status_text(&self) -> String {
+        if self.is_preparing_checkout {
+            if let Some(p) = self.phase_progress.iter().find(|p| p.id == CHECKOUT_PHASE_ID)
+                && let Some(ref st) = p.status_text
+            {
+                return st.clone();
+            }
+            return "Preparing repository...".to_string();
+        }
+        let running: Vec<&PhaseProgress> = self
+            .phase_progress
+            .iter()
+            .filter(|p| p.status == PhaseRunStatus::Running)
+            .collect();
+        if running.len() == 1 {
+            let p = running[0];
+            if let Some(ref st) = p.status_text {
+                return format!("{}: {st}", p.title);
+            }
+            return format!("Running {}...", p.title);
+        }
+        if running.len() > 1 {
+            return format!("Running {} review phases in parallel...", running.len());
+        }
+        if self.is_reviewing {
+            return "Preparing review phases...".to_string();
+        }
+        "Idle".to_string()
+    }
+
+    fn pr_identifier_for_post(&self, session: &ActiveReviewSession, cx: &App) -> String {
+        session
+            .pr
+            .url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                if self.active_tab == PrSelectorTab::Manual {
+                    let manual = self.manual_pr_input.read(cx).value().trim().to_string();
+                    if !manual.is_empty() {
+                        return manual;
+                    }
+                }
+                session.pr.id.clone()
+            })
+    }
+
+    fn handle_start_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_reviewing {
+            return;
+        }
+        let Some(pr) = self
+            .selected_pr
+            .clone()
+            .or_else(|| self.active_session.as_ref().map(|s| s.pr.clone()))
+        else {
             self.checkout_error = Some("Please select a Pull Request first.".to_string());
             cx.notify();
             return;
@@ -892,226 +1030,6 @@ impl PrReviewerView {
             return;
         };
 
-        let settings = self.app_state.read(cx).settings.clone();
-        let target_branch = if pr.target_branch.trim().is_empty() {
-            "main".to_string()
-        } else {
-            pr.target_branch.trim().to_string()
-        };
-        let expected_repo = if pr.repository_name.trim().is_empty() {
-            None
-        } else {
-            Some(pr.repository_name.clone())
-        };
-
-        self.is_loading_checkout = true;
-        self.loading_status = Some("Running repository checks and checking out PR...".to_string());
-        self.checkout_error = None;
-        self.status_notice = None;
-        self.checkout_gen = self.checkout_gen.wrapping_add(1);
-        let co_gen = self.checkout_gen;
-        self.app_state.update(cx, |state, cx| {
-            state.set_task_status(
-                ActiveView::PrReviewer,
-                Some(format!("Fetching & checking out PR #{pr_number}...")),
-            );
-            cx.notify();
-        });
-        cx.notify();
-
-        let pr_service = Arc::clone(&self.pr_service);
-        let pr_service_for_stale = Arc::clone(&self.pr_service);
-        let git = Arc::clone(&self.git_service);
-        let view = cx.entity();
-        let app_state = self.app_state.clone();
-
-        window
-            .spawn(cx, async move |cx| {
-                let res = spawn_tokio(async move {
-                    let verified = verify_repo_path(&git, &repo_path).await;
-                    let code_provider = build_code_review_provider(&settings).ok();
-                    let checkout = pr_service
-                        .checkout_pr(
-                            &verified.path,
-                            pr_number,
-                            &target_branch,
-                            expected_repo.as_deref(),
-                            code_provider.as_deref(),
-                            &settings,
-                        )
-                        .await?;
-                    Ok::<_, CheckoutError>((verified, checkout))
-                })
-                .await;
-
-                let _ = cx.update(|window, cx| {
-                    let mut dirty_message: Option<String> = None;
-
-                    view.update(cx, |this, cx| {
-                        if this.checkout_gen != co_gen {
-                            if let Ok(Ok((verified, _))) = res {
-                                let stale_service = Arc::clone(&pr_service_for_stale);
-                                runtime().spawn(async move {
-                                    let _ = stale_service.cleanup_checkout(&verified.path).await;
-                                });
-                            }
-                            return;
-                        }
-                        this.is_loading_checkout = false;
-                        this.loading_status = None;
-                        app_state.update(cx, |state, cx| {
-                            state.set_task_status(ActiveView::PrReviewer, None);
-                            cx.notify();
-                        });
-
-                        match res {
-                            Ok(Ok((verified, checkout))) => {
-                                let canonical_str = verified.path.to_string_lossy().to_string();
-                                if verified.was_modified {
-                                    this.repo_path_input.update(cx, |input, cx| {
-                                        input.set_value(canonical_str, window, cx);
-                                    });
-                                    this.repo_path_modified = true;
-                                }
-                                if !pr.repository_name.trim().is_empty() {
-                                    app_state.update(cx, |state, cx| {
-                                        state
-                                            .settings
-                                            .repo_paths
-                                            .insert(pr.repository_name.clone(), verified.path.clone());
-                                        let _ = state.save_settings();
-                                        cx.notify();
-                                    });
-                                }
-                                this.checked_out = Some(CheckedOutState {
-                                    pr: pr.clone(),
-                                    repo_path: verified.path,
-                                    commit_sha: checkout.commit_sha,
-                                    effective_repo_path: checkout.effective_repo_path,
-                                    diff_files: checkout.diff_files,
-                                    using_worktree: checkout.using_worktree,
-                                    checkout_cleaned_up: false,
-                                });
-                                this.is_header_collapsed = true;
-                                this.checkout_error = None;
-                                this.review_error = None;
-                                this.post_error = None;
-                            }
-                            Ok(Err(CheckoutError::DirtyRepo(msg))) => {
-                                dirty_message = Some(msg.clone());
-                                this.checkout_error = Some(msg);
-                            }
-                            Ok(Err(CheckoutError::Other(msg))) => {
-                                this.checkout_error = Some(msg);
-                            }
-                            Err(err) => {
-                                this.checkout_error = Some(err.to_string());
-                            }
-                        }
-                        cx.notify();
-                    });
-
-                    if let Some(msg) = dirty_message {
-                        open_dirty_repo_dialog(msg, window, cx);
-                    }
-                });
-            })
-            .detach();
-    }
-
-    fn handle_cleanup_checkout(&mut self, cx: &mut Context<Self>) {
-        if self.is_reviewing {
-            return;
-        }
-        let Some(checked) = self.checked_out.clone() else {
-            return;
-        };
-        let pr_service = Arc::clone(&self.pr_service);
-        let view = cx.entity();
-        let co_gen = self.checkout_gen;
-
-        cx.spawn(async move |_, cx| {
-            let res =
-                spawn_tokio(async move { pr_service.cleanup_checkout(&checked.repo_path).await })
-                    .await;
-
-            let _ = view.update(cx, |this, cx| {
-                if this.checkout_gen != co_gen {
-                    return;
-                }
-                match res {
-                    Ok(Ok(())) => {
-                        this.checked_out = None;
-                        this.is_header_collapsed = false;
-                        this.checkout_error = None;
-                        this.status_notice = Some(if checked.using_worktree {
-                            "Removed temporary PR worktree.".to_string()
-                        } else {
-                            "Restored repository to previous branch/ref.".to_string()
-                        });
-                    }
-                    Ok(Err(err)) => {
-                        this.checkout_error = Some(err.to_string());
-                    }
-                    Err(err) => {
-                        this.checkout_error = Some(err.to_string());
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn general_status_text(&self) -> String {
-        let running: Vec<&PhaseProgress> = self
-            .phase_progress
-            .iter()
-            .filter(|p| p.status == PhaseRunStatus::Running)
-            .collect();
-        if running.len() == 1 {
-            let p = running[0];
-            if let Some(ref st) = p.status_text {
-                return format!("{}: {st}", p.title);
-            }
-            return format!("Running {}...", p.title);
-        }
-        if running.len() > 1 {
-            return format!("Running {} review phases in parallel...", running.len());
-        }
-        if self.is_reviewing {
-            return "Preparing review phases...".to_string();
-        }
-        "Idle".to_string()
-    }
-
-    fn pr_identifier_for_post(&self, checked: &CheckedOutState, cx: &App) -> String {
-        checked
-            .pr
-            .url
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                if self.active_tab == PrSelectorTab::Manual {
-                    let manual = self.manual_pr_input.read(cx).value().trim().to_string();
-                    if !manual.is_empty() {
-                        return manual;
-                    }
-                }
-                checked.pr.id.clone()
-            })
-    }
-
-    fn handle_start_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.is_reviewing {
-            return;
-        }
-        let Some(checked) = self.checked_out.clone() else {
-            return;
-        };
-
         let enabled_phases: Vec<ReviewPhase> = self
             .phases
             .iter()
@@ -1119,13 +1037,13 @@ impl PrReviewerView {
             .map(|p| p.phase.clone())
             .collect();
         if enabled_phases.is_empty() {
-            self.review_error =
-                Some("Select at least one review phase in PR settings to start review.".to_string());
+            self.checkout_error =
+                Some("Select at least one review phase to start the review.".to_string());
             cx.notify();
             return;
         }
         if let Some(bad) = enabled_phases.iter().find(|p| p.template_error.is_some()) {
-            self.review_error = bad.template_error.clone();
+            self.checkout_error = bad.template_error.clone();
             cx.notify();
             return;
         }
@@ -1135,9 +1053,31 @@ impl PrReviewerView {
             (state.settings.clone(), state.copilot_models.clone())
         };
         let custom_instructions = self.custom_instructions_input.read(cx).value().to_string();
-        let pr_identifier = self.pr_identifier_for_post(&checked, cx);
         let run_critic = self.critic_enabled;
+        let target_branch = if pr.target_branch.trim().is_empty() {
+            "main".to_string()
+        } else {
+            pr.target_branch.trim().to_string()
+        };
+        let expected_repo = (!pr.repository_name.trim().is_empty()).then(|| pr.repository_name.clone());
 
+        let new_session = ActiveReviewSession {
+            pr: pr.clone(),
+            repo_path: repo_path.clone(),
+            checkout: None,
+            checkout_cleaned_up: false,
+            model: self.selected_model.clone(),
+            parallelism: self.max_parallelism,
+            persona: self.selected_persona.clone(),
+            custom_instructions: custom_instructions.clone(),
+        };
+        let pr_identifier = self.pr_identifier_for_post(&new_session, cx);
+
+        self.stage = ReviewerStage::Workspace;
+        self.active_session = Some(new_session);
+        self.context_expanded = false;
+        self.show_diff_files = false;
+        self.is_preparing_checkout = true;
         self.is_reviewing = true;
         self.is_critiquing = false;
         self.has_reviewed = false;
@@ -1152,25 +1092,32 @@ impl PrReviewerView {
         self.collapsed_comments.clear();
         self.expanded_rejected_comments.clear();
         self.posting_comment_ids.clear();
+        self.checkout_error = None;
+        self.status_notice = None;
         self.review_error = None;
         self.post_error = None;
         self.last_usage = None;
         self.last_status_time = None;
-        if let Some(ref mut co) = self.checked_out {
-            co.checkout_cleaned_up = false;
-        }
-        let mut initial_progress: Vec<PhaseProgress> = enabled_phases
-            .iter()
-            .map(|phase| PhaseProgress {
-                id: phase.id.clone(),
-                title: phase.title.clone(),
-                group: phase.group.clone(),
-                status: PhaseRunStatus::Pending,
-                status_text: None,
-                reason: None,
-                comment_count: 0,
-            })
-            .collect();
+        self.last_db_session_id = None;
+
+        let mut initial_progress = vec![PhaseProgress {
+            id: CHECKOUT_PHASE_ID.to_string(),
+            title: "Prepare Repository".to_string(),
+            group: String::new(),
+            status: PhaseRunStatus::Running,
+            status_text: Some("Verifying repository path...".to_string()),
+            reason: None,
+            comment_count: 0,
+        }];
+        initial_progress.extend(enabled_phases.iter().map(|phase| PhaseProgress {
+            id: phase.id.clone(),
+            title: phase.title.clone(),
+            group: phase.group.clone(),
+            status: PhaseRunStatus::Pending,
+            status_text: None,
+            reason: None,
+            comment_count: 0,
+        }));
         if run_critic {
             initial_progress.push(PhaseProgress {
                 id: CRITIC_PHASE_ID.to_string(),
@@ -1192,12 +1139,12 @@ impl PrReviewerView {
         let run_gen = self.review_gen;
         let (pipeline_tx, mut pipeline_rx) = mpsc::unbounded_channel::<ReviewPipelineEvent>();
 
-        let pr_id_for_status = checked.pr.id.clone();
-        self.last_db_session_id = None;
+        let pr_id_for_status = pr.id.clone();
+        let pr_repo_name = pr.repository_name.clone();
         self.app_state.update(cx, |state, cx| {
             state.set_task_status(
                 ActiveView::PrReviewer,
-                Some(format!("Reviewing PR #{pr_id_for_status}...")),
+                Some(format!("Preparing repository for PR #{pr_id_for_status}...")),
             );
             state.set_task_progress(ActiveView::PrReviewer, Some(0.05));
             cx.notify();
@@ -1205,64 +1152,64 @@ impl PrReviewerView {
         cx.notify();
 
         let pr_service = Arc::clone(&self.pr_service);
-        let req = PrReviewRequest {
-            repo_path: checked.repo_path.clone(),
-            pr: checked.pr.clone(),
-            enabled_phase_ids: enabled_phases.into_iter().map(|p| p.id).collect(),
-            model_override: self.selected_model.clone(),
-            custom_instructions,
-            max_parallelism: Some(self.max_parallelism),
-            persona_name: self.selected_persona.clone(),
-            settings: settings.clone(),
-            available_models: available_models.clone(),
-            skip_cleanup: run_critic,
-        };
+        let pr_service_for_stale = Arc::clone(&self.pr_service);
+        let git = Arc::clone(&self.git_service);
+        let enabled_phase_ids: Vec<String> = enabled_phases.into_iter().map(|p| p.id).collect();
+        let model_override = self.selected_model.clone();
+        let max_parallelism = self.max_parallelism;
+        let persona_name = self.selected_persona.clone();
 
         runtime().spawn(async move {
-            if !pr_service.has_active_checkout(&req.repo_path).await {
-                match req.pr.id.trim().parse::<u64>() {
-                    Ok(pr_num) => {
-                        let target_branch = if req.pr.target_branch.trim().is_empty() {
-                            "main"
-                        } else {
-                            req.pr.target_branch.trim()
-                        };
-                        let expected_repo = (!req.pr.repository_name.trim().is_empty())
-                            .then_some(req.pr.repository_name.as_str());
-                        let code_provider = build_code_review_provider(&settings).ok();
-                        if let Err(err) = pr_service
-                            .checkout_pr(
-                                &req.repo_path,
-                                pr_num,
-                                target_branch,
-                                expected_repo,
-                                code_provider.as_deref(),
-                                &settings,
-                            )
-                            .await
-                        {
-                            let _ = pipeline_tx.send(ReviewPipelineEvent::Review(
-                                PrReviewStreamEvent::Error {
-                                    message: format!(
-                                        "Failed to re-checkout PR before review: {err}"
-                                    ),
-                                    cleaned_up: false,
-                                },
-                            ));
-                            return;
-                        }
-                    }
-                    Err(_) => {
-                        let _ = pipeline_tx.send(ReviewPipelineEvent::Review(
-                            PrReviewStreamEvent::Error {
-                                message: format!("Invalid PR ID: '{}'", req.pr.id),
-                                cleaned_up: false,
-                            },
-                        ));
-                        return;
-                    }
-                }
+            if *cancel_rx.borrow() {
+                let _ = pipeline_tx.send(ReviewPipelineEvent::CheckoutFailed(
+                    CheckoutError::Cancelled,
+                ));
+                return;
             }
+
+            let verified = verify_repo_path(&git, &repo_path).await;
+            let code_provider = build_code_review_provider(&settings).ok();
+            let status_tx = pipeline_tx.clone();
+            let checkout = match pr_service
+                .checkout_pr_with_progress(
+                    &verified.path,
+                    pr_number,
+                    &target_branch,
+                    expected_repo.as_deref(),
+                    code_provider.as_deref(),
+                    &settings,
+                    Some(cancel_rx.clone()),
+                    move |status| {
+                        let _ = status_tx.send(ReviewPipelineEvent::CheckoutStatus(status));
+                    },
+                )
+                .await
+            {
+                Ok(co) => co,
+                Err(err) => {
+                    let _ = pipeline_tx.send(ReviewPipelineEvent::CheckoutFailed(err));
+                    return;
+                }
+            };
+
+            let _ = pipeline_tx.send(ReviewPipelineEvent::CheckoutCompleted {
+                verified: verified.clone(),
+                checkout: checkout.clone(),
+            });
+
+            let req = PrReviewRequest {
+                repo_path: verified.path,
+                pr,
+                enabled_phase_ids,
+                model_override,
+                custom_instructions,
+                max_parallelism: Some(max_parallelism),
+                persona_name,
+                settings,
+                available_models,
+                skip_cleanup: run_critic,
+                prefetched_diff_files: Some(checkout.diff_files),
+            };
 
             let repo_for_critic = req.repo_path.clone();
             let pr_for_critic = req.pr.clone();
@@ -1323,13 +1270,123 @@ impl PrReviewerView {
             .spawn(cx, async move |cx| {
                 while let Some(pipeline_event) = pipeline_rx.recv().await {
                     let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
+                    let mut dirty_message: Option<String> = None;
                     let _ = cx.update(|window, cx| {
                         view.update(cx, |this, cx| {
                             if this.review_gen != run_gen {
+                                if let ReviewPipelineEvent::CheckoutCompleted { verified, .. } =
+                                    pipeline_event
+                                {
+                                    let stale_service = Arc::clone(&pr_service_for_stale);
+                                    runtime().spawn(async move {
+                                        let _ = stale_service.cleanup_checkout(&verified.path).await;
+                                    });
+                                }
                                 return;
                             }
                             this.last_status_time = Some(timestamp);
                             match pipeline_event {
+                                ReviewPipelineEvent::CheckoutStatus(status) => {
+                                    if let Some(p) = this
+                                        .phase_progress
+                                        .iter_mut()
+                                        .find(|p| p.id == CHECKOUT_PHASE_ID)
+                                    {
+                                        p.status_text = Some(status.clone());
+                                    }
+                                    app_state.update(cx, |state, cx| {
+                                        state.set_task_status(
+                                            ActiveView::PrReviewer,
+                                            Some(status),
+                                        );
+                                        cx.notify();
+                                    });
+                                }
+                                ReviewPipelineEvent::CheckoutCompleted { verified, checkout } => {
+                                    let canonical_str = verified.path.to_string_lossy().to_string();
+                                    if verified.was_modified {
+                                        this.repo_path_input.update(cx, |input, cx| {
+                                            input.set_value(canonical_str, window, cx);
+                                        });
+                                        this.repo_path_modified = true;
+                                    }
+                                    if !pr_repo_name.trim().is_empty() {
+                                        app_state.update(cx, |state, cx| {
+                                            state.settings.repo_paths.insert(
+                                                pr_repo_name.clone(),
+                                                verified.path.clone(),
+                                            );
+                                            let _ = state.save_settings();
+                                            cx.notify();
+                                        });
+                                    }
+                                    let short_sha: String =
+                                        checkout.commit_sha.chars().take(8).collect();
+                                    let file_count = checkout.diff_files.len();
+                                    if let Some(ref mut session) = this.active_session {
+                                        session.repo_path = verified.path;
+                                        session.checkout = Some(SessionCheckoutInfo {
+                                            commit_sha: checkout.commit_sha,
+                                            effective_repo_path: checkout.effective_repo_path,
+                                            diff_files: checkout.diff_files,
+                                            using_worktree: checkout.using_worktree,
+                                        });
+                                    }
+                                    this.is_preparing_checkout = false;
+                                    if let Some(p) = this
+                                        .phase_progress
+                                        .iter_mut()
+                                        .find(|p| p.id == CHECKOUT_PHASE_ID)
+                                    {
+                                        p.status = PhaseRunStatus::Completed;
+                                        p.status_text = Some(format!(
+                                            "{short_sha} • {file_count} changed file{}",
+                                            if file_count == 1 { "" } else { "s" }
+                                        ));
+                                    }
+                                    let frac =
+                                        compute_phase_progress_fraction(&this.phase_progress);
+                                    app_state.update(cx, |state, cx| {
+                                        state.set_task_status(
+                                            ActiveView::PrReviewer,
+                                            Some(format!("Reviewing PR #{pr_id_for_status}...")),
+                                        );
+                                        state.set_task_progress(
+                                            ActiveView::PrReviewer,
+                                            Some(frac),
+                                        );
+                                        cx.notify();
+                                    });
+                                }
+                                ReviewPipelineEvent::CheckoutFailed(err) => {
+                                    this.is_preparing_checkout = false;
+                                    this.is_reviewing = false;
+                                    this.is_critiquing = false;
+                                    this.review_cancel_tx = None;
+                                    this.active_session = None;
+                                    this.phase_progress.clear();
+                                    this.stage = ReviewerStage::Setup;
+                                    app_state.update(cx, |state, cx| {
+                                        state.set_task_status(ActiveView::PrReviewer, None);
+                                        state.set_task_progress(ActiveView::PrReviewer, None);
+                                        cx.notify();
+                                    });
+                                    match err {
+                                        CheckoutError::DirtyRepo(msg) => {
+                                            dirty_message = Some(msg.clone());
+                                            this.checkout_error = Some(msg);
+                                        }
+                                        CheckoutError::Other(msg) => {
+                                            this.checkout_error = Some(msg);
+                                        }
+                                        CheckoutError::Cancelled => {
+                                            this.status_notice = Some(
+                                                "Review cancelled during repository checkout."
+                                                    .to_string(),
+                                            );
+                                        }
+                                    }
+                                }
                                 ReviewPipelineEvent::Review(event) => match event {
                                     PrReviewStreamEvent::PhaseSkipped {
                                         phase_id,
@@ -1411,11 +1468,12 @@ impl PrReviewerView {
                                             this.comments = comments;
                                         }
                                         if cleaned_up {
-                                            if let Some(ref mut co) = this.checked_out {
-                                                co.checkout_cleaned_up = true;
+                                            if let Some(ref mut session) = this.active_session {
+                                                session.checkout_cleaned_up = true;
                                             }
                                         }
                                         if !run_critic {
+                                            this.is_preparing_checkout = false;
                                             this.is_reviewing = false;
                                             this.has_reviewed = true;
                                             this.review_cancel_tx = None;
@@ -1448,6 +1506,7 @@ impl PrReviewerView {
                                         }
                                     }
                                     PrReviewStreamEvent::Cancelled { cleaned_up } => {
+                                        this.is_preparing_checkout = false;
                                         this.is_reviewing = false;
                                         this.is_critiquing = false;
                                         this.review_cancel_tx = None;
@@ -1462,8 +1521,8 @@ impl PrReviewerView {
                                             }
                                         }
                                         if cleaned_up {
-                                            if let Some(ref mut co) = this.checked_out {
-                                                co.checkout_cleaned_up = true;
+                                            if let Some(ref mut session) = this.active_session {
+                                                session.checkout_cleaned_up = true;
                                             }
                                         }
                                         app_state.update(cx, |state, cx| {
@@ -1475,6 +1534,7 @@ impl PrReviewerView {
                                         message,
                                         cleaned_up,
                                     } => {
+                                        this.is_preparing_checkout = false;
                                         this.is_reviewing = false;
                                         this.is_critiquing = false;
                                         this.review_cancel_tx = None;
@@ -1490,8 +1550,8 @@ impl PrReviewerView {
                                             }
                                         }
                                         if cleaned_up {
-                                            if let Some(ref mut co) = this.checked_out {
-                                                co.checkout_cleaned_up = true;
+                                            if let Some(ref mut session) = this.active_session {
+                                                session.checkout_cleaned_up = true;
                                             }
                                         }
                                         app_state.update(cx, |state, cx| {
@@ -1564,6 +1624,7 @@ impl PrReviewerView {
                                         this.has_critiqued = true;
                                         this.comment_view_mode = CommentViewMode::Critiqued;
                                         this.is_critiquing = false;
+                                        this.is_preparing_checkout = false;
                                         this.is_reviewing = false;
                                         this.has_reviewed = true;
                                         this.review_cancel_tx = None;
@@ -1579,8 +1640,8 @@ impl PrReviewerView {
                                                 Some("Critic phase complete.".to_string());
                                         }
                                         if cleaned_up {
-                                            if let Some(ref mut co) = this.checked_out {
-                                                co.checkout_cleaned_up = true;
+                                            if let Some(ref mut session) = this.active_session {
+                                                session.checkout_cleaned_up = true;
                                             }
                                         }
                                         let ai_output = format!("{active_count} comment(s)");
@@ -1613,6 +1674,7 @@ impl PrReviewerView {
                                     }
                                     PrCriticStreamEvent::Cancelled { cleaned_up } => {
                                         this.is_critiquing = false;
+                                        this.is_preparing_checkout = false;
                                         this.is_reviewing = false;
                                         this.review_cancel_tx = None;
                                         if let Some(p) = this
@@ -1624,8 +1686,8 @@ impl PrReviewerView {
                                             p.reason = Some("Critic cancelled".to_string());
                                         }
                                         if cleaned_up {
-                                            if let Some(ref mut co) = this.checked_out {
-                                                co.checkout_cleaned_up = true;
+                                            if let Some(ref mut session) = this.active_session {
+                                                session.checkout_cleaned_up = true;
                                             }
                                         }
                                         app_state.update(cx, |state, cx| {
@@ -1638,6 +1700,7 @@ impl PrReviewerView {
                                         cleaned_up,
                                     } => {
                                         this.is_critiquing = false;
+                                        this.is_preparing_checkout = false;
                                         this.is_reviewing = false;
                                         this.has_reviewed = true;
                                         this.review_cancel_tx = None;
@@ -1653,8 +1716,8 @@ impl PrReviewerView {
                                             p.reason = Some(format!("Critic failed: {message}"));
                                         }
                                         if cleaned_up {
-                                            if let Some(ref mut co) = this.checked_out {
-                                                co.checkout_cleaned_up = true;
+                                            if let Some(ref mut session) = this.active_session {
+                                                session.checkout_cleaned_up = true;
                                             }
                                         }
                                         let raw_count = this.comments.len();
@@ -1683,6 +1746,10 @@ impl PrReviewerView {
                             }
                             cx.notify();
                         });
+
+                        if let Some(msg) = dirty_message {
+                            open_dirty_repo_dialog(msg, window, cx);
+                        }
                     });
                 }
 
@@ -1691,7 +1758,8 @@ impl PrReviewerView {
                         if this.review_gen != run_gen {
                             return;
                         }
-                        if this.is_reviewing || this.is_critiquing {
+                        if this.is_reviewing || this.is_critiquing || this.is_preparing_checkout {
+                            this.is_preparing_checkout = false;
                             this.is_reviewing = false;
                             this.is_critiquing = false;
                             this.review_cancel_tx = None;
@@ -1717,12 +1785,12 @@ impl PrReviewerView {
     fn reset_state(&self, cx: &App) -> ResetState {
         if self.is_reviewing
             || self.is_critiquing
-            || self.is_loading_checkout
+            || self.is_preparing_checkout
             || !self.posting_comment_ids.is_empty()
         {
             return ResetState::NeedsConfirmation { is_running: true };
         }
-        if self.checked_out.is_some()
+        if self.active_session.is_some()
             || self.has_reviewed
             || self.has_critiqued
             || !self.comments.is_empty()
@@ -1782,9 +1850,9 @@ impl PrReviewerView {
                 let detail = if is_running {
                     "This will cancel the active PR operation, clean up any temporary checkout or worktree, and clear all review comments and inputs."
                 } else if self
-                    .checked_out
+                    .active_session
                     .as_ref()
-                    .is_some_and(|c| !c.checkout_cleaned_up)
+                    .is_some_and(|s| s.checkout.is_some() && !s.checkout_cleaned_up)
                 {
                     "This will clean up the active PR checkout/worktree and clear all review comments, selections, and tool overrides."
                 } else {
@@ -1808,7 +1876,6 @@ impl PrReviewerView {
 
     fn reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.pr_detail_gen = self.pr_detail_gen.wrapping_add(1);
-        self.checkout_gen = self.checkout_gen.wrapping_add(1);
         self.review_gen = self.review_gen.wrapping_add(1);
         self.post_gen = self.post_gen.wrapping_add(1);
 
@@ -1819,12 +1886,12 @@ impl PrReviewerView {
             false
         };
 
-        if let Some(checked) = self.checked_out.take()
-            && !checked.checkout_cleaned_up
+        if let Some(session) = self.active_session.take()
+            && !session.checkout_cleaned_up
             && !was_reviewing
         {
             let pr_service = Arc::clone(&self.pr_service);
-            let repo_path = checked.repo_path;
+            let repo_path = session.repo_path;
             runtime().spawn(async move {
                 if let Err(err) = pr_service.cleanup_checkout(&repo_path).await {
                     eprintln!("Warning: failed to clean up PR checkout on reset: {err}");
@@ -1853,16 +1920,16 @@ impl PrReviewerView {
         self.custom_instructions_input
             .update(cx, |input, cx| input.set_value("", window, cx));
 
+        self.stage = ReviewerStage::Setup;
         self.selected_pr = None;
         self.loading_pr_details = false;
-        self.is_loading_checkout = false;
-        self.loading_status = None;
+        self.is_preparing_checkout = false;
+        self.context_expanded = false;
         self.checkout_error = None;
         self.status_notice = None;
         self.review_error = None;
         self.post_error = None;
         self.pr_list_error = None;
-        self.is_header_collapsed = false;
         self.repo_path_modified = false;
         self.show_diff_files = false;
 
@@ -1934,7 +2001,7 @@ impl PrReviewerView {
         edited_text: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let Some(checked) = self.checked_out.as_ref() else {
+        let Some(session) = self.active_session.as_ref() else {
             return;
         };
         if self.posting_comment_ids.contains(&comment.id) {
@@ -1961,8 +2028,8 @@ impl PrReviewerView {
             thread_id: comment.thread_id,
         };
 
-        let pr_identifier = self.pr_identifier_for_post(checked, cx);
-        let repo_path = checked.repo_path.clone();
+        let pr_identifier = self.pr_identifier_for_post(session, cx);
+        let repo_path = session.repo_path.clone();
         let settings = self.app_state.read(cx).settings.clone();
         let pr_service = Arc::clone(&self.pr_service);
         let comment_id = comment.id.clone();
@@ -2483,11 +2550,15 @@ impl PrReviewerView {
             })
     }
 
-    fn render_details_and_checkout_pane(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_setup_config_pane(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
-        let (models, models_loading) = {
+        let (models, models_loading, worktree_enabled) = {
             let state = self.app_state.read(cx);
-            (state.copilot_models.clone(), state.models_loading)
+            (
+                state.copilot_models.clone(),
+                state.models_loading,
+                state.settings.git_worktree_enabled,
+            )
         };
         let green = hsla(152.0 / 360.0, 0.76, 0.40, 1.0);
         let amber = hsla(38.0 / 360.0, 0.92, 0.50, 1.0);
@@ -2524,502 +2595,676 @@ impl PrReviewerView {
                         .text_center()
                         .text_sm()
                         .text_color(theme.muted_foreground)
-                        .child("Choose a Pull Request on the left or enter a PR URL/ID manually to inspect its local repository, review phases, and diff."),
+                        .child("Choose a Pull Request on the left or enter a PR URL/ID manually to configure the repository, review settings, and phases."),
                 )
                 .into_any_element();
         };
 
         let grouped_phases = group_phases_for_render(&self.phases, &models, models_loading);
         let repo_non_empty = !self.repo_path_input.read(cx).value().trim().is_empty();
+        let enabled_phases = self.phases.iter().filter(|p| p.enabled).count();
+        let has_template_error = self
+            .phases
+            .iter()
+            .any(|p| p.enabled && p.phase.template_error.is_some());
+        let can_start = !self.is_reviewing
+            && !self.loading_pr_details
+            && repo_non_empty
+            && enabled_phases > 0
+            && !has_template_error;
+        let can_return_to_results = self
+            .active_session
+            .as_ref()
+            .is_some_and(|s| s.pr.id == pr.id);
+        let setup_error = self
+            .checkout_error
+            .clone()
+            .or_else(|| self.review_error.clone());
         let phases_dir_label = pr_reviewer_root_dir().join("phases").display().to_string();
+        let max_limit = max_parallelism_limit(self.cpu_count);
 
         v_flex()
             .size_full()
-            .overflow_y_scrollbar()
             .bg(theme.background)
-            .p_6()
-            .gap_4()
-            .when_some(self.checkout_error.clone(), |col, err| {
-                col.child(
-                    h_flex()
-                        .p_3()
-                        .gap_2()
-                        .items_start()
-                        .rounded(theme.radius)
-                        .border_1()
-                        .border_color(red.opacity(0.4))
-                        .bg(red.opacity(0.08))
-                        .text_xs()
-                        .text_color(red)
-                        .child(Icon::new(LucideIcon::CircleAlert).small())
-                        .child(div().flex_1().child(err)),
-                )
-            })
-            .when_some(self.status_notice.clone(), |col, note| {
-                col.child(
-                    h_flex()
-                        .p_3()
-                        .gap_2()
-                        .items_start()
-                        .rounded(theme.radius)
-                        .border_1()
-                        .border_color(green.opacity(0.4))
-                        .bg(green.opacity(0.08))
-                        .text_xs()
-                        .text_color(green)
-                        .child(Icon::new(LucideIcon::Check).small())
-                        .child(div().flex_1().child(note)),
-                )
-            })
             .child(
                 v_flex()
-                    .p_4()
-                    .gap_2()
-                    .rounded(theme.radius_lg)
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.sidebar)
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scrollbar()
+                    .p_6()
+                    .gap_4()
+                    .when_some(setup_error, |col, err| {
+                        col.child(
+                            h_flex()
+                                .p_3()
+                                .gap_2()
+                                .items_start()
+                                .rounded(theme.radius)
+                                .border_1()
+                                .border_color(red.opacity(0.4))
+                                .bg(red.opacity(0.08))
+                                .text_xs()
+                                .text_color(red)
+                                .child(Icon::new(LucideIcon::CircleAlert).small())
+                                .child(div().flex_1().child(err)),
+                        )
+                    })
+                    .when_some(self.status_notice.clone(), |col, note| {
+                        col.child(
+                            h_flex()
+                                .p_3()
+                                .gap_2()
+                                .items_start()
+                                .rounded(theme.radius)
+                                .border_1()
+                                .border_color(green.opacity(0.4))
+                                .bg(green.opacity(0.08))
+                                .text_xs()
+                                .text_color(green)
+                                .child(Icon::new(LucideIcon::Check).small())
+                                .child(div().flex_1().child(note)),
+                        )
+                    })
                     .child(
-                        h_flex()
-                            .items_center()
-                            .justify_between()
+                        v_flex()
+                            .p_4()
                             .gap_2()
+                            .rounded(theme.radius_lg)
+                            .border_1()
+                            .border_color(theme.border)
+                            .bg(theme.sidebar)
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_2()
+                                    .child(
+                                        h_flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .px_2()
+                                                    .py_0p5()
+                                                    .rounded(theme.radius)
+                                                    .bg(theme.primary.opacity(0.14))
+                                                    .text_xs()
+                                                    .font_weight(FontWeight::BOLD)
+                                                    .text_color(theme.primary)
+                                                    .child(format!("PR #{}", pr.id)),
+                                            )
+                                            .when(!pr.repository_name.is_empty(), |row| {
+                                                row.child(
+                                                    div()
+                                                        .px_2()
+                                                        .py_0p5()
+                                                        .rounded(theme.radius)
+                                                        .bg(theme.secondary)
+                                                        .border_1()
+                                                        .border_color(theme.border)
+                                                        .text_xs()
+                                                        .child(format!("Repo: {}", pr.repository_name)),
+                                                )
+                                            })
+                                            .when(self.loading_pr_details, |row| {
+                                                row.child(Spinner::new().small().color(theme.primary))
+                                            }),
+                                    )
+                                    .when_some(pr.url.clone(), |row, url| {
+                                        row.child(
+                                            Button::new("pr-open-web-setup")
+                                                .ghost()
+                                                .xsmall()
+                                                .icon(Icon::new(LucideIcon::ExternalLink).xsmall())
+                                                .label("Open")
+                                                .on_click(move |_, _, cx| {
+                                                    cx.open_url(&url);
+                                                }),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_base()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme.foreground)
+                                    .child(pr.title.clone()),
+                            )
+                            .child(
+                                h_flex()
+                                    .flex_wrap()
+                                    .items_center()
+                                    .gap_3()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(format!("Author: {}", pr.author))
+                                    .when(
+                                        !pr.source_branch.is_empty() || !pr.target_branch.is_empty(),
+                                        |row| {
+                                            row.child(
+                                                h_flex()
+                                                    .items_center()
+                                                    .gap_1p5()
+                                                    .child(
+                                                        div()
+                                                            .px_1p5()
+                                                            .py_0p5()
+                                                            .rounded(theme.radius)
+                                                            .bg(theme.background)
+                                                            .border_1()
+                                                            .border_color(theme.border)
+                                                            .font_family(theme.mono_font_family.clone())
+                                                            .child(pr.source_branch.clone()),
+                                                    )
+                                                    .child(Icon::new(LucideIcon::ArrowRight).xsmall())
+                                                    .child(
+                                                        div()
+                                                            .px_1p5()
+                                                            .py_0p5()
+                                                            .rounded(theme.radius)
+                                                            .bg(theme.background)
+                                                            .border_1()
+                                                            .border_color(theme.border)
+                                                            .font_family(theme.mono_font_family.clone())
+                                                            .child(pr.target_branch.clone()),
+                                                    ),
+                                            )
+                                        },
+                                    ),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1p5()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme.foreground)
+                                    .child(format!(
+                                        "Locally Cloned Repo Path for \"{}\"",
+                                        if pr.repository_name.is_empty() {
+                                            "Repository"
+                                        } else {
+                                            pr.repository_name.as_str()
+                                        }
+                                    )),
+                            )
                             .child(
                                 h_flex()
                                     .items_center()
                                     .gap_2()
                                     .child(
                                         div()
-                                            .px_2()
-                                            .py_0p5()
-                                            .rounded(theme.radius)
-                                            .bg(theme.primary.opacity(0.14))
-                                            .text_xs()
-                                            .font_weight(FontWeight::BOLD)
-                                            .text_color(theme.primary)
-                                            .child(format!("PR #{}", pr.id)),
+                                            .flex_1()
+                                            .min_w_0()
+                                            .child(
+                                                Input::new(&self.repo_path_input)
+                                                    .disabled(self.is_reviewing),
+                                            ),
                                     )
-                                    .when(!pr.repository_name.is_empty(), |row| {
-                                        row.child(
-                                            div()
-                                                .px_2()
-                                                .py_0p5()
-                                                .rounded(theme.radius)
-                                                .bg(theme.secondary)
-                                                .border_1()
-                                                .border_color(theme.border)
-                                                .text_xs()
-                                                .child(format!("Repo: {}", pr.repository_name)),
-                                        )
-                                    })
-                                    .when(self.loading_pr_details, |row| {
-                                        row.child(Spinner::new().small().color(theme.primary))
-                                    }),
+                                    .child(
+                                        Button::new("pr-browse-repo")
+                                            .small()
+                                            .disabled(self.is_reviewing)
+                                            .icon(Icon::new(LucideIcon::FolderOpen).small())
+                                            .label("Browse")
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.browse_repo_dir(window, cx);
+                                            })),
+                                    ),
                             )
-                            .when_some(pr.url.clone(), |row, url| {
-                                row.child(
-                                    Button::new("pr-open-web-setup")
-                                        .ghost()
-                                        .xsmall()
-                                        .icon(Icon::new(LucideIcon::ExternalLink).xsmall())
-                                        .label("Open")
-                                        .on_click(move |_, _, cx| {
-                                            cx.open_url(&url);
-                                        }),
-                                )
-                            }),
-                    )
-                    .child(
-                        div()
-                            .text_base()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.foreground)
-                            .child(pr.title.clone()),
-                    )
-                    .child(
-                        h_flex()
-                            .flex_wrap()
-                            .items_center()
-                            .gap_3()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(format!("Author: {}", pr.author))
-                            .when(!pr.source_branch.is_empty() || !pr.target_branch.is_empty(), |row| {
-                                row.child(
+                            .when(self.repo_path_modified, |col| {
+                                col.child(
                                     h_flex()
                                         .items_center()
                                         .gap_1p5()
-                                        .child(
-                                            div()
-                                                .px_1p5()
-                                                .py_0p5()
-                                                .rounded(theme.radius)
-                                                .bg(theme.background)
-                                                .border_1()
-                                                .border_color(theme.border)
-                                                .font_family(theme.mono_font_family.clone())
-                                                .child(pr.source_branch.clone()),
-                                        )
-                                        .child(Icon::new(LucideIcon::ArrowRight).xsmall())
-                                        .child(
-                                            div()
-                                                .px_1p5()
-                                                .py_0p5()
-                                                .rounded(theme.radius)
-                                                .bg(theme.background)
-                                                .border_1()
-                                                .border_color(theme.border)
-                                                .font_family(theme.mono_font_family.clone())
-                                                .child(pr.target_branch.clone()),
-                                        ),
+                                        .text_xs()
+                                        .text_color(amber)
+                                        .child(Icon::new(LucideIcon::TriangleAlert).xsmall())
+                                        .child("Updated to repository root"),
                                 )
-                            }),
-                    ),
-            )
-            .child(
-                v_flex()
-                    .gap_1p5()
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.foreground)
-                            .child(format!(
-                                "Locally Cloned Repo Path for \"{}\"",
-                                if pr.repository_name.is_empty() {
-                                    "Repository"
-                                } else {
-                                    pr.repository_name.as_str()
-                                }
-                            )),
-                    )
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_2()
+                            })
                             .child(
                                 div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .child(
-                                        Input::new(&self.repo_path_input)
-                                            .disabled(self.is_loading_checkout),
-                                    ),
-                            )
-                            .child(
-                                Button::new("pr-browse-repo")
-                                    .small()
-                                    .disabled(self.is_loading_checkout)
-                                    .icon(Icon::new(LucideIcon::FolderOpen).small())
-                                    .label("Browse")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.browse_repo_dir(window, cx);
-                                    })),
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(if worktree_enabled {
+                                        "PR state will be checked out into an isolated temporary Git worktree when the review starts and cleaned up automatically."
+                                    } else {
+                                        "PR state will be checked out locally when the review starts and restored automatically when finished."
+                                    }),
                             ),
                     )
-                    .when(self.repo_path_modified, |col| {
-                        col.child(
-                            h_flex()
-                                .items_center()
-                                .gap_1p5()
-                                .text_xs()
-                                .text_color(amber)
-                                .child(Icon::new(LucideIcon::TriangleAlert).xsmall())
-                                .child("Updated to repository root"),
-                        )
-                    })
                     .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(if repo_non_empty {
-                                "Select or confirm the local Git clone directory used to fetch and diff this PR.".to_string()
-                            } else {
-                                format!(
-                                    "Choose the local clone directory for repository \"{}\".",
-                                    pr.repository_name
-                                )
-                            }),
-                    ),
-            )
-            .child(
-                v_flex()
-                    .gap_2()
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .justify_between()
+                        v_flex()
+                            .p_4()
+                            .gap_3()
+                            .rounded(theme.radius_lg)
+                            .border_1()
+                            .border_color(theme.border)
+                            .bg(theme.sidebar)
                             .child(
-                                div()
+                                h_flex()
+                                    .items_center()
+                                    .gap_2()
                                     .text_xs()
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(theme.foreground)
-                                    .child("Active Review Phases"),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(format!(
-                                        "{}/{} enabled",
-                                        self.phases.iter().filter(|p| p.enabled).count(),
-                                        self.phases.len()
-                                    )),
-                            ),
-                    )
-                    .child(if self.phases.is_empty() {
-                        v_flex()
-                            .p_4()
-                            .gap_3()
-                            .rounded(theme.radius_lg)
-                            .border_1()
-                            .border_color(theme.border)
-                            .bg(theme.sidebar)
-                            .child(
-                                h_flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(Icon::new(LucideIcon::SlidersHorizontal).small())
-                                    .child("Set Up Review Phases"),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child("No review phases found. Add Markdown phase files inside ~/.stitch/pr-reviewer/phases/ and click Check Again."),
-                            )
-                            .child(
-                                h_flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .px_3()
-                                    .py_2()
-                                    .rounded(theme.radius)
-                                    .bg(theme.background)
-                                    .border_1()
-                                    .border_color(theme.border)
-                                    .font_family(theme.mono_font_family.clone())
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(Icon::new(LucideIcon::Folder).xsmall())
-                                    .child(phases_dir_label),
-                            )
-                            .child(
-                                h_flex()
-                                    .gap_2()
                                     .child(
-                                        Button::new("pr-empty-open-dir")
+                                        Icon::new(LucideIcon::SlidersHorizontal)
                                             .small()
-                                            .icon(Icon::new(LucideIcon::FolderOpen).small())
-                                            .label("Open Phases Folder")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.open_phases_folder(cx);
-                                            })),
+                                            .text_color(theme.primary),
+                                    )
+                                    .child("Review Configuration"),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_4()
+                                    .items_start()
+                                    .child(
+                                        v_flex()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .gap_1p5()
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(theme.muted_foreground)
+                                                    .child("Copilot Model"),
+                                            )
+                                            .child(self.model_dropdown.clone()),
                                     )
                                     .child(
-                                        Button::new("pr-empty-check-again")
-                                            .primary()
-                                            .small()
-                                            .icon(Icon::new(LucideIcon::RefreshCw).small())
-                                            .label("Check Again")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.reload_phases(cx);
-                                            })),
+                                        v_flex()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .gap_1p5()
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(theme.muted_foreground)
+                                                    .child("Review Persona (Optional)"),
+                                            )
+                                            .child(Select::new(&self.persona_select)),
                                     ),
                             )
-                            .into_any_element()
-                    } else {
-                        v_flex()
-                            .p_4()
-                            .gap_3()
-                            .rounded(theme.radius_lg)
-                            .border_1()
-                            .border_color(theme.border)
-                            .bg(theme.sidebar)
-                            .children(grouped_phases.into_iter().enumerate().map(|(group_idx, group)| {
-                                let group_name_for_click = group.name.clone();
+                            .child(
                                 v_flex()
                                     .gap_1p5()
                                     .child(
                                         h_flex()
                                             .items_center()
-                                            .gap_2()
+                                            .justify_between()
                                             .child(
-                                                Checkbox::new(("pr-group-check", group_idx))
-                                                    .small()
-                                                    .checked(group.all_checked)
-                                                    .disabled(group.selectable_count == 0)
-                                                    .label(group.name.clone())
-                                                    .on_click(cx.listener(move |this, next: &bool, _, cx| {
-                                                        this.toggle_group(&group_name_for_click, *next, cx);
-                                                    })),
+                                                div()
+                                                    .text_xs()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(theme.muted_foreground)
+                                                    .child("Review Agent Parallelism"),
                                             )
-                                            .when(group.some_checked, |row| {
+                                            .when(self.cpu_count >= 4, |row| {
                                                 row.child(
                                                     div()
                                                         .px_1p5()
                                                         .py_0p5()
                                                         .rounded(theme.radius)
                                                         .bg(theme.secondary)
+                                                        .font_family(theme.mono_font_family.clone())
                                                         .text_xs()
-                                                        .text_color(theme.muted_foreground)
-                                                        .child("partial"),
+                                                        .child(format!("{}x", self.max_parallelism)),
                                                 )
                                             }),
                                     )
-                                    .child(
+                                    .child(if self.cpu_count < 4 {
+                                        div()
+                                            .text_xs()
+                                            .text_color(theme.muted_foreground)
+                                            .child("Parallelism fixed at 1 (fewer than 4 CPU cores).")
+                                            .into_any_element()
+                                    } else {
                                         v_flex()
-                                            .pl_5()
-                                            .gap_1p5()
-                                            .border_l_1()
-                                            .border_color(theme.border)
-                                            .children(group.items.into_iter().map(|entry| {
-                                                let idx = entry.original_index;
-                                                let item = entry.item;
-                                                let tpl_err = item.phase.template_error.clone();
-                                                let phase_model = item.phase.model.clone();
-                                                let missing = entry.model_missing;
-                                                let matched_label = entry.matched_model_name;
-
-                                                v_flex()
-                                                    .gap_0p5()
-                                                    .child(
-                                                        h_flex()
-                                                            .flex_wrap()
-                                                            .items_center()
-                                                            .gap_2()
-                                                            .child(
-                                                                Checkbox::new(("pr-phase-check", idx))
-                                                                    .small()
-                                                                    .checked(!missing && item.enabled)
-                                                                    .disabled(missing)
-                                                                    .label(item.phase.title.clone())
-                                                                    .on_click(cx.listener(move |this, next: &bool, _, cx| {
-                                                                        this.toggle_phase(idx, *next, cx);
-                                                                    })),
-                                                            )
-                                                            .when_some(phase_model, |row, model_id| {
-                                                                if missing {
-                                                                    row.child(
-                                                                        div()
-                                                                            .px_1p5()
-                                                                            .py_0p5()
-                                                                            .rounded(theme.radius)
-                                                                            .border_1()
-                                                                            .border_color(red.opacity(0.4))
-                                                                            .bg(red.opacity(0.1))
-                                                                            .font_family(theme.mono_font_family.clone())
-                                                                            .text_xs()
-                                                                            .text_color(red)
-                                                                            .child(format!("Model not available: {model_id}")),
-                                                                    )
-                                                                } else {
-                                                                    row.child(
-                                                                        div()
-                                                                            .px_1p5()
-                                                                            .py_0p5()
-                                                                            .rounded(theme.radius)
-                                                                            .bg(theme.secondary)
-                                                                            .border_1()
-                                                                            .border_color(theme.border)
-                                                                            .font_family(theme.mono_font_family.clone())
-                                                                            .text_xs()
-                                                                            .text_color(theme.muted_foreground)
-                                                                            .child(matched_label.unwrap_or(model_id)),
-                                                                    )
-                                                                }
-                                                            }),
-                                                    )
-                                                    .when_some(tpl_err, |col, err_msg| {
-                                                        col.child(
-                                                            h_flex()
-                                                                .pl_5()
-                                                                .items_center()
-                                                                .gap_1()
-                                                                .text_xs()
-                                                                .text_color(red)
-                                                                .child(Icon::new(LucideIcon::CircleAlert).xsmall())
-                                                                .child(err_msg),
-                                                        )
-                                                    })
-                                            })),
-                                    )
-                            }))
-                            .child(div().h(px(1.)).w_full().bg(theme.border))
+                                            .gap_1()
+                                            .child(Slider::new(&self.parallelism_slider).horizontal())
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(theme.muted_foreground)
+                                                    .child(format!(
+                                                        "Range: 1 to {max_limit} workers (CPUs: {})",
+                                                        self.cpu_count
+                                                    )),
+                                            )
+                                            .into_any_element()
+                                    }),
+                            )
                             .child(
                                 v_flex()
-                                    .gap_0p5()
+                                    .gap_1p5()
                                     .child(
-                                        Checkbox::new("pr-critic-toggle")
-                                            .small()
-                                            .checked(self.critic_enabled)
-                                            .label("Critic")
-                                            .on_click(cx.listener(|this, next: &bool, _, cx| {
-                                                this.toggle_critic(*next, cx);
-                                            })),
+                                        div()
+                                            .text_xs()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(theme.muted_foreground)
+                                            .child("Specific Instructions (Optional)"),
+                                    )
+                                    .child(Textarea::new(&self.custom_instructions_input).h(px(88.))),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_2()
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(theme.foreground)
+                                            .child("Active Review Phases"),
                                     )
                                     .child(
                                         div()
-                                            .pl_6()
                                             .text_xs()
                                             .text_color(theme.muted_foreground)
-                                            .child("Critiques and refines generated comments once all review phases finish."),
+                                            .child(format!(
+                                                "{enabled_phases}/{} enabled",
+                                                self.phases.len()
+                                            )),
                                     ),
                             )
-                            .into_any_element()
-                    }),
+                            .child(if self.phases.is_empty() {
+                                v_flex()
+                                    .p_4()
+                                    .gap_3()
+                                    .rounded(theme.radius_lg)
+                                    .border_1()
+                                    .border_color(theme.border)
+                                    .bg(theme.sidebar)
+                                    .child(
+                                        h_flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .text_sm()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(Icon::new(LucideIcon::SlidersHorizontal).small())
+                                            .child("Set Up Review Phases"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(theme.muted_foreground)
+                                            .child("No review phases found. Add Markdown phase files inside ~/.stitch/pr-reviewer/phases/ and click Check Again."),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .px_3()
+                                            .py_2()
+                                            .rounded(theme.radius)
+                                            .bg(theme.background)
+                                            .border_1()
+                                            .border_color(theme.border)
+                                            .font_family(theme.mono_font_family.clone())
+                                            .text_xs()
+                                            .text_color(theme.muted_foreground)
+                                            .child(Icon::new(LucideIcon::Folder).xsmall())
+                                            .child(phases_dir_label),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .child(
+                                                Button::new("pr-empty-open-dir")
+                                                    .small()
+                                                    .icon(Icon::new(LucideIcon::FolderOpen).small())
+                                                    .label("Open Phases Folder")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.open_phases_folder(cx);
+                                                    })),
+                                            )
+                                            .child(
+                                                Button::new("pr-empty-check-again")
+                                                    .primary()
+                                                    .small()
+                                                    .icon(Icon::new(LucideIcon::RefreshCw).small())
+                                                    .label("Check Again")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.reload_phases(cx);
+                                                    })),
+                                            ),
+                                    )
+                                    .into_any_element()
+                            } else {
+                                v_flex()
+                                    .p_4()
+                                    .gap_3()
+                                    .rounded(theme.radius_lg)
+                                    .border_1()
+                                    .border_color(theme.border)
+                                    .bg(theme.sidebar)
+                                    .children(grouped_phases.into_iter().enumerate().map(|(group_idx, group)| {
+                                        let group_name_for_click = group.name.clone();
+                                        v_flex()
+                                            .gap_1p5()
+                                            .child(
+                                                h_flex()
+                                                    .items_center()
+                                                    .gap_2()
+                                                    .child(
+                                                        Checkbox::new(("pr-group-check", group_idx))
+                                                            .small()
+                                                            .checked(group.all_checked)
+                                                            .disabled(group.selectable_count == 0)
+                                                            .label(group.name.clone())
+                                                            .on_click(cx.listener(move |this, next: &bool, _, cx| {
+                                                                this.toggle_group(&group_name_for_click, *next, cx);
+                                                            })),
+                                                    )
+                                                    .when(group.some_checked, |row| {
+                                                        row.child(
+                                                            div()
+                                                                .px_1p5()
+                                                                .py_0p5()
+                                                                .rounded(theme.radius)
+                                                                .bg(theme.secondary)
+                                                                .text_xs()
+                                                                .text_color(theme.muted_foreground)
+                                                                .child("partial"),
+                                                        )
+                                                    }),
+                                            )
+                                            .child(
+                                                v_flex()
+                                                    .pl_5()
+                                                    .gap_1p5()
+                                                    .border_l_1()
+                                                    .border_color(theme.border)
+                                                    .children(group.items.into_iter().map(|entry| {
+                                                        let idx = entry.original_index;
+                                                        let item = entry.item;
+                                                        let tpl_err = item.phase.template_error.clone();
+                                                        let phase_model = item.phase.model.clone();
+                                                        let missing = entry.model_missing;
+                                                        let matched_label = entry.matched_model_name;
+
+                                                        v_flex()
+                                                            .gap_0p5()
+                                                            .child(
+                                                                h_flex()
+                                                                    .flex_wrap()
+                                                                    .items_center()
+                                                                    .gap_2()
+                                                                    .child(
+                                                                        Checkbox::new(("pr-phase-check", idx))
+                                                                            .small()
+                                                                            .checked(!missing && item.enabled)
+                                                                            .disabled(missing)
+                                                                            .label(item.phase.title.clone())
+                                                                            .on_click(cx.listener(move |this, next: &bool, _, cx| {
+                                                                                this.toggle_phase(idx, *next, cx);
+                                                                            })),
+                                                                    )
+                                                                    .when_some(phase_model, |row, model_id| {
+                                                                        if missing {
+                                                                            row.child(
+                                                                                div()
+                                                                                    .px_1p5()
+                                                                                    .py_0p5()
+                                                                                    .rounded(theme.radius)
+                                                                                    .border_1()
+                                                                                    .border_color(red.opacity(0.4))
+                                                                                    .bg(red.opacity(0.1))
+                                                                                    .font_family(theme.mono_font_family.clone())
+                                                                                    .text_xs()
+                                                                                    .text_color(red)
+                                                                                    .child(format!("Model not available: {model_id}")),
+                                                                            )
+                                                                        } else {
+                                                                            row.child(
+                                                                                div()
+                                                                                    .px_1p5()
+                                                                                    .py_0p5()
+                                                                                    .rounded(theme.radius)
+                                                                                    .bg(theme.secondary)
+                                                                                    .border_1()
+                                                                                    .border_color(theme.border)
+                                                                                    .font_family(theme.mono_font_family.clone())
+                                                                                    .text_xs()
+                                                                                    .text_color(theme.muted_foreground)
+                                                                                    .child(matched_label.unwrap_or(model_id)),
+                                                                            )
+                                                                        }
+                                                                    }),
+                                                            )
+                                                            .when_some(tpl_err, |col, err_msg| {
+                                                                col.child(
+                                                                    h_flex()
+                                                                        .pl_5()
+                                                                        .items_center()
+                                                                        .gap_1()
+                                                                        .text_xs()
+                                                                        .text_color(red)
+                                                                        .child(Icon::new(LucideIcon::CircleAlert).xsmall())
+                                                                        .child(err_msg),
+                                                                )
+                                                            })
+                                                    })),
+                                            )
+                                    }))
+                                    .child(div().h(px(1.)).w_full().bg(theme.border))
+                                    .child(
+                                        v_flex()
+                                            .gap_0p5()
+                                            .child(
+                                                Checkbox::new("pr-critic-toggle")
+                                                    .small()
+                                                    .checked(self.critic_enabled)
+                                                    .label("Critic")
+                                                    .on_click(cx.listener(|this, next: &bool, _, cx| {
+                                                        this.toggle_critic(*next, cx);
+                                                    })),
+                                            )
+                                            .child(
+                                                div()
+                                                    .pl_6()
+                                                    .text_xs()
+                                                    .text_color(theme.muted_foreground)
+                                                    .child("Critiques and refines generated comments once all review phases finish."),
+                                            ),
+                                    )
+                                    .into_any_element()
+                            }),
+                    ),
             )
             .child(
                 h_flex()
                     .items_center()
                     .justify_between()
                     .gap_3()
-                    .pt_1()
-                    .child(
-                        div().flex_1().min_w_0().when_some(self.loading_status.clone(), |el, msg| {
-                            el.child(
-                                h_flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(Spinner::new().small().color(theme.primary))
-                                    .child(msg),
-                            )
-                        }),
-                    )
+                    .px_6()
+                    .py_3()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .bg(theme.sidebar)
+                    .child(if !repo_non_empty {
+                        h_flex()
+                            .items_center()
+                            .gap_1p5()
+                            .text_xs()
+                            .text_color(amber)
+                            .child(Icon::new(LucideIcon::TriangleAlert).xsmall())
+                            .child("Select a local repository path to start.")
+                            .into_any_element()
+                    } else if enabled_phases == 0 {
+                        h_flex()
+                            .items_center()
+                            .gap_1p5()
+                            .text_xs()
+                            .text_color(amber)
+                            .child(Icon::new(LucideIcon::TriangleAlert).xsmall())
+                            .child("Enable at least one review phase to start.")
+                            .into_any_element()
+                    } else if has_template_error {
+                        h_flex()
+                            .items_center()
+                            .gap_1p5()
+                            .text_xs()
+                            .text_color(red)
+                            .child(Icon::new(LucideIcon::CircleAlert).xsmall())
+                            .child("Resolve phase template errors before starting.")
+                            .into_any_element()
+                    } else {
+                        let critic_suffix = if self.critic_enabled { " + Critic" } else { "" };
+                        let worker_word = if self.max_parallelism == 1 {
+                            "worker"
+                        } else {
+                            "workers"
+                        };
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(format!(
+                                "{enabled_phases} phase{}{critic_suffix} • {}x {worker_word}",
+                                if enabled_phases == 1 { "" } else { "s" },
+                                self.max_parallelism
+                            ))
+                            .into_any_element()
+                    })
                     .child(
                         h_flex()
                             .items_center()
                             .gap_2()
-                            .when(self.checked_out.is_some(), |row| {
+                            .when(can_return_to_results, |row| {
                                 row.child(
-                                    Button::new("pr-collapse-setup")
+                                    Button::new("pr-back-to-results")
                                         .ghost()
                                         .small()
-                                        .icon(Icon::new(LucideIcon::Minimize2).small())
-                                        .label("Back to Review Workspace")
+                                        .icon(Icon::new(LucideIcon::ArrowRight).small())
+                                        .label("Back to Results")
                                         .on_click(cx.listener(|this, _, _, cx| {
-                                            this.is_header_collapsed = true;
+                                            this.stage = ReviewerStage::Workspace;
                                             cx.notify();
                                         })),
                                 )
                             })
                             .child(
-                                Button::new("pr-fetch-checkout")
-                                    .primary()
-                                    .disabled(self.is_loading_checkout || !repo_non_empty)
-                                    .loading(self.is_loading_checkout)
-                                    .icon(Icon::new(LucideIcon::CloudDownload).small())
-                                    .label(if self.is_loading_checkout {
-                                        "Checking Out..."
+                                Button::new("pr-start-review")
+                                    .success()
+                                    .disabled(!can_start)
+                                    .icon(Icon::new(LucideIcon::Play).small())
+                                    .label(if self.loading_pr_details {
+                                        "Loading PR..."
                                     } else {
-                                        "Fetch & Checkout PR"
+                                        "Start Code Review"
                                     })
                                     .on_click(cx.listener(|this, _, window, cx| {
-                                        this.handle_checkout(window, cx);
+                                        this.handle_start_review(window, cx);
                                     })),
                             ),
                     ),
@@ -3027,176 +3272,373 @@ impl PrReviewerView {
             .into_any_element()
     }
 
-    fn render_collapsed_workspace(
+    fn render_workspace_view(
         &self,
-        checked: &CheckedOutState,
+        session: &ActiveReviewSession,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme().clone();
-        let short_sha: String = checked.commit_sha.chars().take(8).collect();
-        let pr_url = checked.pr.url.clone();
+        let pr_url = session.pr.url.clone();
         let red = hsla(0.0, 0.78, 0.55, 1.0);
         let green = hsla(152.0 / 360.0, 0.76, 0.40, 1.0);
         let amber = hsla(38.0 / 360.0, 0.92, 0.50, 1.0);
+        let chevron = if self.context_expanded {
+            LucideIcon::ChevronUp
+        } else {
+            LucideIcon::ChevronDown
+        };
+        let needs_recovery_cleanup = !self.is_reviewing
+            && session.checkout.is_some()
+            && !session.checkout_cleaned_up;
 
         v_flex()
             .size_full()
             .bg(theme.background)
             .child(
-                h_flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_4()
-                    .px_6()
-                    .py_3()
+                v_flex()
+                    .w_full()
                     .border_b_1()
                     .border_color(theme.border)
                     .bg(theme.sidebar)
                     .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .gap_1()
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_4()
+                            .px_6()
+                            .py_3()
                             .child(
-                                h_flex()
-                                    .flex_wrap()
-                                    .items_center()
-                                    .gap_2()
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .gap_1()
                                     .child(
-                                        div()
-                                            .text_xs()
-                                            .font_weight(FontWeight::BOLD)
-                                            .text_color(theme.primary)
-                                            .child(format!("PR #{}", checked.pr.id)),
-                                    )
-                                    .when(!checked.pr.repository_name.is_empty(), |row| {
-                                        row.child(
-                                            div()
-                                                .px_1p5()
-                                                .py_0p5()
-                                                .rounded(theme.radius)
-                                                .bg(theme.secondary)
-                                                .font_family(theme.mono_font_family.clone())
-                                                .text_xs()
-                                                .child(checked.pr.repository_name.clone()),
-                                        )
-                                    })
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(theme.muted_foreground)
-                                            .child(format!("By {}", checked.pr.author)),
-                                    )
-                                    .child(
-                                        div()
-                                            .px_1p5()
-                                            .py_0p5()
-                                            .rounded(theme.radius)
-                                            .border_1()
-                                            .border_color(theme.border)
-                                            .bg(theme.background)
-                                            .font_family(theme.mono_font_family.clone())
-                                            .text_xs()
-                                            .child(format!(
-                                                "{} -> {}",
-                                                checked.pr.source_branch, checked.pr.target_branch
-                                            )),
-                                    )
-                                    .child(
-                                        div()
-                                            .px_1p5()
-                                            .py_0p5()
-                                            .rounded(theme.radius)
-                                            .bg(theme.secondary)
-                                            .font_family(theme.mono_font_family.clone())
-                                            .text_xs()
-                                            .text_color(theme.muted_foreground)
-                                            .child(short_sha),
-                                    )
-                                    .child(
-                                        div()
-                                            .px_1p5()
-                                            .py_0p5()
-                                            .rounded(theme.radius)
-                                            .border_1()
-                                            .border_color(if checked.checkout_cleaned_up {
-                                                theme.border
-                                            } else if checked.using_worktree {
-                                                green.opacity(0.4)
-                                            } else {
-                                                amber.opacity(0.4)
+                                        h_flex()
+                                            .flex_wrap()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .font_weight(FontWeight::BOLD)
+                                                    .text_color(theme.primary)
+                                                    .child(format!("PR #{}", session.pr.id)),
+                                            )
+                                            .when(!session.pr.repository_name.is_empty(), |row| {
+                                                row.child(
+                                                    div()
+                                                        .px_1p5()
+                                                        .py_0p5()
+                                                        .rounded(theme.radius)
+                                                        .bg(theme.secondary)
+                                                        .font_family(theme.mono_font_family.clone())
+                                                        .text_xs()
+                                                        .child(session.pr.repository_name.clone()),
+                                                )
                                             })
-                                            .bg(if checked.checkout_cleaned_up {
-                                                theme.secondary
-                                            } else if checked.using_worktree {
-                                                green.opacity(0.1)
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(theme.muted_foreground)
+                                                    .child(format!("By {}", session.pr.author)),
+                                            )
+                                            .child(
+                                                div()
+                                                    .px_1p5()
+                                                    .py_0p5()
+                                                    .rounded(theme.radius)
+                                                    .border_1()
+                                                    .border_color(theme.border)
+                                                    .bg(theme.background)
+                                                    .font_family(theme.mono_font_family.clone())
+                                                    .text_xs()
+                                                    .child(format!(
+                                                        "{} -> {}",
+                                                        session.pr.source_branch,
+                                                        session.pr.target_branch
+                                                    )),
+                                            )
+                                            .child(if let Some(ref checkout) = session.checkout {
+                                                let short_sha: String =
+                                                    checkout.commit_sha.chars().take(8).collect();
+                                                h_flex()
+                                                    .items_center()
+                                                    .gap_2()
+                                                    .child(
+                                                        div()
+                                                            .px_1p5()
+                                                            .py_0p5()
+                                                            .rounded(theme.radius)
+                                                            .bg(theme.secondary)
+                                                            .font_family(
+                                                                theme.mono_font_family.clone(),
+                                                            )
+                                                            .text_xs()
+                                                            .text_color(theme.muted_foreground)
+                                                            .child(short_sha),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .px_1p5()
+                                                            .py_0p5()
+                                                            .rounded(theme.radius)
+                                                            .border_1()
+                                                            .border_color(
+                                                                if session.checkout_cleaned_up {
+                                                                    theme.border
+                                                                } else if checkout.using_worktree {
+                                                                    green.opacity(0.4)
+                                                                } else {
+                                                                    amber.opacity(0.4)
+                                                                },
+                                                            )
+                                                            .bg(if session.checkout_cleaned_up {
+                                                                theme.secondary
+                                                            } else if checkout.using_worktree {
+                                                                green.opacity(0.1)
+                                                            } else {
+                                                                amber.opacity(0.1)
+                                                            })
+                                                            .text_xs()
+                                                            .text_color(
+                                                                if session.checkout_cleaned_up {
+                                                                    theme.muted_foreground
+                                                                } else if checkout.using_worktree {
+                                                                    green
+                                                                } else {
+                                                                    amber
+                                                                },
+                                                            )
+                                                            .child(if session.checkout_cleaned_up {
+                                                                "Checkout Cleaned"
+                                                            } else if checkout.using_worktree {
+                                                                "Worktree"
+                                                            } else {
+                                                                "Local Checkout"
+                                                            }),
+                                                    )
+                                                    .into_any_element()
                                             } else {
-                                                amber.opacity(0.1)
-                                            })
-                                            .text_xs()
-                                            .text_color(if checked.checkout_cleaned_up {
-                                                theme.muted_foreground
-                                            } else if checked.using_worktree {
-                                                green
-                                            } else {
-                                                amber
-                                            })
-                                            .child(if checked.checkout_cleaned_up {
-                                                "Checkout Cleaned"
-                                            } else if checked.using_worktree {
-                                                "Worktree"
-                                            } else {
-                                                "Local Checkout"
+                                                h_flex()
+                                                    .items_center()
+                                                    .gap_1p5()
+                                                    .px_1p5()
+                                                    .py_0p5()
+                                                    .rounded(theme.radius)
+                                                    .border_1()
+                                                    .border_color(theme.primary.opacity(0.35))
+                                                    .bg(theme.primary.opacity(0.08))
+                                                    .text_xs()
+                                                    .text_color(theme.primary)
+                                                    .child(Spinner::new().xsmall().color(theme.primary))
+                                                    .child("Preparing repository...")
+                                                    .into_any_element()
                                             }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .truncate()
+                                            .child(session.pr.title.clone()),
                                     ),
                             )
                             .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .truncate()
-                                    .child(checked.pr.title.clone()),
+                                h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .flex_shrink_0()
+                                    .when_some(pr_url, |row, url| {
+                                        row.child(
+                                            Button::new("pr-open-web-collapsed")
+                                                .ghost()
+                                                .small()
+                                                .icon(Icon::new(LucideIcon::ExternalLink).small())
+                                                .label("Open")
+                                                .on_click(move |_, _, cx| {
+                                                    cx.open_url(&url);
+                                                }),
+                                        )
+                                    })
+                                    .child(
+                                        Button::new("pr-toggle-context-details")
+                                            .ghost()
+                                            .small()
+                                            .icon(Icon::new(chevron).small())
+                                            .label(if self.context_expanded {
+                                                "Hide Details"
+                                            } else {
+                                                "Details"
+                                            })
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.context_expanded = !this.context_expanded;
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .when(needs_recovery_cleanup, |row| {
+                                        row.child(
+                                            Button::new("pr-cleanup-checkout")
+                                                .ghost()
+                                                .small()
+                                                .icon(Icon::new(LucideIcon::RotateCcw).small())
+                                                .label("Clean Checkout")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.handle_cleanup_checkout(cx);
+                                                })),
+                                        )
+                                    })
+                                    .when(self.is_reviewing, |row| {
+                                        row.child(
+                                            Button::new("pr-header-cancel-review")
+                                                .danger()
+                                                .small()
+                                                .icon(Icon::new(LucideIcon::CircleX).small())
+                                                .label("Cancel")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.handle_cancel_review(cx);
+                                                })),
+                                        )
+                                    })
+                                    .when(!self.is_reviewing, |row| {
+                                        row.child(
+                                            Button::new("pr-header-rerun")
+                                                .ghost()
+                                                .small()
+                                                .icon(Icon::new(LucideIcon::RotateCw).small())
+                                                .label("Re-run")
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.handle_start_review(window, cx);
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("pr-edit-setup")
+                                                .small()
+                                                .icon(
+                                                    Icon::new(LucideIcon::SlidersHorizontal)
+                                                        .small(),
+                                                )
+                                                .label("Edit Setup")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.stage = ReviewerStage::Setup;
+                                                    cx.notify();
+                                                })),
+                                        )
+                                    }),
                             ),
                     )
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_2()
-                            .flex_shrink_0()
-                            .when_some(pr_url, |row, url| {
-                                row.child(
-                                    Button::new("pr-open-web-collapsed")
-                                        .ghost()
-                                        .small()
-                                        .icon(Icon::new(LucideIcon::ExternalLink).small())
-                                        .label("Open")
-                                        .on_click(move |_, _, cx| {
-                                            cx.open_url(&url);
+                    .when(self.context_expanded, |bar| {
+                        let instr = session.custom_instructions.trim().to_string();
+                        bar.child(
+                            v_flex()
+                                .gap_2()
+                                .px_6()
+                                .py_3()
+                                .border_t_1()
+                                .border_color(theme.border)
+                                .bg(theme.background)
+                                .child(
+                                    h_flex()
+                                        .flex_wrap()
+                                        .items_center()
+                                        .gap_4()
+                                        .text_xs()
+                                        .child(
+                                            h_flex()
+                                                .items_center()
+                                                .gap_1p5()
+                                                .child(
+                                                    div()
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .text_color(theme.muted_foreground)
+                                                        .child("Repository:"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .font_family(theme.mono_font_family.clone())
+                                                        .text_color(theme.foreground)
+                                                        .child(
+                                                            session
+                                                                .repo_path
+                                                                .display()
+                                                                .to_string(),
+                                                        ),
+                                                ),
+                                        )
+                                        .child(
+                                            h_flex()
+                                                .items_center()
+                                                .gap_1p5()
+                                                .child(
+                                                    div()
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .text_color(theme.muted_foreground)
+                                                        .child("Model:"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .font_family(theme.mono_font_family.clone())
+                                                        .text_color(theme.foreground)
+                                                        .child(session.model.clone()),
+                                                ),
+                                        )
+                                        .child(
+                                            h_flex()
+                                                .items_center()
+                                                .gap_1p5()
+                                                .child(
+                                                    div()
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .text_color(theme.muted_foreground)
+                                                        .child("Parallelism:"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .font_family(theme.mono_font_family.clone())
+                                                        .text_color(theme.foreground)
+                                                        .child(format!("{}x", session.parallelism)),
+                                                ),
+                                        )
+                                        .when(session.persona != "None", |row| {
+                                            row.child(
+                                                h_flex()
+                                                    .items_center()
+                                                    .gap_1p5()
+                                                    .child(
+                                                        div()
+                                                            .font_weight(FontWeight::SEMIBOLD)
+                                                            .text_color(theme.muted_foreground)
+                                                            .child("Persona:"),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_color(theme.foreground)
+                                                            .child(session.persona.clone()),
+                                                    ),
+                                            )
                                         }),
                                 )
-                            })
-                            .child(
-                                Button::new("pr-expand-selection")
-                                    .small()
-                                    .icon(Icon::new(LucideIcon::Maximize2).small())
-                                    .label("Expand PR Selection")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.is_header_collapsed = false;
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("pr-cleanup-checkout")
-                                    .ghost()
-                                    .small()
-                                    .disabled(self.is_reviewing)
-                                    .icon(Icon::new(LucideIcon::RotateCcw).small())
-                                    .label("Clean Checkout")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.handle_cleanup_checkout(cx);
-                                    })),
-                            ),
-                    ),
+                                .when(!instr.is_empty(), |col| {
+                                    col.child(
+                                        h_flex()
+                                            .items_start()
+                                            .gap_1p5()
+                                            .text_xs()
+                                            .child(
+                                                div()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(theme.muted_foreground)
+                                                    .child("Instructions:"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .text_color(theme.foreground)
+                                                    .child(instr),
+                                            ),
+                                    )
+                                }),
+                        )
+                    }),
             )
             .when_some(self.checkout_error.clone(), |col, err| {
                 col.child(
@@ -3223,7 +3665,7 @@ impl PrReviewerView {
                             resizable_panel()
                                 .size(px(370.))
                                 .size_range(px(300.)..px(520.))
-                                .child(self.render_review_left_column(checked, &theme, cx)),
+                                .child(self.render_review_progress_column(session, &theme, cx)),
                         )
                         .child(
                             resizable_panel().child(self.render_review_comments_column(&theme, cx)),
@@ -3233,282 +3675,32 @@ impl PrReviewerView {
             .into_any_element()
     }
 
-    fn render_review_left_column(
+    fn render_review_progress_column(
         &self,
-        checked: &CheckedOutState,
+        session: &ActiveReviewSession,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let green = hsla(152.0 / 360.0, 0.76, 0.40, 1.0);
         let amber = hsla(38.0 / 360.0, 0.92, 0.50, 1.0);
-        let enabled_phases = self.phases.iter().filter(|p| p.enabled).count();
-        let show_progress = self.is_reviewing || !self.phase_progress.is_empty();
-
-        if show_progress {
-            let active_phases: Vec<&PhaseProgress> = self
-                .phase_progress
-                .iter()
-                .filter(|p| p.status != PhaseRunStatus::Skipped)
-                .collect();
-            let total = active_phases.len();
-            let completed = active_phases
-                .iter()
-                .filter(|p| p.status == PhaseRunStatus::Completed)
-                .count();
-            let percent = if total > 0 {
-                (completed * 100) / total
-            } else {
-                0
-            };
-
-            return v_flex()
-                .size_full()
-                .p_5()
-                .gap_4()
-                .bg(theme.sidebar)
-                .border_r_1()
-                .border_color(theme.border)
-                .child(
-                    h_flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_2()
-                        .child(
-                            h_flex()
-                                .items_center()
-                                .gap_2()
-                                .text_sm()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(Icon::new(LucideIcon::Bot).small().text_color(theme.primary))
-                                .child("Review Progress"),
-                        )
-                        .child(
-                            div()
-                                .px_2()
-                                .py_0p5()
-                                .rounded(theme.radius)
-                                .bg(theme.primary.opacity(0.12))
-                                .text_xs()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(theme.primary)
-                                .child(format!("{percent}% Complete")),
-                        ),
-                )
-                .child(
-                    div()
-                        .h(px(8.))
-                        .w_full()
-                        .rounded(theme.radius)
-                        .bg(theme.secondary)
-                        .overflow_hidden()
-                        .child(
-                            div()
-                                .h_full()
-                                .w(relative(percent as f32 / 100.0))
-                                .bg(theme.primary),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_y_scrollbar()
-                        .child(
-                            v_flex()
-                                .gap_2()
-                                .children(self.phase_progress.iter().map(|phase| {
-                                    let is_running = phase.status == PhaseRunStatus::Running;
-                                    let is_completed = phase.status == PhaseRunStatus::Completed;
-                                    let is_skipped = phase.status == PhaseRunStatus::Skipped;
-
-                                    let status_icon = match phase.status {
-                                        PhaseRunStatus::Pending => Icon::new(LucideIcon::Clock)
-                                            .small()
-                                            .text_color(theme.muted_foreground)
-                                            .into_any_element(),
-                                        PhaseRunStatus::Running => Spinner::new()
-                                            .small()
-                                            .color(theme.primary)
-                                            .into_any_element(),
-                                        PhaseRunStatus::Completed => {
-                                            Icon::new(LucideIcon::CircleCheck)
-                                                .small()
-                                                .text_color(green)
-                                                .into_any_element()
-                                        }
-                                        PhaseRunStatus::Skipped => Icon::new(LucideIcon::SkipForward)
-                                            .small()
-                                            .text_color(amber)
-                                            .into_any_element(),
-                                    };
-
-                                    let is_critic_phase = phase.id == CRITIC_PHASE_ID;
-                                    let is_critic_pending =
-                                        is_critic_phase && phase.status == PhaseRunStatus::Pending;
-                                    let (badge_text, badge_color) = match phase.status {
-                                        PhaseRunStatus::Pending => (
-                                            if is_critic_pending {
-                                                "Queued".to_string()
-                                            } else {
-                                                "Pending".to_string()
-                                            },
-                                            theme.muted_foreground,
-                                        ),
-                                        PhaseRunStatus::Running => ("Running".to_string(), theme.primary),
-                                        PhaseRunStatus::Completed => (
-                                            if is_critic_phase {
-                                                "Done".to_string()
-                                            } else {
-                                                format!(
-                                                    "Done ({} draft comment{})",
-                                                    phase.comment_count,
-                                                    if phase.comment_count == 1 { "" } else { "s" }
-                                                )
-                                            },
-                                            green,
-                                        ),
-                                        PhaseRunStatus::Skipped => ("Skipped".to_string(), amber),
-                                    };
-
-                                    let subtitle = if is_running {
-                                        Some(
-                                            phase
-                                                .status_text
-                                                .clone()
-                                                .unwrap_or_else(|| "Analyzing diffs...".to_string()),
-                                        )
-                                    } else if is_critic_pending {
-                                        phase.status_text.clone()
-                                    } else if is_skipped {
-                                        phase.reason.clone()
-                                    } else {
-                                        None
-                                    };
-
-                                    v_flex()
-                                        .p_3()
-                                        .gap_1p5()
-                                        .rounded(theme.radius)
-                                        .border_1()
-                                        .border_color(if is_running {
-                                            theme.primary.opacity(0.45)
-                                        } else {
-                                            theme.border
-                                        })
-                                        .bg(if is_running {
-                                            theme.primary.opacity(0.08)
-                                        } else {
-                                            theme.background
-                                        })
-                                        .child(
-                                            h_flex()
-                                                .items_center()
-                                                .justify_between()
-                                                .gap_2()
-                                                .child(
-                                                    h_flex()
-                                                        .flex_1()
-                                                        .min_w_0()
-                                                        .items_center()
-                                                        .gap_2()
-                                                        .child(status_icon)
-                                                        .child(
-                                                            div()
-                                                                .flex_1()
-                                                                .min_w_0()
-                                                                .text_xs()
-                                                                .font_weight(FontWeight::SEMIBOLD)
-                                                                .text_color(if is_completed || is_skipped {
-                                                                    theme.muted_foreground
-                                                                } else {
-                                                                    theme.foreground
-                                                                })
-                                                                .truncate()
-                                                                .child(phase.title.clone()),
-                                                        ),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .px_1p5()
-                                                        .py_0p5()
-                                                        .rounded(theme.radius)
-                                                        .border_1()
-                                                        .border_color(badge_color.opacity(0.35))
-                                                        .bg(badge_color.opacity(0.1))
-                                                        .font_family(theme.mono_font_family.clone())
-                                                        .text_xs()
-                                                        .text_color(badge_color)
-                                                        .child(badge_text),
-                                                ),
-                                        )
-                                        .when(!phase.group.trim().is_empty(), |col| {
-                                            col.child(
-                                                div()
-                                                    .pl_5()
-                                                    .text_xs()
-                                                    .text_color(theme.muted_foreground)
-                                                    .child(phase.group.clone()),
-                                            )
-                                        })
-                                        .when_some(subtitle, |col, sub| {
-                                            col.child(
-                                                div()
-                                                    .pl_5()
-                                                    .text_xs()
-                                                    .text_color(theme.muted_foreground)
-                                                    .truncate()
-                                                    .child(sub),
-                                            )
-                                        })
-                                })),
-                        ),
-                )
-                .child(if self.is_reviewing {
-                    v_flex()
-                        .gap_2()
-                        .child(
-                            h_flex()
-                                .p_2p5()
-                                .gap_2()
-                                .items_center()
-                                .rounded(theme.radius)
-                                .bg(theme.secondary)
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(Spinner::new().small().color(theme.primary))
-                                .child(div().flex_1().truncate().child(self.general_status_text())),
-                        )
-                        .child(
-                            Button::new("pr-cancel-review")
-                                .danger()
-                                .small()
-                                .icon(Icon::new(LucideIcon::CircleX).small())
-                                .label("Cancel Review")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.handle_cancel_review(cx);
-                                })),
-                        )
-                        .into_any_element()
-                } else {
-                    Button::new("pr-back-to-review-settings")
-                        .ghost()
-                        .small()
-                        .icon(Icon::new(LucideIcon::ArrowLeft).small())
-                        .label("Back to Settings")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.phase_progress.clear();
-                            cx.notify();
-                        }))
-                        .into_any_element()
-                })
-                .into_any_element();
-        }
-
-        let max_limit = max_parallelism_limit(self.cpu_count);
+        let active_phases: Vec<&PhaseProgress> = self
+            .phase_progress
+            .iter()
+            .filter(|p| p.status != PhaseRunStatus::Skipped)
+            .collect();
+        let total = active_phases.len();
+        let completed = active_phases
+            .iter()
+            .filter(|p| p.status == PhaseRunStatus::Completed)
+            .count();
+        let percent = if total > 0 {
+            (completed * 100) / total
+        } else {
+            0
+        };
 
         v_flex()
             .size_full()
-            .overflow_y_scrollbar()
             .p_5()
             .gap_4()
             .bg(theme.sidebar)
@@ -3517,234 +3709,406 @@ impl PrReviewerView {
             .child(
                 h_flex()
                     .items_center()
+                    .justify_between()
                     .gap_2()
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(Icon::new(LucideIcon::Bot).small().text_color(theme.primary))
-                    .child("Review Settings"),
-            )
-            .child(
-                v_flex()
-                    .gap_1p5()
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.muted_foreground)
-                            .child("Copilot Model"),
-                    )
-                    .child(self.model_dropdown.clone()),
-            )
-            .child(
-                v_flex()
-                    .gap_1p5()
                     .child(
                         h_flex()
                             .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme.muted_foreground)
-                                    .child("Review Agent Parallelism"),
-                            )
-                            .when(self.cpu_count >= 4, |row| {
-                                row.child(
-                                    div()
-                                        .px_1p5()
-                                        .py_0p5()
-                                        .rounded(theme.radius)
-                                        .bg(theme.secondary)
-                                        .font_family(theme.mono_font_family.clone())
-                                        .text_xs()
-                                        .child(format!("{}x", self.max_parallelism)),
-                                )
-                            }),
+                            .gap_2()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(Icon::new(LucideIcon::Bot).small().text_color(theme.primary))
+                            .child("Review Progress"),
                     )
-                    .child(if self.cpu_count < 4 {
+                    .child(
                         div()
+                            .px_2()
+                            .py_0p5()
+                            .rounded(theme.radius)
+                            .bg(theme.primary.opacity(0.12))
                             .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child("Parallelism fixed at 1 (fewer than 4 CPU cores).")
-                            .into_any_element()
-                    } else {
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.primary)
+                            .child(format!("{percent}% Complete")),
+                    ),
+            )
+            .child(
+                div()
+                    .h(px(8.))
+                    .w_full()
+                    .rounded(theme.radius)
+                    .bg(theme.secondary)
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .h_full()
+                            .w(relative(percent as f32 / 100.0))
+                            .bg(theme.primary),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scrollbar()
+                    .child(
                         v_flex()
-                            .gap_1()
-                            .child(Slider::new(&self.parallelism_slider).horizontal())
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(format!(
-                                        "Range: 1 to {max_limit} workers (CPUs: {})",
-                                        self.cpu_count
-                                    )),
+                            .gap_2()
+                            .children(self.phase_progress.iter().map(|phase| {
+                                let is_running = phase.status == PhaseRunStatus::Running;
+                                let is_completed = phase.status == PhaseRunStatus::Completed;
+                                let is_skipped = phase.status == PhaseRunStatus::Skipped;
+
+                                let status_icon = match phase.status {
+                                    PhaseRunStatus::Pending => Icon::new(LucideIcon::Clock)
+                                        .small()
+                                        .text_color(theme.muted_foreground)
+                                        .into_any_element(),
+                                    PhaseRunStatus::Running => Spinner::new()
+                                        .small()
+                                        .color(theme.primary)
+                                        .into_any_element(),
+                                    PhaseRunStatus::Completed => {
+                                        Icon::new(LucideIcon::CircleCheck)
+                                            .small()
+                                            .text_color(green)
+                                            .into_any_element()
+                                    }
+                                    PhaseRunStatus::Skipped => Icon::new(LucideIcon::SkipForward)
+                                        .small()
+                                        .text_color(amber)
+                                        .into_any_element(),
+                                };
+
+                                let is_checkout_phase = phase.id == CHECKOUT_PHASE_ID;
+                                let is_critic_phase = phase.id == CRITIC_PHASE_ID;
+                                let is_critic_pending =
+                                    is_critic_phase && phase.status == PhaseRunStatus::Pending;
+                                let (badge_text, badge_color) = match phase.status {
+                                    PhaseRunStatus::Pending => (
+                                        if is_critic_pending {
+                                            "Queued".to_string()
+                                        } else {
+                                            "Pending".to_string()
+                                        },
+                                        theme.muted_foreground,
+                                    ),
+                                    PhaseRunStatus::Running => {
+                                        ("Running".to_string(), theme.primary)
+                                    }
+                                    PhaseRunStatus::Completed => (
+                                        if is_checkout_phase {
+                                            "Ready".to_string()
+                                        } else if is_critic_phase {
+                                            "Done".to_string()
+                                        } else {
+                                            format!(
+                                                "Done ({} draft comment{})",
+                                                phase.comment_count,
+                                                if phase.comment_count == 1 { "" } else { "s" }
+                                            )
+                                        },
+                                        green,
+                                    ),
+                                    PhaseRunStatus::Skipped => ("Skipped".to_string(), amber),
+                                };
+
+                                let subtitle = if is_running {
+                                    Some(phase.status_text.clone().unwrap_or_else(|| {
+                                        if is_checkout_phase {
+                                            "Preparing repository...".to_string()
+                                        } else {
+                                            "Analyzing diffs...".to_string()
+                                        }
+                                    }))
+                                } else if is_checkout_phase && is_completed {
+                                    phase.status_text.clone()
+                                } else if is_critic_pending {
+                                    phase.status_text.clone()
+                                } else if is_skipped {
+                                    phase.reason.clone()
+                                } else {
+                                    None
+                                };
+
+                                v_flex()
+                                    .p_3()
+                                    .gap_1p5()
+                                    .rounded(theme.radius)
+                                    .border_1()
+                                    .border_color(if is_running {
+                                        theme.primary.opacity(0.45)
+                                    } else {
+                                        theme.border
+                                    })
+                                    .bg(if is_running {
+                                        theme.primary.opacity(0.08)
+                                    } else {
+                                        theme.background
+                                    })
+                                    .child(
+                                        h_flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .gap_2()
+                                            .child(
+                                                h_flex()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .items_center()
+                                                    .gap_2()
+                                                    .child(status_icon)
+                                                    .child(
+                                                        div()
+                                                            .flex_1()
+                                                            .min_w_0()
+                                                            .text_xs()
+                                                            .font_weight(FontWeight::SEMIBOLD)
+                                                            .text_color(
+                                                                if is_completed || is_skipped {
+                                                                    theme.muted_foreground
+                                                                } else {
+                                                                    theme.foreground
+                                                                },
+                                                            )
+                                                            .truncate()
+                                                            .child(phase.title.clone()),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .px_1p5()
+                                                    .py_0p5()
+                                                    .rounded(theme.radius)
+                                                    .border_1()
+                                                    .border_color(badge_color.opacity(0.35))
+                                                    .bg(badge_color.opacity(0.1))
+                                                    .font_family(theme.mono_font_family.clone())
+                                                    .text_xs()
+                                                    .text_color(badge_color)
+                                                    .child(badge_text),
+                                            ),
+                                    )
+                                    .when(!phase.group.trim().is_empty(), |col| {
+                                        col.child(
+                                            div()
+                                                .pl_5()
+                                                .text_xs()
+                                                .text_color(theme.muted_foreground)
+                                                .child(phase.group.clone()),
+                                        )
+                                    })
+                                    .when_some(subtitle, |col, sub| {
+                                        col.child(
+                                            div()
+                                                .pl_5()
+                                                .text_xs()
+                                                .text_color(theme.muted_foreground)
+                                                .truncate()
+                                                .child(sub),
+                                        )
+                                    })
+                            })),
+                    ),
+            )
+            .when_some(session.checkout.as_ref(), |col, checkout| {
+                col.child(
+                    v_flex()
+                        .pt_2()
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .gap_2()
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(theme.muted_foreground)
+                                        .child(format!(
+                                            "Changed Files ({})",
+                                            checkout.diff_files.len()
+                                        )),
+                                )
+                                .child(
+                                    Button::new("pr-toggle-diff-files")
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(
+                                            Icon::new(if self.show_diff_files {
+                                                LucideIcon::ChevronUp
+                                            } else {
+                                                LucideIcon::ChevronDown
+                                            })
+                                            .xsmall(),
+                                        )
+                                        .label(if self.show_diff_files { "Hide" } else { "Show" })
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.show_diff_files = !this.show_diff_files;
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
+                        .when(self.show_diff_files, |inner_col| {
+                            inner_col.child(
+                                v_flex()
+                                    .gap_1p5()
+                                    .when(!session.checkout_cleaned_up, |inner| {
+                                        inner.child(
+                                            div()
+                                                .text_xs()
+                                                .font_family(theme.mono_font_family.clone())
+                                                .text_color(theme.muted_foreground)
+                                                .truncate()
+                                                .child(format!(
+                                                    "Working dir: {}",
+                                                    checkout.effective_repo_path.display()
+                                                )),
+                                        )
+                                    })
+                                    .child(
+                                        v_flex()
+                                            .max_h(px(220.))
+                                            .overflow_y_scrollbar()
+                                            .rounded(theme.radius)
+                                            .border_1()
+                                            .border_color(theme.border)
+                                            .bg(theme.background)
+                                            .child(if checkout.diff_files.is_empty() {
+                                                div()
+                                                    .p_3()
+                                                    .text_xs()
+                                                    .text_color(theme.muted_foreground)
+                                                    .child("No changed files detected against target branch.")
+                                                    .into_any_element()
+                                            } else {
+                                                v_flex()
+                                                    .children(
+                                                        checkout.diff_files.iter().enumerate().map(
+                                                            |(i, file)| {
+                                                                let (icon, color) =
+                                                                    diff_status_style(
+                                                                        file.status,
+                                                                        theme,
+                                                                    );
+                                                                h_flex()
+                                                                    .items_center()
+                                                                    .justify_between()
+                                                                    .gap_2()
+                                                                    .px_2p5()
+                                                                    .py_1p5()
+                                                                    .when(i > 0, |row| {
+                                                                        row.border_t_1()
+                                                                            .border_color(
+                                                                                theme.border,
+                                                                            )
+                                                                    })
+                                                                    .child(
+                                                                        h_flex()
+                                                                            .flex_1()
+                                                                            .min_w_0()
+                                                                            .items_center()
+                                                                            .gap_1p5()
+                                                                            .text_color(color)
+                                                                            .child(
+                                                                                Icon::new(icon)
+                                                                                    .xsmall(),
+                                                                            )
+                                                                            .child(
+                                                                                div()
+                                                                                    .flex_1()
+                                                                                    .min_w_0()
+                                                                                    .font_family(
+                                                                                        theme
+                                                                                            .mono_font_family
+                                                                                            .clone(),
+                                                                                    )
+                                                                                    .text_xs()
+                                                                                    .text_color(
+                                                                                        theme
+                                                                                            .foreground,
+                                                                                    )
+                                                                                    .truncate()
+                                                                                    .child(
+                                                                                        file.path
+                                                                                            .clone(),
+                                                                                    ),
+                                                                            ),
+                                                                    )
+                                                                    .child(
+                                                                        div()
+                                                                            .text_xs()
+                                                                            .text_color(color)
+                                                                            .child(
+                                                                                file.status.label(),
+                                                                            ),
+                                                                    )
+                                                            },
+                                                        ),
+                                                    )
+                                                    .into_any_element()
+                                            }),
+                                    ),
                             )
-                            .into_any_element()
-                    }),
-            )
-            .child(
+                        }),
+                )
+            })
+            .child(if self.is_reviewing {
                 v_flex()
-                    .gap_1p5()
+                    .gap_2()
                     .child(
-                        div()
+                        h_flex()
+                            .p_2p5()
+                            .gap_2()
+                            .items_center()
+                            .rounded(theme.radius)
+                            .bg(theme.secondary)
                             .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme.muted_foreground)
-                            .child("Review Persona (Optional)"),
+                            .child(Spinner::new().small().color(theme.primary))
+                            .child(div().flex_1().truncate().child(self.general_status_text())),
                     )
-                    .child(Select::new(&self.persona_select)),
-            )
-            .child(
-                v_flex()
-                    .gap_1p5()
                     .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.muted_foreground)
-                            .child("Specific Instructions (Optional)"),
+                        Button::new("pr-cancel-review")
+                            .danger()
+                            .small()
+                            .icon(Icon::new(LucideIcon::CircleX).small())
+                            .label("Cancel Review")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.handle_cancel_review(cx);
+                            })),
                     )
-                    .child(Textarea::new(&self.custom_instructions_input).h(px(104.))),
-            )
-            .child(
-                v_flex()
-                    .gap_1p5()
+                    .into_any_element()
+            } else {
+                h_flex()
+                    .items_center()
+                    .gap_2()
                     .child(
-                        Button::new("pr-start-review")
-                            .primary()
-                            .disabled(self.is_reviewing || enabled_phases == 0)
-                            .icon(Icon::new(LucideIcon::Play).small())
-                            .label("Start Code Review")
+                        Button::new("pr-back-to-setup")
+                            .ghost()
+                            .small()
+                            .flex_1()
+                            .icon(Icon::new(LucideIcon::SlidersHorizontal).small())
+                            .label("Edit Setup")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.stage = ReviewerStage::Setup;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("pr-rerun-review")
+                            .small()
+                            .flex_1()
+                            .icon(Icon::new(LucideIcon::RotateCw).small())
+                            .label("Re-run Review")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.handle_start_review(window, cx);
                             })),
                     )
-                    .when(enabled_phases == 0, |col| {
-                        col.child(
-                            h_flex()
-                                .items_center()
-                                .gap_1p5()
-                                .text_xs()
-                                .text_color(amber)
-                                .child(Icon::new(LucideIcon::TriangleAlert).xsmall())
-                                .child("Select at least one phase in PR settings to start review."),
-                        )
-                    }),
-            )
-            .child(
-                v_flex()
-                    .pt_2()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .gap_2()
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme.muted_foreground)
-                                    .child(format!("Changed Files ({})", checked.diff_files.len())),
-                            )
-                            .child(
-                                Button::new("pr-toggle-diff-files")
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(
-                                        Icon::new(if self.show_diff_files {
-                                            LucideIcon::ChevronUp
-                                        } else {
-                                            LucideIcon::ChevronDown
-                                        })
-                                        .xsmall(),
-                                    )
-                                    .label(if self.show_diff_files { "Hide" } else { "Show" })
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.show_diff_files = !this.show_diff_files;
-                                        cx.notify();
-                                    })),
-                            ),
-                    )
-                    .when(self.show_diff_files, |col| {
-                        col.child(
-                            v_flex()
-                                .gap_1p5()
-                                .when(!checked.checkout_cleaned_up, |inner| {
-                                    inner.child(
-                                        div()
-                                            .text_xs()
-                                            .font_family(theme.mono_font_family.clone())
-                                            .text_color(theme.muted_foreground)
-                                            .truncate()
-                                            .child(format!(
-                                                "Working dir: {}",
-                                                checked.effective_repo_path.display()
-                                            )),
-                                    )
-                                })
-                                .child(
-                                    v_flex()
-                                        .rounded(theme.radius)
-                                        .border_1()
-                                        .border_color(theme.border)
-                                        .bg(theme.background)
-                                        .overflow_hidden()
-                                        .child(if checked.diff_files.is_empty() {
-                                            div()
-                                                .p_3()
-                                                .text_xs()
-                                                .text_color(theme.muted_foreground)
-                                                .child("No changed files detected against target branch.")
-                                                .into_any_element()
-                                        } else {
-                                            v_flex()
-                                                .children(checked.diff_files.iter().enumerate().map(|(i, file)| {
-                                                    let (icon, color) = diff_status_style(file.status, theme);
-                                                    h_flex()
-                                                        .items_center()
-                                                        .justify_between()
-                                                        .gap_2()
-                                                        .px_2p5()
-                                                        .py_1p5()
-                                                        .when(i > 0, |row| {
-                                                            row.border_t_1().border_color(theme.border)
-                                                        })
-                                                        .child(
-                                                            h_flex()
-                                                                .flex_1()
-                                                                .min_w_0()
-                                                                .items_center()
-                                                                .gap_1p5()
-                                                                .text_color(color)
-                                                                .child(Icon::new(icon).xsmall())
-                                                                .child(
-                                                                    div()
-                                                                        .flex_1()
-                                                                        .min_w_0()
-                                                                        .font_family(theme.mono_font_family.clone())
-                                                                        .text_xs()
-                                                                        .text_color(theme.foreground)
-                                                                        .truncate()
-                                                                        .child(file.path.clone()),
-                                                                ),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .text_xs()
-                                                                .text_color(color)
-                                                                .child(file.status.label()),
-                                                        )
-                                                }))
-                                                .into_any_element()
-                                        }),
-                                ),
-                        )
-                    }),
-            )
+                    .into_any_element()
+            })
             .into_any_element()
     }
 
@@ -4006,7 +4370,11 @@ impl PrReviewerView {
                                         div()
                                             .text_xs()
                                             .text_color(theme.muted_foreground)
-                                            .child("Copilot is analyzing the repository. Comments will appear here as they are generated."),
+                                            .child(if self.is_preparing_checkout {
+                                                "Fetching PR state and setting up the repository. Review phases will begin automatically."
+                                            } else {
+                                                "Copilot is analyzing the repository. Comments will appear here as they are generated."
+                                            }),
                                     )
                                     .into_any_element()
                             } else if self.has_reviewed {
@@ -4689,30 +5057,17 @@ impl Render for PrReviewerView {
         let reset_state = self.reset_state(cx);
         let view_for_reset = cx.entity();
 
-        let body: AnyElement = if self.is_header_collapsed {
-            if let Some(checked) = self.checked_out.as_ref() {
-                self.render_collapsed_workspace(checked, cx)
-            } else {
-                h_resizable("pr-reviewer-setup-split")
-                    .child(
-                        resizable_panel()
-                            .size(px(420.))
-                            .size_range(px(330.)..px(600.))
-                            .child(self.render_selector_pane(cx)),
-                    )
-                    .child(resizable_panel().child(self.render_details_and_checkout_pane(cx)))
-                    .into_any_element()
-            }
-        } else {
-            h_resizable("pr-reviewer-setup-split")
+        let body: AnyElement = match (self.stage, self.active_session.as_ref()) {
+            (ReviewerStage::Workspace, Some(session)) => self.render_workspace_view(session, cx),
+            _ => h_resizable("pr-reviewer-setup-split")
                 .child(
                     resizable_panel()
-                        .size(px(420.))
-                        .size_range(px(330.)..px(600.))
+                        .size(px(400.))
+                        .size_range(px(330.)..px(580.))
                         .child(self.render_selector_pane(cx)),
                 )
-                .child(resizable_panel().child(self.render_details_and_checkout_pane(cx)))
-                .into_any_element()
+                .child(resizable_panel().child(self.render_setup_config_pane(cx)))
+                .into_any_element(),
         };
 
         v_flex()
@@ -4779,6 +5134,7 @@ impl Render for PrReviewerView {
                                 Button::new("pr-reload-phases")
                                     .ghost()
                                     .small()
+                                    .disabled(self.is_reviewing)
                                     .icon(Icon::new(LucideIcon::RefreshCw).small())
                                     .label("Reload Phases")
                                     .on_click(cx.listener(|this, _, _, cx| {
@@ -4977,4 +5333,50 @@ fn open_dirty_repo_dialog(message: String, window: &mut Window, cx: &mut App) {
                 ),
             )
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_phase(id: &str, status: PhaseRunStatus) -> PhaseProgress {
+        PhaseProgress {
+            id: id.to_string(),
+            title: id.to_string(),
+            group: String::new(),
+            status,
+            status_text: None,
+            reason: None,
+            comment_count: 0,
+        }
+    }
+
+    #[test]
+    fn compute_phase_progress_fraction_tracks_checkout_phases_and_completion() {
+        assert!((compute_phase_progress_fraction(&[]) - 0.0).abs() < f32::EPSILON);
+
+        let initial = vec![
+            make_phase(CHECKOUT_PHASE_ID, PhaseRunStatus::Running),
+            make_phase("p1", PhaseRunStatus::Pending),
+            make_phase("p2", PhaseRunStatus::Pending),
+            make_phase(CRITIC_PHASE_ID, PhaseRunStatus::Pending),
+        ];
+        assert!((compute_phase_progress_fraction(&initial) - 0.05).abs() < f32::EPSILON);
+
+        let after_checkout = vec![
+            make_phase(CHECKOUT_PHASE_ID, PhaseRunStatus::Completed),
+            make_phase("p1", PhaseRunStatus::Running),
+            make_phase("p2", PhaseRunStatus::Skipped),
+            make_phase(CRITIC_PHASE_ID, PhaseRunStatus::Pending),
+        ];
+        assert!((compute_phase_progress_fraction(&after_checkout) - 0.5).abs() < f32::EPSILON);
+
+        let all_done = vec![
+            make_phase(CHECKOUT_PHASE_ID, PhaseRunStatus::Completed),
+            make_phase("p1", PhaseRunStatus::Completed),
+            make_phase("p2", PhaseRunStatus::Skipped),
+            make_phase(CRITIC_PHASE_ID, PhaseRunStatus::Completed),
+        ];
+        assert!((compute_phase_progress_fraction(&all_done) - 1.0).abs() < f32::EPSILON);
+    }
 }
