@@ -12,8 +12,8 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     AnyElement, App, Context, Entity, FontWeight, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _, Subscription, Window,
-    div, hsla, img, prelude::FluentBuilder as _, px, relative,
+    MouseButton, ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _,
+    Subscription, Window, div, hsla, img, prelude::FluentBuilder as _, px, relative,
 };
 
 use crate::app_state::{ActiveView, AppState, apply_theme, refresh_copilot_status};
@@ -23,6 +23,22 @@ use crate::ui::components::render_usage_stats_toast;
 const REPORT_ISSUE_URL: &str = "https://github.com/thealternator89/stitch/issues";
 const SIDEBAR_WIDTH: f32 = 224.0;
 const USAGE_TOAST_AUTO_DISMISS: Duration = Duration::from_secs(8);
+
+/// Configures a titlebar button so the `TitleBar` drag container does not intercept its clicks on Windows.
+///
+/// `.occlude()` (`HitboxBehavior::BlockMouse`) prevents the ancestor `WindowControlArea::Drag`
+/// hitbox from matching `WM_NCHITTEST` over the button, keeping it in `HTCLIENT` for normal
+/// clicks/hover and preventing `#title-bar` from starting a window drag. `.on_mouse_down` with
+/// `cx.stop_propagation()` also guards zero-hover clicks where `WM_NCHITTEST` ran before
+/// `mouse_hit_test` updated so `WM_NCLBUTTONDOWN` is consumed instead of falling through to
+/// `DefWindowProcW`.
+fn title_bar_button(button: Button) -> Button {
+    button
+        .occlude()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+            cx.stop_propagation();
+        })
+}
 
 pub struct WorkspaceShell {
     app_state: Entity<AppState>,
@@ -95,7 +111,7 @@ impl WorkspaceShell {
                 h_flex()
                     .items_center()
                     .gap_2()
-                    .child(
+                    .child(title_bar_button(
                         Button::new("toggle-sidebar")
                             .ghost()
                             .xsmall()
@@ -104,7 +120,7 @@ impl WorkspaceShell {
                                 this.sidebar_collapsed = !this.sidebar_collapsed;
                                 cx.notify();
                             })),
-                    )
+                    ))
                     .child(
                         h_flex()
                             .items_center()
@@ -128,7 +144,7 @@ impl WorkspaceShell {
                     .items_center()
                     .gap_1p5()
                     .pr_2()
-                    .child(
+                    .child(title_bar_button(
                         Button::new("theme-mode-toggle")
                             .ghost()
                             .xsmall()
@@ -140,8 +156,8 @@ impl WorkspaceShell {
                                     cx.notify();
                                 });
                             }),
-                    )
-                    .child(
+                    ))
+                    .child(title_bar_button(
                         Button::new("report-issue")
                             .ghost()
                             .xsmall()
@@ -150,7 +166,7 @@ impl WorkspaceShell {
                             .on_click(|_, _, cx| {
                                 cx.open_url(REPORT_ISSUE_URL);
                             }),
-                    ),
+                    )),
             )
     }
 
