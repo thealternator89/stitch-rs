@@ -54,6 +54,12 @@ jobs:
       - name: Setup NSIS
         uses: nsis-dev/setup-nsis@v1
 
+      - name: Cache Copilot runtime
+        uses: actions/cache@v4
+        with:
+          path: target\copilot-runtime
+          key: copilot-runtime-windows-x86_64-${{ hashFiles('Cargo.lock') }}
+
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -93,7 +99,16 @@ jobs:
           Add-Content -Path $env:GITHUB_OUTPUT -Value "is_prerelease=$isPrerelease"
 
       - name: Build release executable
-        run: cargo build --release --target x86_64-pc-windows-msvc
+        shell: pwsh
+        env:
+          IS_VERSION_TAG: ${{ steps.version.outputs.is_version_tag }}
+        run: |
+          if ($env:IS_VERSION_TAG -eq 'true') {
+            Write-Host "Version tag detected: enabling fat LTO and single codegen unit"
+            $env:CARGO_PROFILE_RELEASE_LTO = 'true'
+            $env:CARGO_PROFILE_RELEASE_CODEGEN_UNITS = '1'
+          }
+          cargo build --release --target x86_64-pc-windows-msvc
 
       - name: Build Windows installer
         shell: pwsh
