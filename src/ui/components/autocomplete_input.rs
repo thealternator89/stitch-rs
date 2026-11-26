@@ -7,7 +7,7 @@ use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    AppContext as _, Context, Entity, EventEmitter, FontWeight, InteractiveElement as _,
+    App, AppContext as _, Context, Entity, EventEmitter, FontWeight, InteractiveElement as _,
     IntoElement, MouseButton, ParentElement as _, Render, SharedString, Styled as _, Subscription,
     Window, div, hsla, prelude::FluentBuilder as _, px,
 };
@@ -154,6 +154,30 @@ impl AutocompleteInput {
             self.direct_id_mode = mode;
             cx.notify();
         }
+    }
+
+    pub fn has_value(&self, cx: &App) -> bool {
+        !self.input_state.read(cx).value().trim().is_empty()
+            || self.selected_display.is_some()
+            || self.is_open
+            || self.is_searching
+            || !self.results.is_empty()
+            || self.search_error.is_some()
+    }
+
+    pub fn clear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.debounce_gen = self.debounce_gen.wrapping_add(1);
+        self.active_request_id = self.active_request_id.wrapping_add(1);
+        self.selected_display = None;
+        self.results.clear();
+        self.search_error = None;
+        self.is_searching = false;
+        self.is_open = false;
+        self.disabled = false;
+        self.input_state.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+        });
+        cx.notify();
     }
 
     pub fn set_disabled(&mut self, disabled: bool, cx: &mut Context<Self>) {

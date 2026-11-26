@@ -44,7 +44,10 @@ use crate::types::{
     ReviewCommentStatus, ReviewCommentType, ReviewPersona, ReviewPhase, max_parallelism_limit,
     resolve_effective_parallelism, system_cpu_count,
 };
-use crate::ui::components::{ModelDropdown, ModelDropdownEvent, ModelDropdownMode};
+use crate::ui::components::{
+    ModelDropdown, ModelDropdownEvent, ModelDropdownMode, ResetState, normalize_default_model,
+    open_reset_confirm_modal, render_tool_reset_button,
+};
 
 const CRITIC_PHASE_ID: &str = "critic-phase";
 
@@ -198,6 +201,7 @@ pub struct PrReviewerView {
     is_header_collapsed: bool,
     model_dropdown: Entity<ModelDropdown>,
     selected_model: String,
+    user_overrode_model: bool,
     cpu_count: usize,
     max_parallelism: usize,
     parallelism_slider: Entity<SliderState>,
@@ -223,6 +227,9 @@ pub struct PrReviewerView {
     expanded_rejected_comments: HashSet<String>,
     posting_comment_ids: HashSet<String>,
     comment_render_rev: u64,
+    checkout_gen: u64,
+    review_gen: u64,
+    post_gen: u64,
     review_error: Option<String>,
     post_error: Option<String>,
     _subscriptions: Vec<Subscription>,
@@ -257,11 +264,7 @@ impl PrReviewerView {
             InputState::new(window, cx).placeholder("/path/to/local/repository")
         });
 
-        let selected_model = if initial_settings.copilot_model.trim().is_empty() {
-            "auto".to_string()
-        } else {
-            initial_settings.copilot_model.trim().to_string()
-        };
+        let selected_model = normalize_default_model(&initial_settings.copilot_model);
         let model_dropdown = cx.new(|cx| {
             ModelDropdown::new(
                 app_state.clone(),
@@ -335,7 +338,14 @@ impl PrReviewerView {
         let model_sub = cx.subscribe(&model_dropdown, |this, _, event, cx| {
             let ModelDropdownEvent::Changed(model_id) = event;
             this.selected_model = model_id.clone();
+            this.user_overrode_model = true;
             cx.notify();
+        });
+
+        let custom_inst_sub = cx.subscribe(&custom_instructions_input, |_, _, event, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
         });
 
         let slider_sub = cx.subscribe(&parallelism_slider, |this, _, event, cx| {
@@ -371,7 +381,15 @@ impl PrReviewerView {
         });
 
         let state_sub = cx.observe_in(&app_state, window, |this, app_state, window, cx| {
-            let (is_active, code_ready, models, models_loading, next_personas, settings_parallel) = {
+            let (
+                is_active,
+                code_ready,
+                models,
+                models_loading,
+                next_personas,
+                settings_parallel,
+                default_model,
+            ) = {
                 let state = app_state.read(cx);
                 (
                     state.active_view == ActiveView::PrReviewer,
@@ -380,9 +398,16 @@ impl PrReviewerView {
                     state.models_loading,
                     state.settings.pr_reviewer.personas.clone(),
                     state.settings.max_parallelism,
+                    normalize_default_model(&state.settings.copilot_model),
                 )
             };
             this.reconcile_phase_models(&models, models_loading);
+            if !this.user_overrode_model && default_model != this.selected_model {
+                this.selected_model = default_model.clone();
+                this.model_dropdown.update(cx, |dd, cx| {
+                    dd.set_selected_model(default_model, window, cx);
+                });
+            }
             if next_personas != this.personas {
                 this.personas = next_personas;
                 if this.selected_persona != "None"
@@ -440,6 +465,7 @@ impl PrReviewerView {
             is_header_collapsed: false,
             model_dropdown,
             selected_model,
+            user_overrode_model: false,
             cpu_count,
             max_parallelism,
             parallelism_slider,
@@ -469,6 +495,9 @@ impl PrReviewerView {
             expanded_rejected_comments: HashSet::new(),
             posting_comment_ids: HashSet::new(),
             comment_render_rev: 0,
+            checkout_gen: 0,
+            review_gen: 0,
+            post_gen: 0,
             review_error: None,
             post_error: None,
             _subscriptions: vec![
@@ -476,6 +505,7 @@ impl PrReviewerView {
                 manual_sub,
                 repo_sub,
                 model_sub,
+                custom_inst_sub,
                 slider_sub,
                 persona_sub,
                 state_sub,
@@ -690,6 +720,9 @@ impl PrReviewerView {
         if let Some(cancel_tx) = self.review_cancel_tx.take() {
             let _ = cancel_tx.send(true);
         }
+        self.review_gen = self.review_gen.wrapping_add(1);
+        self.checkout_gen = self.checkout_gen.wrapping_add(1);
+        self.post_gen = self.post_gen.wrapping_add(1);
 
         let needs_details =
             pr.source_branch.trim().is_empty() || pr.target_branch.trim().is_empty();
@@ -875,6 +908,8 @@ impl PrReviewerView {
         self.loading_status = Some("Running repository checks and checking out PR...".to_string());
         self.checkout_error = None;
         self.status_notice = None;
+        self.checkout_gen = self.checkout_gen.wrapping_add(1);
+        let co_gen = self.checkout_gen;
         self.app_state.update(cx, |state, cx| {
             state.set_task_status(
                 ActiveView::PrReviewer,
@@ -885,6 +920,7 @@ impl PrReviewerView {
         cx.notify();
 
         let pr_service = Arc::clone(&self.pr_service);
+        let pr_service_for_stale = Arc::clone(&self.pr_service);
         let git = Arc::clone(&self.git_service);
         let view = cx.entity();
         let app_state = self.app_state.clone();
@@ -912,6 +948,15 @@ impl PrReviewerView {
                     let mut dirty_message: Option<String> = None;
 
                     view.update(cx, |this, cx| {
+                        if this.checkout_gen != co_gen {
+                            if let Ok(Ok((verified, _))) = res {
+                                let stale_service = Arc::clone(&pr_service_for_stale);
+                                runtime().spawn(async move {
+                                    let _ = stale_service.cleanup_checkout(&verified.path).await;
+                                });
+                            }
+                            return;
+                        }
                         this.is_loading_checkout = false;
                         this.loading_status = None;
                         app_state.update(cx, |state, cx| {
@@ -983,6 +1028,7 @@ impl PrReviewerView {
         };
         let pr_service = Arc::clone(&self.pr_service);
         let view = cx.entity();
+        let co_gen = self.checkout_gen;
 
         cx.spawn(async move |_, cx| {
             let res =
@@ -990,6 +1036,9 @@ impl PrReviewerView {
                     .await;
 
             let _ = view.update(cx, |this, cx| {
+                if this.checkout_gen != co_gen {
+                    return;
+                }
                 match res {
                     Ok(Ok(())) => {
                         this.checked_out = None;
@@ -1139,6 +1188,8 @@ impl PrReviewerView {
 
         let (cancel_tx, cancel_rx) = watch::channel(false);
         self.review_cancel_tx = Some(cancel_tx);
+        self.review_gen = self.review_gen.wrapping_add(1);
+        let run_gen = self.review_gen;
         let (pipeline_tx, mut pipeline_rx) = mpsc::unbounded_channel::<ReviewPipelineEvent>();
 
         let pr_id_for_status = checked.pr.id.clone();
@@ -1274,6 +1325,9 @@ impl PrReviewerView {
                     let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
                     let _ = cx.update(|window, cx| {
                         view.update(cx, |this, cx| {
+                            if this.review_gen != run_gen {
+                                return;
+                            }
                             this.last_status_time = Some(timestamp);
                             match pipeline_event {
                                 ReviewPipelineEvent::Review(event) => match event {
@@ -1634,6 +1688,9 @@ impl PrReviewerView {
 
                 let _ = cx.update(|_, cx| {
                     view.update(cx, |this, cx| {
+                        if this.review_gen != run_gen {
+                            return;
+                        }
                         if this.is_reviewing || this.is_critiquing {
                             this.is_reviewing = false;
                             this.is_critiquing = false;
@@ -1655,6 +1712,220 @@ impl PrReviewerView {
             let _ = cancel_tx.send(true);
             cx.notify();
         }
+    }
+
+    fn reset_state(&self, cx: &App) -> ResetState {
+        if self.is_reviewing
+            || self.is_critiquing
+            || self.is_loading_checkout
+            || !self.posting_comment_ids.is_empty()
+        {
+            return ResetState::NeedsConfirmation { is_running: true };
+        }
+        if self.checked_out.is_some()
+            || self.has_reviewed
+            || self.has_critiqued
+            || !self.comments.is_empty()
+            || !self.critiqued_comments.is_empty()
+        {
+            return ResetState::NeedsConfirmation { is_running: false };
+        }
+
+        let (default_critic, models, models_loading) = {
+            let state = self.app_state.read(cx);
+            (
+                state.settings.pr_reviewer.critic_enabled,
+                state.copilot_models.clone(),
+                state.models_loading,
+            )
+        };
+        let phases_modified = self.phases.iter().any(|item| {
+            let expected_enabled = !is_phase_model_missing(&item.phase, &models, models_loading);
+            item.enabled != expected_enabled
+        });
+
+        let has_dirty_inputs = self.active_tab != PrSelectorTab::Assigned
+            || !self.search_input.read(cx).value().trim().is_empty()
+            || !self.manual_pr_input.read(cx).value().trim().is_empty()
+            || !self.repo_path_input.read(cx).value().trim().is_empty()
+            || self.selected_pr.is_some()
+            || self.user_overrode_model
+            || self.user_overrode_parallelism
+            || self.selected_persona != "None"
+            || !self
+                .custom_instructions_input
+                .read(cx)
+                .value()
+                .trim()
+                .is_empty()
+            || self.critic_enabled != default_critic
+            || phases_modified
+            || self.checkout_error.is_some()
+            || self.review_error.is_some()
+            || self.post_error.is_some()
+            || self.status_notice.is_some()
+            || self.pr_list_error.is_some();
+
+        if has_dirty_inputs {
+            ResetState::DirtyInputsOnly
+        } else {
+            ResetState::Clean
+        }
+    }
+
+    fn request_reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.reset_state(cx) {
+            ResetState::Clean => {}
+            ResetState::DirtyInputsOnly => self.reset(window, cx),
+            ResetState::NeedsConfirmation { is_running } => {
+                let view = cx.entity();
+                let detail = if is_running {
+                    "This will cancel the active PR operation, clean up any temporary checkout or worktree, and clear all review comments and inputs."
+                } else if self
+                    .checked_out
+                    .as_ref()
+                    .is_some_and(|c| !c.checkout_cleaned_up)
+                {
+                    "This will clean up the active PR checkout/worktree and clear all review comments, selections, and tool overrides."
+                } else {
+                    "This will clear the current PR review workspace, generated comments, selections, and tool overrides."
+                };
+                open_reset_confirm_modal(
+                    "PR Reviewer",
+                    is_running,
+                    detail,
+                    move |window, cx| {
+                        view.update(cx, |this, cx| {
+                            this.reset(window, cx);
+                        });
+                    },
+                    window,
+                    cx,
+                );
+            }
+        }
+    }
+
+    fn reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.pr_detail_gen = self.pr_detail_gen.wrapping_add(1);
+        self.checkout_gen = self.checkout_gen.wrapping_add(1);
+        self.review_gen = self.review_gen.wrapping_add(1);
+        self.post_gen = self.post_gen.wrapping_add(1);
+
+        let was_reviewing = if let Some(cancel_tx) = self.review_cancel_tx.take() {
+            let _ = cancel_tx.send(true);
+            true
+        } else {
+            false
+        };
+
+        if let Some(checked) = self.checked_out.take()
+            && !checked.checkout_cleaned_up
+            && !was_reviewing
+        {
+            let pr_service = Arc::clone(&self.pr_service);
+            let repo_path = checked.repo_path;
+            runtime().spawn(async move {
+                if let Err(err) = pr_service.cleanup_checkout(&repo_path).await {
+                    eprintln!("Warning: failed to clean up PR checkout on reset: {err}");
+                }
+            });
+        }
+
+        let (default_model, default_critic, default_parallelism, code_ready, models, models_loading) = {
+            let state = self.app_state.read(cx);
+            (
+                normalize_default_model(&state.settings.copilot_model),
+                state.settings.pr_reviewer.critic_enabled,
+                resolve_effective_parallelism(None, state.settings.max_parallelism, self.cpu_count),
+                is_code_source_configured(&state.settings),
+                state.copilot_models.clone(),
+                state.models_loading,
+            )
+        };
+
+        self.search_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.manual_pr_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.repo_path_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.custom_instructions_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+
+        self.selected_pr = None;
+        self.loading_pr_details = false;
+        self.is_loading_checkout = false;
+        self.loading_status = None;
+        self.checkout_error = None;
+        self.status_notice = None;
+        self.review_error = None;
+        self.post_error = None;
+        self.pr_list_error = None;
+        self.is_header_collapsed = false;
+        self.repo_path_modified = false;
+        self.show_diff_files = false;
+
+        self.is_reviewing = false;
+        self.is_critiquing = false;
+        self.has_reviewed = false;
+        self.has_critiqued = false;
+        self.phase_progress.clear();
+        self.last_status_time = None;
+        self.last_usage = None;
+        self.last_db_session_id = None;
+        self.comments.clear();
+        self.critiqued_comments.clear();
+        self.collapsed_comments.clear();
+        self.expanded_rejected_comments.clear();
+        self.posting_comment_ids.clear();
+
+        self.critic_enabled = default_critic;
+        self.comment_view_mode = if default_critic {
+            CommentViewMode::Critiqued
+        } else {
+            CommentViewMode::Unvalidated
+        };
+
+        self.user_overrode_model = false;
+        self.selected_model = default_model.clone();
+        self.model_dropdown.update(cx, |dd, cx| {
+            dd.set_selected_model(default_model, window, cx);
+        });
+
+        self.user_overrode_parallelism = false;
+        self.max_parallelism = default_parallelism;
+        self.parallelism_slider.update(cx, |slider, cx| {
+            slider.set_value(default_parallelism as f32, window, cx);
+        });
+
+        self.selected_persona = "None".to_string();
+        let none_persona = "None".to_string();
+        self.persona_select.update(cx, |select, cx| {
+            select.set_selected_value(&none_persona, window, cx);
+        });
+
+        for item in &mut self.phases {
+            item.enabled = !is_phase_model_missing(&item.phase, &models, models_loading);
+        }
+
+        if self.active_tab != PrSelectorTab::Assigned {
+            self.prs_request_gen = self.prs_request_gen.wrapping_add(1);
+            self.active_tab = PrSelectorTab::Assigned;
+            self.pr_list.clear();
+            if code_ready {
+                self.load_project_prs(window, cx);
+            } else {
+                self.is_loading_prs = false;
+            }
+        }
+
+        self.app_state.update(cx, |state, cx| {
+            state.set_task_status(ActiveView::PrReviewer, None);
+            state.set_task_progress(ActiveView::PrReviewer, None);
+            cx.notify();
+        });
+        cx.notify();
     }
 
     fn handle_post_comment(
@@ -1698,6 +1969,7 @@ impl PrReviewerView {
 
         self.post_error = None;
         self.posting_comment_ids.insert(comment_id.clone());
+        let post_gen = self.post_gen;
         cx.notify();
 
         let view = cx.entity();
@@ -1710,6 +1982,9 @@ impl PrReviewerView {
             .await;
 
             let _ = view.update(cx, |this, cx| {
+                if this.post_gen != post_gen {
+                    return;
+                }
                 this.posting_comment_ids.remove(&comment_id);
                 match res {
                     Ok(Ok(())) => {
@@ -4411,6 +4686,8 @@ impl Render for PrReviewerView {
             )
         };
         let app_state_for_header = self.app_state.clone();
+        let reset_state = self.reset_state(cx);
+        let view_for_reset = cx.entity();
 
         let body: AnyElement = if self.is_header_collapsed {
             if let Some(checked) = self.checked_out.as_ref() {
@@ -4525,7 +4802,16 @@ impl Render for PrReviewerView {
                                             });
                                         }),
                                 )
-                            }),
+                            })
+                            .child(render_tool_reset_button(
+                                "pr-header-reset",
+                                reset_state,
+                                move |window, cx| {
+                                    view_for_reset.update(cx, |this, cx| {
+                                        this.request_reset(window, cx);
+                                    });
+                                },
+                            )),
                     ),
             )
             .child(div().flex_1().min_h_0().w_full().child(body))

@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use gpui_kit::assets::IconName as LucideIcon;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
+use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::spinner::Spinner;
@@ -22,7 +22,8 @@ use crate::features::tshirt_estimator::service::{
 };
 use crate::infrastructure::notifications::NotificationService;
 use crate::ui::components::{
-    ModelDropdown, ModelDropdownEvent, ModelDropdownMode, open_timeout_modal,
+    ModelDropdown, ModelDropdownEvent, ModelDropdownMode, ResetState, normalize_default_model,
+    open_reset_confirm_modal, open_timeout_modal, render_tool_reset_button,
 };
 
 #[derive(Debug, Clone)]
@@ -46,6 +47,8 @@ pub struct TShirtEstimatorView {
     status_logs: Vec<String>,
     logs_expanded: bool,
     copied: bool,
+    copy_generation: u64,
+    estimation_gen: u64,
     active_handle: Option<ActiveEstimationHandle>,
     terminal_scroll_handle: ScrollHandle,
     _subscriptions: Vec<Subscription>,
@@ -58,11 +61,7 @@ impl TShirtEstimatorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let initial_model = if initial_model.trim().is_empty() {
-            "auto".to_string()
-        } else {
-            initial_model.trim().to_string()
-        };
+        let initial_model = normalize_default_model(&initial_model);
 
         let description_input = cx.new(|cx| {
             TextareaState::new(window, cx)
@@ -92,7 +91,8 @@ impl TShirtEstimatorView {
 
         let state_sub = cx.observe_in(&app_state, window, |this, app_state, window, cx| {
             if !this.user_overrode_model {
-                let default_model = app_state.read(cx).settings.copilot_model.clone();
+                let default_model =
+                    normalize_default_model(&app_state.read(cx).settings.copilot_model);
                 if default_model != this.selected_model {
                     this.selected_model = default_model.clone();
                     this.model_dropdown.update(cx, |dd, cx| {
@@ -110,6 +110,22 @@ impl TShirtEstimatorView {
             cx.notify();
         });
 
+        let desc_sub = cx.subscribe(&description_input, |_, _, event, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        });
+        let repo_sub = cx.subscribe(&repo_path_input, |_, _, event, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        });
+        let branch_sub = cx.subscribe(&branch_input, |_, _, event, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        });
+
         Self {
             app_state,
             description_input,
@@ -123,9 +139,11 @@ impl TShirtEstimatorView {
             status_logs: Vec::new(),
             logs_expanded: false,
             copied: false,
+            copy_generation: 0,
+            estimation_gen: 0,
             active_handle: None,
             terminal_scroll_handle: ScrollHandle::new(),
-            _subscriptions: vec![state_sub, model_sub],
+            _subscriptions: vec![state_sub, model_sub, desc_sub, repo_sub, branch_sub],
         }
     }
 
@@ -212,6 +230,8 @@ impl TShirtEstimatorView {
         self.logs_expanded = false;
         self.copied = false;
         self.stage = EstimatorStage::Estimating;
+        self.estimation_gen = self.estimation_gen.wrapping_add(1);
+        let run_gen = self.estimation_gen;
 
         self.app_state.update(cx, |state, cx| {
             state.set_task_status(
@@ -242,7 +262,11 @@ impl TShirtEstimatorView {
                     let _ = cx.update(|window, cx| {
                         let mut open_timeout_secs: Option<u64> = None;
 
-                        view.update(cx, |this, cx| match event {
+                        view.update(cx, |this, cx| {
+                            if this.estimation_gen != run_gen {
+                                return;
+                            }
+                            match event {
                             EstimationStreamEvent::Status(line) => {
                                 this.status_logs.push(line.clone());
                                 this.terminal_scroll_handle.scroll_to_bottom();
@@ -308,6 +332,7 @@ impl TShirtEstimatorView {
                                 });
                                 cx.notify();
                             }
+                            }
                         });
 
                         if let Some(secs) = open_timeout_secs {
@@ -339,12 +364,84 @@ impl TShirtEstimatorView {
         }
     }
 
-    fn reset_to_idle(&mut self, cx: &mut Context<Self>) {
+    fn reset_state(&self, cx: &App) -> ResetState {
+        match self.stage {
+            EstimatorStage::Estimating => ResetState::NeedsConfirmation { is_running: true },
+            EstimatorStage::Completed(_) => ResetState::NeedsConfirmation { is_running: false },
+            EstimatorStage::Idle | EstimatorStage::Error(_) => {
+                let has_dirty_inputs = !self.description_input.read(cx).value().trim().is_empty()
+                    || !self.repo_path_input.read(cx).value().trim().is_empty()
+                    || self.branch_input.read(cx).value().trim() != "develop"
+                    || self.user_overrode_model
+                    || matches!(self.stage, EstimatorStage::Error(_))
+                    || self.validation_error.is_some()
+                    || !self.status_logs.is_empty();
+                if has_dirty_inputs {
+                    ResetState::DirtyInputsOnly
+                } else {
+                    ResetState::Clean
+                }
+            }
+        }
+    }
+
+    fn request_reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.reset_state(cx) {
+            ResetState::Clean => {}
+            ResetState::DirtyInputsOnly => self.reset(window, cx),
+            ResetState::NeedsConfirmation { is_running } => {
+                let view = cx.entity();
+                let detail = if is_running {
+                    "This will cancel the running estimation, clean up any temporary worktree, and clear all inputs and logs."
+                } else {
+                    "This will clear the current estimation result, activity log, and all form inputs."
+                };
+                open_reset_confirm_modal(
+                    "T-Shirt Estimator",
+                    is_running,
+                    detail,
+                    move |window, cx| {
+                        view.update(cx, |this, cx| {
+                            this.reset(window, cx);
+                        });
+                    },
+                    window,
+                    cx,
+                );
+            }
+        }
+    }
+
+    fn reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.estimation_gen = self.estimation_gen.wrapping_add(1);
+        self.copy_generation = self.copy_generation.wrapping_add(1);
+        if let Some(handle) = self.active_handle.take() {
+            handle.cancel();
+        }
+        self.description_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.repo_path_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.branch_input
+            .update(cx, |input, cx| input.set_value("develop", window, cx));
+
+        let default_model =
+            normalize_default_model(&self.app_state.read(cx).settings.copilot_model);
+        self.user_overrode_model = false;
+        self.selected_model = default_model.clone();
+        self.model_dropdown.update(cx, |dd, cx| {
+            dd.set_selected_model(default_model, window, cx);
+        });
+
         self.stage = EstimatorStage::Idle;
+        self.validation_error = None;
         self.status_logs.clear();
         self.logs_expanded = false;
         self.copied = false;
-        self.validation_error = None;
+        self.app_state.update(cx, |state, cx| {
+            state.set_task_status(ActiveView::TShirtEstimator, None);
+            cx.notify();
+        });
         cx.notify();
     }
 
@@ -356,14 +453,18 @@ impl TShirtEstimatorView {
         );
         cx.write_to_clipboard(ClipboardItem::new_string(text));
         self.copied = true;
+        self.copy_generation = self.copy_generation.wrapping_add(1);
+        let copy_gen = self.copy_generation;
         cx.notify();
 
         let view = cx.entity();
         cx.spawn(async move |_, cx| {
             cx.background_executor().timer(Duration::from_secs(2)).await;
             let _ = view.update(cx, |this, cx| {
-                this.copied = false;
-                cx.notify();
+                if this.copy_generation == copy_gen {
+                    this.copied = false;
+                    cx.notify();
+                }
             });
         })
         .detach();
@@ -681,15 +782,6 @@ impl TShirtEstimatorView {
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 this.copy_result(&result_for_copy, cx);
                                             })),
-                                    )
-                                    .child(
-                                        Button::new("tshirt-start-over")
-                                            .small()
-                                            .icon(Icon::new(LucideIcon::RotateCw).small())
-                                            .label("Start Over")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.reset_to_idle(cx);
-                                            })),
                                     ),
                             ),
                     )
@@ -888,15 +980,6 @@ impl TShirtEstimatorView {
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 this.start_estimation(window, cx);
                                             })),
-                                    )
-                                    .child(
-                                        Button::new("tshirt-error-reset")
-                                            .ghost()
-                                            .small()
-                                            .label("Start Over")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.reset_to_idle(cx);
-                                            })),
                                     ),
                             ),
                     )
@@ -926,6 +1009,8 @@ impl Render for TShirtEstimatorView {
         let accent_fg = theme.accent_foreground;
         let muted_fg = theme.muted_foreground;
         let radius = theme.radius;
+        let reset_state = self.reset_state(cx);
+        let view_for_reset = cx.entity();
 
         v_flex()
             .size_full()
@@ -970,7 +1055,16 @@ impl Render for TShirtEstimatorView {
                                             .child(ActiveView::TShirtEstimator.subtitle()),
                                     ),
                             ),
-                    ),
+                    )
+                    .child(render_tool_reset_button(
+                        "tshirt-header-reset",
+                        reset_state,
+                        move |window, cx| {
+                            view_for_reset.update(cx, |this, cx| {
+                                this.request_reset(window, cx);
+                            });
+                        },
+                    )),
             )
             .child(
                 div().flex_1().min_h_0().w_full().child(

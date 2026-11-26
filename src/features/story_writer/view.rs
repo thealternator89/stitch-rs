@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use gpui_kit::assets::IconName as LucideIcon;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
+use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::spinner::Spinner;
@@ -11,7 +11,7 @@ use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Sizable as _, Size, Theme, h_flex, v_flex,
 };
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, Entity, FontWeight, IntoElement, ParentElement as _,
+    AnyElement, App, AppContext as _, Context, Entity, FontWeight, IntoElement, ParentElement as _,
     Render, Styled as _, Subscription, Window, div, hsla, prelude::FluentBuilder as _, px,
 };
 
@@ -27,7 +27,8 @@ use crate::infrastructure::runtime::spawn_tokio;
 use crate::types::{AppSettings, CopilotUsage, DocPageData, StoryData, TicketData};
 use crate::ui::components::{
     AutocompleteEvent, AutocompleteInput, AutocompleteOption, DirectIdMode, ModelDropdown,
-    ModelDropdownEvent, ModelDropdownMode, open_timeout_modal,
+    ModelDropdownEvent, ModelDropdownMode, ResetState, normalize_default_model,
+    open_reset_confirm_modal, open_timeout_modal, render_tool_reset_button,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,11 +94,7 @@ impl StoryWriterView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let initial_model = if initial_settings.copilot_model.trim().is_empty() {
-            "auto".to_string()
-        } else {
-            initial_settings.copilot_model.trim().to_string()
-        };
+        let initial_model = normalize_default_model(&initial_settings.copilot_model);
 
         let initial_feature_mode = feature_id_mode_for(initial_settings);
 
@@ -144,7 +141,10 @@ impl StoryWriterView {
         let state_sub = cx.observe_in(&app_state, window, |this, app_state, window, cx| {
             let (default_model, next_mode) = {
                 let settings = &app_state.read(cx).settings;
-                (settings.copilot_model.clone(), feature_id_mode_for(settings))
+                (
+                    normalize_default_model(&settings.copilot_model),
+                    feature_id_mode_for(settings),
+                )
             };
             if !this.user_overrode_model && default_model != this.selected_model {
                 this.selected_model = default_model.clone();
@@ -173,6 +173,12 @@ impl StoryWriterView {
             cx.subscribe_in(&feature_search, window, |this, _, event, window, cx| {
                 this.handle_feature_autocomplete_event(event.clone(), window, cx);
             });
+
+        let context_sub = cx.subscribe(&additional_context_input, |_, _, event, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        });
 
         Self {
             app_state,
@@ -203,8 +209,115 @@ impl StoryWriterView {
             created_ticket_ids: HashMap::new(),
             validation_error: None,
             status_notice: None,
-            _subscriptions: vec![state_sub, model_sub, page_sub, feature_sub],
+            _subscriptions: vec![state_sub, model_sub, page_sub, feature_sub, context_sub],
         }
+    }
+
+    fn reset_state(&self, cx: &App) -> ResetState {
+        let any_creating = self
+            .stories
+            .iter()
+            .any(|s| s.status == StoryCardStatus::Creating);
+        if self.is_generating || any_creating {
+            return ResetState::NeedsConfirmation { is_running: true };
+        }
+        if !self.stories.is_empty() {
+            return ResetState::NeedsConfirmation { is_running: false };
+        }
+        let has_dirty_inputs = self.page_search.read(cx).has_value(cx)
+            || self.feature_search.read(cx).has_value(cx)
+            || self.selected_page_id.is_some()
+            || self.fetched_page.is_some()
+            || self.fetching_page
+            || self.selected_feature_id.is_some()
+            || self.fetched_feature.is_some()
+            || self.fetching_feature
+            || !self
+                .additional_context_input
+                .read(cx)
+                .value()
+                .trim()
+                .is_empty()
+            || self.user_overrode_model
+            || self.validation_error.is_some()
+            || self.status_notice.is_some();
+        if has_dirty_inputs {
+            ResetState::DirtyInputsOnly
+        } else {
+            ResetState::Clean
+        }
+    }
+
+    fn request_reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.reset_state(cx) {
+            ResetState::Clean => {}
+            ResetState::DirtyInputsOnly => self.reset(window, cx),
+            ResetState::NeedsConfirmation { is_running } => {
+                let view = cx.entity();
+                let detail = if is_running {
+                    "This will cancel the active operation and clear all drafted stories, edits, and selected Confluence/Feature inputs."
+                } else {
+                    "This will clear all generated stories, unsaved edits, and selected Confluence/Feature inputs."
+                };
+                open_reset_confirm_modal(
+                    "Story Writer",
+                    is_running,
+                    detail,
+                    move |window, cx| {
+                        view.update(cx, |this, cx| {
+                            this.reset(window, cx);
+                        });
+                    },
+                    window,
+                    cx,
+                );
+            }
+        }
+    }
+
+    fn reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.generation_id = self.generation_id.wrapping_add(1);
+        self.page_fetch_gen = self.page_fetch_gen.wrapping_add(1);
+        self.feature_fetch_gen = self.feature_fetch_gen.wrapping_add(1);
+        if let Some(handle) = self.active_handle.take() {
+            handle.cancel();
+        }
+        self.page_search.update(cx, |input, cx| input.clear(window, cx));
+        self.feature_search
+            .update(cx, |input, cx| input.clear(window, cx));
+        self.page_search_cache.clear();
+        self.selected_page_id = None;
+        self.fetched_page = None;
+        self.fetching_page = false;
+        self.feature_search_cache.clear();
+        self.selected_feature_id = None;
+        self.fetched_feature = None;
+        self.fetching_feature = false;
+        self.additional_context_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+
+        let default_model =
+            normalize_default_model(&self.app_state.read(cx).settings.copilot_model);
+        self.user_overrode_model = false;
+        self.selected_model = default_model.clone();
+        self.model_dropdown.update(cx, |dd, cx| {
+            dd.set_selected_model(default_model, window, cx);
+        });
+
+        self.stories.clear();
+        self.is_generating = false;
+        self.generation_usage = None;
+        self.last_db_session_id = None;
+        self.card_errors.clear();
+        self.created_ticket_ids.clear();
+        self.validation_error = None;
+        self.status_notice = None;
+
+        self.app_state.update(cx, |state, cx| {
+            state.set_task_status(ActiveView::StoryWriter, None);
+            cx.notify();
+        });
+        cx.notify();
     }
 
     pub fn upsert_story(&mut self, story: StoryData, cx: &mut Context<Self>) {
@@ -1921,6 +2034,8 @@ impl Render for StoryWriterView {
                 _ => false,
             };
         let app_state_for_header = self.app_state.clone();
+        let reset_state = self.reset_state(cx);
+        let view_for_reset = cx.entity();
 
         v_flex()
             .size_full()
@@ -1969,21 +2084,38 @@ impl Render for StoryWriterView {
                                     ),
                             ),
                     )
-                    .when(!connectors_ready, |header| {
-                        header.child(
-                            Button::new("story-header-connectors")
-                                .ghost()
-                                .small()
-                                .icon(Icon::new(LucideIcon::Plug).small())
-                                .label("Connectors")
-                                .on_click(move |_, _, cx| {
-                                    app_state_for_header.update(cx, |state, cx| {
-                                        state.navigate_to_settings_tab(SettingsTab::Connectors, cx);
-                                        cx.notify();
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .when(!connectors_ready, |header| {
+                                header.child(
+                                    Button::new("story-header-connectors")
+                                        .ghost()
+                                        .small()
+                                        .icon(Icon::new(LucideIcon::Plug).small())
+                                        .label("Connectors")
+                                        .on_click(move |_, _, cx| {
+                                            app_state_for_header.update(cx, |state, cx| {
+                                                state.navigate_to_settings_tab(
+                                                    SettingsTab::Connectors,
+                                                    cx,
+                                                );
+                                                cx.notify();
+                                            });
+                                        }),
+                                )
+                            })
+                            .child(render_tool_reset_button(
+                                "story-header-reset",
+                                reset_state,
+                                move |window, cx| {
+                                    view_for_reset.update(cx, |this, cx| {
+                                        this.request_reset(window, cx);
                                     });
-                                }),
-                        )
-                    }),
+                                },
+                            )),
+                    ),
             )
             .child(
                 div().flex_1().min_h_0().w_full().child(

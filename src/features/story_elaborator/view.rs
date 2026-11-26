@@ -14,9 +14,9 @@ use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Sizable as _, Size, Theme, h_flex, v_flex,
 };
 use gpui_kit::{
-    AnyElement, AppContext as _, ClipboardItem, Context, Entity, FontWeight, InteractiveElement as _,
-    IntoElement, ParentElement as _, PathPromptOptions, Render, ScrollHandle,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, hsla,
+    AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, FontWeight,
+    InteractiveElement as _, IntoElement, ParentElement as _, PathPromptOptions, Render,
+    ScrollHandle, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, hsla,
     prelude::FluentBuilder as _, px,
 };
 use tokio::sync::mpsc;
@@ -35,7 +35,8 @@ use crate::infrastructure::runtime::{runtime, spawn_tokio};
 use crate::types::{AppSettings, CopilotUsage, TicketData};
 use crate::ui::components::{
     AutocompleteEvent, AutocompleteInput, AutocompleteOption, DirectIdMode, ModelDropdown,
-    ModelDropdownEvent, ModelDropdownMode, open_timeout_modal,
+    ModelDropdownEvent, ModelDropdownMode, ResetState, normalize_default_model,
+    open_reset_confirm_modal, open_timeout_modal, render_tool_reset_button,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +109,7 @@ pub struct StoryElaboratorView {
     active_db_session_id: Option<i64>,
     is_posting: bool,
     publish_feedback: Option<Result<String, String>>,
+    publish_gen: u64,
     copied: bool,
     copy_generation: u64,
     validation_error: Option<String>,
@@ -126,11 +128,7 @@ impl StoryElaboratorView {
         cx: &mut Context<Self>,
     ) -> Self {
         let service = Arc::new(StoryElaboratorService::new(copilot_service, git_service));
-        let initial_model = if initial_settings.copilot_model.trim().is_empty() {
-            "auto".to_string()
-        } else {
-            initial_settings.copilot_model.trim().to_string()
-        };
+        let initial_model = normalize_default_model(&initial_settings.copilot_model);
 
         let initial_mode = ticket_id_mode_for(initial_settings);
         let ticket_search = cx.new(|cx| {
@@ -181,7 +179,10 @@ impl StoryElaboratorView {
         let state_sub = cx.observe_in(&app_state, window, |this, app_state, window, cx| {
             let (default_model, next_mode) = {
                 let settings = &app_state.read(cx).settings;
-                (settings.copilot_model.clone(), ticket_id_mode_for(settings))
+                (
+                    normalize_default_model(&settings.copilot_model),
+                    ticket_id_mode_for(settings),
+                )
             };
             if !this.user_overrode_model && default_model != this.selected_model {
                 this.selected_model = default_model.clone();
@@ -206,6 +207,22 @@ impl StoryElaboratorView {
             cx.subscribe_in(&ticket_search, window, |this, _, event, window, cx| {
                 this.handle_ticket_autocomplete_event(event.clone(), window, cx);
             });
+
+        let repo_sub = cx.subscribe(&repo_path_input, |_, _, event, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        });
+        let branch_sub = cx.subscribe(&branch_input, |_, _, event, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        });
+        let context_sub = cx.subscribe(&additional_context_input, |_, _, event, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        });
 
         let reply_sub = cx.subscribe_in(&reply_input, window, |this, _, event, window, cx| {
             match event {
@@ -259,12 +276,22 @@ impl StoryElaboratorView {
             active_db_session_id: None,
             is_posting: false,
             publish_feedback: None,
+            publish_gen: 0,
             copied: false,
             copy_generation: 0,
             validation_error: None,
             status_notice: None,
             last_retry_turn: None,
-            _subscriptions: vec![state_sub, model_sub, ticket_sub, reply_sub, refine_sub],
+            _subscriptions: vec![
+                state_sub,
+                model_sub,
+                ticket_sub,
+                repo_sub,
+                branch_sub,
+                context_sub,
+                reply_sub,
+                refine_sub,
+            ],
         }
     }
 
@@ -968,6 +995,96 @@ impl StoryElaboratorView {
         cx.notify();
     }
 
+    fn reset_state(&self, cx: &App) -> ResetState {
+        if self.is_generating || self.is_posting {
+            return ResetState::NeedsConfirmation { is_running: true };
+        }
+        if self.stage != ElaboratorStage::Idle
+            || !self.plan_markdown.is_empty()
+            || !self.feed.is_empty()
+        {
+            return ResetState::NeedsConfirmation { is_running: false };
+        }
+        let has_dirty_inputs = self.ticket_search.read(cx).has_value(cx)
+            || self.selected_ticket_id.is_some()
+            || self.fetched_ticket.is_some()
+            || self.fetching_ticket
+            || !self.repo_path_input.read(cx).value().trim().is_empty()
+            || self.branch_input.read(cx).value().trim() != "develop"
+            || !self
+                .additional_context_input
+                .read(cx)
+                .value()
+                .trim()
+                .is_empty()
+            || self.user_overrode_model
+            || self.validation_error.is_some()
+            || self.status_notice.is_some()
+            || self.publish_feedback.is_some();
+        if has_dirty_inputs {
+            ResetState::DirtyInputsOnly
+        } else {
+            ResetState::Clean
+        }
+    }
+
+    fn request_reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.reset_state(cx) {
+            ResetState::Clean => {}
+            ResetState::DirtyInputsOnly => self.reset(window, cx),
+            ResetState::NeedsConfirmation { is_running } => {
+                let view = cx.entity();
+                let detail = if is_running {
+                    "This will cancel the active elaboration session, clean up any temporary worktree, and clear all Q&A history, plans, and form inputs."
+                } else {
+                    "This will end the current elaboration session and clear the Q&A history, implementation plan, and all form inputs."
+                };
+                open_reset_confirm_modal(
+                    "Story Elaborator",
+                    is_running,
+                    detail,
+                    move |window, cx| {
+                        view.update(cx, |this, cx| {
+                            this.reset(window, cx);
+                        });
+                    },
+                    window,
+                    cx,
+                );
+            }
+        }
+    }
+
+    fn reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.publish_gen = self.publish_gen.wrapping_add(1);
+        self.copy_generation = self.copy_generation.wrapping_add(1);
+        self.stop_and_reset(false, window, cx);
+
+        self.ticket_search
+            .update(cx, |input, cx| input.clear(window, cx));
+        self.ticket_search_cache.clear();
+        self.selected_ticket_id = None;
+        self.fetched_ticket = None;
+        self.fetching_ticket = false;
+        self.repo_path_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.branch_input
+            .update(cx, |input, cx| input.set_value("develop", window, cx));
+        self.additional_context_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+
+        let default_model =
+            normalize_default_model(&self.app_state.read(cx).settings.copilot_model);
+        self.user_overrode_model = false;
+        self.selected_model = default_model.clone();
+        self.model_dropdown.update(cx, |dd, cx| {
+            dd.set_selected_model(default_model, window, cx);
+        });
+
+        self.status_notice = None;
+        cx.notify();
+    }
+
     fn push_status_item(&mut self, text: String, cx: &mut Context<Self>) {
         self.feed.push(FeedItem::Status { text });
         self.feed_scroll_handle.scroll_to_bottom();
@@ -1059,6 +1176,8 @@ impl StoryElaboratorView {
 
         self.is_posting = true;
         self.publish_feedback = None;
+        self.publish_gen = self.publish_gen.wrapping_add(1);
+        let pub_gen = self.publish_gen;
         self.app_state.update(cx, |state, cx| {
             state.set_task_status(
                 ActiveView::StoryElaborator,
@@ -1089,6 +1208,9 @@ impl StoryElaboratorView {
 
                 let _ = cx.update(|_, cx| {
                     view.update(cx, |this, cx| {
+                        if this.publish_gen != pub_gen {
+                            return;
+                        }
                         this.is_posting = false;
                         let succeeded = outcome.is_ok();
                         let sid_opt = this.active_db_session_id;
@@ -2006,17 +2128,6 @@ impl StoryElaboratorView {
                             .min_w_0()
                             .items_center()
                             .gap_3()
-                            .child(
-                                Button::new("elab-start-over")
-                                    .ghost()
-                                    .small()
-                                    .disabled(self.is_refining || self.is_posting)
-                                    .icon(Icon::new(LucideIcon::RotateCcw).small())
-                                    .label("Start Over")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.stop_and_reset(false, window, cx);
-                                    })),
-                            )
                             .when_some(self.publish_feedback.clone(), |row, fb| {
                                 let (color, icon, msg) = match fb {
                                     Ok(m) => (green, LucideIcon::Check, m),
@@ -2096,6 +2207,8 @@ impl Render for StoryElaboratorView {
             )
         };
         let app_state_for_header = self.app_state.clone();
+        let reset_state = self.reset_state(cx);
+        let view_for_reset = cx.entity();
 
         v_flex()
             .size_full()
@@ -2143,21 +2256,38 @@ impl Render for StoryElaboratorView {
                                     ),
                             ),
                     )
-                    .when(!connectors_ready, |header| {
-                        header.child(
-                            Button::new("elab-header-connectors")
-                                .ghost()
-                                .small()
-                                .icon(Icon::new(LucideIcon::Plug).small())
-                                .label("Connectors")
-                                .on_click(move |_, _, cx| {
-                                    app_state_for_header.update(cx, |state, cx| {
-                                        state.navigate_to_settings_tab(SettingsTab::Connectors, cx);
-                                        cx.notify();
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .when(!connectors_ready, |header| {
+                                header.child(
+                                    Button::new("elab-header-connectors")
+                                        .ghost()
+                                        .small()
+                                        .icon(Icon::new(LucideIcon::Plug).small())
+                                        .label("Connectors")
+                                        .on_click(move |_, _, cx| {
+                                            app_state_for_header.update(cx, |state, cx| {
+                                                state.navigate_to_settings_tab(
+                                                    SettingsTab::Connectors,
+                                                    cx,
+                                                );
+                                                cx.notify();
+                                            });
+                                        }),
+                                )
+                            })
+                            .child(render_tool_reset_button(
+                                "elab-header-reset",
+                                reset_state,
+                                move |window, cx| {
+                                    view_for_reset.update(cx, |this, cx| {
+                                        this.request_reset(window, cx);
                                     });
-                                }),
-                        )
-                    }),
+                                },
+                            )),
+                    ),
             )
             .child(
                 div().flex_1().min_h_0().w_full().child(

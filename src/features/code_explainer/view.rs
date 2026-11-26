@@ -13,9 +13,10 @@ use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Sizable as _, Size, Theme, h_flex, v_flex,
 };
 use gpui_kit::{
-    AnyElement, AppContext as _, ClipboardItem, Context, Entity, FontWeight, InteractiveElement as _, IntoElement,
-    ParentElement as _, PathPromptOptions, Render, ScrollHandle, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Window, div, hsla, prelude::FluentBuilder as _, px,
+    AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, FontWeight,
+    InteractiveElement as _, IntoElement, ParentElement as _, PathPromptOptions, Render,
+    ScrollHandle, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, hsla,
+    prelude::FluentBuilder as _, px,
 };
 use tokio::sync::mpsc;
 
@@ -29,7 +30,8 @@ use crate::infrastructure::notifications::NotificationService;
 use crate::infrastructure::runtime::{runtime, spawn_tokio};
 use crate::types::{AppSettings, CopilotUsage};
 use crate::ui::components::{
-    ModelDropdown, ModelDropdownEvent, ModelDropdownMode, open_timeout_modal,
+    ModelDropdown, ModelDropdownEvent, ModelDropdownMode, ResetState, normalize_default_model,
+    open_reset_confirm_modal, open_timeout_modal, render_tool_reset_button,
 };
 
 const TOOL_NAME: &str = "Code Explainer";
@@ -106,11 +108,7 @@ impl CodeExplainerView {
         cx: &mut Context<Self>,
     ) -> Self {
         let service = Arc::new(CodeExplainerService::new(copilot_service, git_service));
-        let initial_model = if initial_settings.copilot_model.trim().is_empty() {
-            "auto".to_string()
-        } else {
-            initial_settings.copilot_model.trim().to_string()
-        };
+        let initial_model = normalize_default_model(&initial_settings.copilot_model);
 
         let repo_path_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("/path/to/local/project"));
@@ -143,7 +141,8 @@ impl CodeExplainerView {
         });
 
         let state_sub = cx.observe_in(&app_state, window, |this, app_state, window, cx| {
-            let default_model = app_state.read(cx).settings.copilot_model.clone();
+            let default_model =
+                normalize_default_model(&app_state.read(cx).settings.copilot_model);
             if !this.user_overrode_model && default_model != this.selected_model {
                 this.selected_model = default_model.clone();
                 this.model_dropdown.update(cx, |dd, cx| {
@@ -157,6 +156,16 @@ impl CodeExplainerView {
             this.selected_model = model_id.clone();
             this.user_overrode_model = true;
             cx.notify();
+        });
+        let repo_sub = cx.subscribe(&repo_path_input, |_, _, event, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        });
+        let branch_sub = cx.subscribe(&branch_input, |_, _, event, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
         });
         let reply_sub = cx.subscribe_in(&reply_input, window, |this, _, event, window, cx| {
             match event {
@@ -209,6 +218,8 @@ impl CodeExplainerView {
             _subscriptions: vec![
                 state_sub,
                 model_sub,
+                repo_sub,
+                branch_sub,
                 reply_sub,
                 request_sub,
                 refine_sub,
@@ -592,6 +603,76 @@ impl CodeExplainerView {
         self.refinement_input
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.set_task(None, cx);
+        cx.notify();
+    }
+
+    fn reset_state(&self, cx: &App) -> ResetState {
+        if self.is_generating {
+            return ResetState::NeedsConfirmation { is_running: true };
+        }
+        if self.stage != Stage::Idle || !self.doc_markdown.is_empty() || !self.feed.is_empty() {
+            return ResetState::NeedsConfirmation { is_running: false };
+        }
+        let has_dirty_inputs = !self.repo_path_input.read(cx).value().trim().is_empty()
+            || !self.branch_input.read(cx).value().trim().is_empty()
+            || !self.request_input.read(cx).value().trim().is_empty()
+            || self.user_overrode_model
+            || self.validation_error.is_some()
+            || self.status_notice.is_some()
+            || self.saved_path.is_some();
+        if has_dirty_inputs {
+            ResetState::DirtyInputsOnly
+        } else {
+            ResetState::Clean
+        }
+    }
+
+    fn request_reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.reset_state(cx) {
+            ResetState::Clean => {}
+            ResetState::DirtyInputsOnly => self.reset(window, cx),
+            ResetState::NeedsConfirmation { is_running } => {
+                let view = cx.entity();
+                let detail = if is_running {
+                    "This will cancel the active investigation, stop the Copilot session, clean up any temporary worktree, and clear all inputs and conversation history."
+                } else {
+                    "This will end the current explainer session and clear the generated documentation, conversation history, and all form inputs."
+                };
+                open_reset_confirm_modal(
+                    TOOL_NAME,
+                    is_running,
+                    detail,
+                    move |window, cx| {
+                        view.update(cx, |this, cx| {
+                            this.reset(window, cx);
+                        });
+                    },
+                    window,
+                    cx,
+                );
+            }
+        }
+    }
+
+    fn reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.copy_generation = self.copy_generation.wrapping_add(1);
+        self.stop_and_reset(false, window, cx);
+        self.repo_path_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.branch_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.request_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+
+        let default_model =
+            normalize_default_model(&self.app_state.read(cx).settings.copilot_model);
+        self.user_overrode_model = false;
+        self.selected_model = default_model.clone();
+        self.model_dropdown.update(cx, |dd, cx| {
+            dd.set_selected_model(default_model, window, cx);
+        });
+
+        self.status_notice = None;
         cx.notify();
     }
 
@@ -1279,17 +1360,6 @@ impl CodeExplainerView {
                             .min_w_0()
                             .items_center()
                             .gap_3()
-                            .child(
-                                Button::new("explain-start-over")
-                                    .ghost()
-                                    .small()
-                                    .disabled(self.is_refining)
-                                    .icon(Icon::new(LucideIcon::RotateCcw).small())
-                                    .label("Start Over")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.stop_and_reset(false, window, cx);
-                                    })),
-                            )
                             .when_some(self.saved_path.clone(), |row, fb| {
                                 let (color, icon, msg) = match fb {
                                     Ok(p) => (green, LucideIcon::FileCheck, format!("Saved to {p}")),
@@ -1356,12 +1426,16 @@ impl Render for CodeExplainerView {
             )
         };
 
+        let reset_state = self.reset_state(cx);
+        let view_for_reset = cx.entity();
+
         v_flex()
             .size_full()
             .bg(bg)
             .child(
                 h_flex()
                     .items_center()
+                    .justify_between()
                     .px_6()
                     .py_4()
                     .border_b_1()
@@ -1400,7 +1474,16 @@ impl Render for CodeExplainerView {
                                             .child(ActiveView::CodeExplainer.subtitle()),
                                     ),
                             ),
-                    ),
+                    )
+                    .child(render_tool_reset_button(
+                        "explain-header-reset",
+                        reset_state,
+                        move |window, cx| {
+                            view_for_reset.update(cx, |this, cx| {
+                                this.request_reset(window, cx);
+                            });
+                        },
+                    )),
             )
             .child(
                 div().flex_1().min_h_0().w_full().child(

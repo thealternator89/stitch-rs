@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use gpui_kit::assets::IconName as LucideIcon;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Textarea, TextareaState};
+use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::spinner::Spinner;
@@ -11,9 +11,9 @@ use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Sizable as _, Size, Theme, h_flex, v_flex,
 };
 use gpui_kit::{
-    AnyElement, AppContext as _, ClipboardItem, Context, Entity, FocusHandle, FontWeight, Hsla,
-    InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, hsla,
+    AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, FocusHandle, FontWeight,
+    Hsla, InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Render,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, hsla,
     prelude::FluentBuilder as _, px, relative,
 };
 
@@ -29,7 +29,8 @@ use crate::infrastructure::runtime::spawn_tokio;
 use crate::types::{AppSettings, CopilotUsage, TestCase, TicketData};
 use crate::ui::components::{
     AutocompleteEvent, AutocompleteInput, AutocompleteOption, DirectIdMode, ModelDropdown,
-    ModelDropdownEvent, ModelDropdownMode, open_timeout_modal,
+    ModelDropdownEvent, ModelDropdownMode, ResetState, normalize_default_model,
+    open_reset_confirm_modal, open_timeout_modal, render_tool_reset_button,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +113,7 @@ pub struct TestCaseWriterView {
     last_db_session_id: Option<i64>,
     posting_action: Option<PublishAction>,
     publish_feedback: Option<Result<String, String>>,
+    publish_gen: u64,
     copied: bool,
     copy_generation: u64,
     validation_error: Option<String>,
@@ -126,11 +128,7 @@ impl TestCaseWriterView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let initial_model = if initial_settings.copilot_model.trim().is_empty() {
-            "auto".to_string()
-        } else {
-            initial_settings.copilot_model.trim().to_string()
-        };
+        let initial_model = normalize_default_model(&initial_settings.copilot_model);
 
         let initial_mode = ticket_id_mode_for(initial_settings);
         let ticket_search = cx.new(|cx| {
@@ -164,7 +162,10 @@ impl TestCaseWriterView {
         let state_sub = cx.observe_in(&app_state, window, |this, app_state, window, cx| {
             let (default_model, next_mode) = {
                 let settings = &app_state.read(cx).settings;
-                (settings.copilot_model.clone(), ticket_id_mode_for(settings))
+                (
+                    normalize_default_model(&settings.copilot_model),
+                    ticket_id_mode_for(settings),
+                )
             };
             if !this.user_overrode_model && default_model != this.selected_model {
                 this.selected_model = default_model.clone();
@@ -190,6 +191,12 @@ impl TestCaseWriterView {
                 this.handle_ticket_autocomplete_event(event.clone(), window, cx);
             });
 
+        let context_sub = cx.subscribe(&additional_context_input, |_, _, event, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        });
+
         Self {
             app_state,
             ticket_search,
@@ -214,12 +221,112 @@ impl TestCaseWriterView {
             last_db_session_id: None,
             posting_action: None,
             publish_feedback: None,
+            publish_gen: 0,
             copied: false,
             copy_generation: 0,
             validation_error: None,
             status_notice: None,
-            _subscriptions: vec![state_sub, model_sub, ticket_sub],
+            _subscriptions: vec![state_sub, model_sub, ticket_sub, context_sub],
         }
+    }
+
+    fn reset_state(&self, cx: &App) -> ResetState {
+        if self.is_generating || self.posting_action.is_some() {
+            return ResetState::NeedsConfirmation { is_running: true };
+        }
+        if !self.rows.is_empty() {
+            return ResetState::NeedsConfirmation { is_running: false };
+        }
+        let has_dirty_inputs = self.ticket_search.read(cx).has_value(cx)
+            || self.selected_ticket_id.is_some()
+            || self.fetched_ticket.is_some()
+            || self.fetching_ticket
+            || !self
+                .additional_context_input
+                .read(cx)
+                .value()
+                .trim()
+                .is_empty()
+            || self.user_overrode_model
+            || self.validation_error.is_some()
+            || self.status_notice.is_some()
+            || self.publish_feedback.is_some();
+        if has_dirty_inputs {
+            ResetState::DirtyInputsOnly
+        } else {
+            ResetState::Clean
+        }
+    }
+
+    fn request_reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.reset_state(cx) {
+            ResetState::Clean => {}
+            ResetState::DirtyInputsOnly => self.reset(window, cx),
+            ResetState::NeedsConfirmation { is_running } => {
+                let view = cx.entity();
+                let detail = if is_running {
+                    "This will cancel the active operation and clear all generated test cases and form inputs."
+                } else {
+                    "This will clear all generated test cases, edits/reordering, and form inputs."
+                };
+                open_reset_confirm_modal(
+                    "Test Case Writer",
+                    is_running,
+                    detail,
+                    move |window, cx| {
+                        view.update(cx, |this, cx| {
+                            this.reset(window, cx);
+                        });
+                    },
+                    window,
+                    cx,
+                );
+            }
+        }
+    }
+
+    fn reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.generation_id = self.generation_id.wrapping_add(1);
+        self.ticket_fetch_generation = self.ticket_fetch_generation.wrapping_add(1);
+        self.publish_gen = self.publish_gen.wrapping_add(1);
+        self.copy_generation = self.copy_generation.wrapping_add(1);
+        if let Some(handle) = self.active_handle.take() {
+            handle.cancel();
+        }
+        self.ticket_search
+            .update(cx, |input, cx| input.clear(window, cx));
+        self.ticket_search_cache.clear();
+        self.selected_ticket_id = None;
+        self.fetched_ticket = None;
+        self.fetching_ticket = false;
+        self.additional_context_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+
+        let default_model =
+            normalize_default_model(&self.app_state.read(cx).settings.copilot_model);
+        self.user_overrode_model = false;
+        self.selected_model = default_model.clone();
+        self.model_dropdown.update(cx, |dd, cx| {
+            dd.set_selected_model(default_model, window, cx);
+        });
+
+        self.rows.clear();
+        self.selected_row_uid = None;
+        self.test_cases_modified = false;
+        self.is_generating = false;
+        self.generation_usage = None;
+        self.last_db_session_id = None;
+        self.posting_action = None;
+        self.publish_feedback = None;
+        self.copied = false;
+        self.validation_error = None;
+        self.status_notice = None;
+
+        self.app_state.update(cx, |state, cx| {
+            state.set_task_status(ActiveView::TestCaseWriter, None);
+            cx.notify();
+        });
+        cx.notify();
     }
 
     fn handle_ticket_autocomplete_event(
@@ -810,6 +917,8 @@ impl TestCaseWriterView {
 
         self.posting_action = Some(action);
         self.publish_feedback = None;
+        self.publish_gen = self.publish_gen.wrapping_add(1);
+        let pub_gen = self.publish_gen;
         let status_label = match action {
             PublishAction::Comment => "Adding test cases comment to ticket...",
             PublishAction::Task => "Creating testing task on ticket...",
@@ -874,6 +983,9 @@ impl TestCaseWriterView {
 
                 let _ = cx.update(|_, cx| {
                     view.update(cx, |this, cx| {
+                        if this.publish_gen != pub_gen {
+                            return;
+                        }
                         this.posting_action = None;
                         let succeeded = outcome.is_ok();
                         this.publish_feedback = Some(outcome);
@@ -1764,6 +1876,8 @@ impl Render for TestCaseWriterView {
             )
         };
         let app_state_for_header = self.app_state.clone();
+        let reset_state = self.reset_state(cx);
+        let view_for_reset = cx.entity();
 
         v_flex()
             .size_full()
@@ -1811,21 +1925,38 @@ impl Render for TestCaseWriterView {
                                     ),
                             ),
                     )
-                    .when(!connectors_ready, |header| {
-                        header.child(
-                            Button::new("tc-header-connectors")
-                                .ghost()
-                                .small()
-                                .icon(Icon::new(LucideIcon::Plug).small())
-                                .label("Connectors")
-                                .on_click(move |_, _, cx| {
-                                    app_state_for_header.update(cx, |state, cx| {
-                                        state.navigate_to_settings_tab(SettingsTab::Connectors, cx);
-                                        cx.notify();
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .when(!connectors_ready, |header| {
+                                header.child(
+                                    Button::new("tc-header-connectors")
+                                        .ghost()
+                                        .small()
+                                        .icon(Icon::new(LucideIcon::Plug).small())
+                                        .label("Connectors")
+                                        .on_click(move |_, _, cx| {
+                                            app_state_for_header.update(cx, |state, cx| {
+                                                state.navigate_to_settings_tab(
+                                                    SettingsTab::Connectors,
+                                                    cx,
+                                                );
+                                                cx.notify();
+                                            });
+                                        }),
+                                )
+                            })
+                            .child(render_tool_reset_button(
+                                "tc-header-reset",
+                                reset_state,
+                                move |window, cx| {
+                                    view_for_reset.update(cx, |this, cx| {
+                                        this.request_reset(window, cx);
                                     });
-                                }),
-                        )
-                    }),
+                                },
+                            )),
+                    ),
             )
             .child(
                 div().flex_1().min_h_0().w_full().child(
