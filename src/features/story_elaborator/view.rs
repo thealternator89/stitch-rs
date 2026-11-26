@@ -35,8 +35,9 @@ use crate::infrastructure::runtime::{runtime, spawn_tokio};
 use crate::types::{AppSettings, CopilotUsage, TicketData};
 use crate::ui::components::{
     AutocompleteEvent, AutocompleteInput, AutocompleteOption, DirectIdMode, ModelDropdown,
-    ModelDropdownEvent, ModelDropdownMode, ResetState, normalize_default_model,
-    open_reset_confirm_modal, open_timeout_modal, render_tool_reset_button,
+    ModelDropdownEvent, ModelDropdownMode, ResetState, display_repo_name, normalize_default_model,
+    open_reset_confirm_modal, open_timeout_modal, render_active_error_banner, render_context_pill,
+    render_tool_reset_button,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +93,7 @@ pub struct StoryElaboratorView {
     selected_model: String,
     user_overrode_model: bool,
     stage: ElaboratorStage,
+    context_expanded: bool,
     is_generating: bool,
     is_waiting_for_user: bool,
     session_run_id: u64,
@@ -259,6 +261,7 @@ impl StoryElaboratorView {
             selected_model: initial_model,
             user_overrode_model: false,
             stage: ElaboratorStage::Idle,
+            context_expanded: false,
             is_generating: false,
             is_waiting_for_user: false,
             session_run_id: 0,
@@ -524,6 +527,7 @@ impl StoryElaboratorView {
             .update(cx, |input, cx| input.set_value("", window, cx));
 
         self.stage = ElaboratorStage::Elaborating;
+        self.context_expanded = false;
         self.is_generating = true;
         self.is_waiting_for_user = false;
         self.fetching_ticket = true;
@@ -652,6 +656,7 @@ impl StoryElaboratorView {
         cx: &mut Context<Self>,
     ) {
         self.stage = ElaboratorStage::Idle;
+        self.context_expanded = false;
         self.is_generating = false;
         self.is_waiting_for_user = false;
         self.active_ticket_id = None;
@@ -861,7 +866,7 @@ impl StoryElaboratorView {
                             {
                                 this.is_waiting_for_user = true;
                                 this.validation_error = Some(
-                                    "Copilot finished the turn without sending a structured question or final plan. Send a follow-up prompt below or Cancel Session."
+                                    "Copilot finished the turn without sending a structured question or final plan. Send a follow-up prompt below or click Reset to start over."
                                         .to_string(),
                                 );
                             }
@@ -953,6 +958,7 @@ impl StoryElaboratorView {
             });
         }
         self.stage = ElaboratorStage::Idle;
+        self.context_expanded = false;
         self.is_generating = false;
         self.is_waiting_for_user = false;
         self.fetching_ticket = false;
@@ -1231,6 +1237,102 @@ impl StoryElaboratorView {
             .detach();
     }
 
+    fn render_fetched_ticket_card(&self, ticket: TicketData, theme: &Theme) -> impl IntoElement {
+        let id_label = ticket.id.unwrap_or_default();
+        let preview = strip_html_for_preview(&ticket.description);
+        let ac_preview = ticket
+            .acceptance_criteria
+            .as_deref()
+            .map(strip_html_for_preview)
+            .filter(|s| !s.is_empty());
+
+        v_flex()
+            .p_3p5()
+            .gap_2()
+            .rounded(theme.radius_lg)
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.background)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1p5()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.muted_foreground)
+                            .child(Icon::new(LucideIcon::Ticket).xsmall())
+                            .child("FETCHED TICKET"),
+                    )
+                    .when(!id_label.is_empty(), |row| {
+                        row.child(
+                            div()
+                                .px_1p5()
+                                .py_0p5()
+                                .rounded(theme.radius)
+                                .bg(theme.secondary)
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(format!("#{id_label}")),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.foreground)
+                    .child(ticket.title),
+            )
+            .child(
+                div()
+                    .max_h(px(140.))
+                    .overflow_y_scrollbar()
+                    .p_2p5()
+                    .rounded(theme.radius)
+                    .bg(theme.sidebar)
+                    .border_1()
+                    .border_color(theme.border)
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(if preview.is_empty() {
+                        "(Ticket description is empty)".to_string()
+                    } else {
+                        preview
+                    }),
+            )
+            .when_some(ac_preview, |card, ac| {
+                card.child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme.muted_foreground)
+                                .child("Acceptance Criteria"),
+                        )
+                        .child(
+                            div()
+                                .max_h(px(90.))
+                                .overflow_y_scrollbar()
+                                .p_2()
+                                .rounded(theme.radius)
+                                .bg(theme.sidebar)
+                                .border_1()
+                                .border_color(theme.border)
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(ac),
+                        ),
+                )
+            })
+    }
+
     fn render_left_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let settings = &self.app_state.read(cx).settings;
@@ -1245,7 +1347,6 @@ impl StoryElaboratorView {
             _ => "Unconfigured",
         };
         let worktree_enabled = settings.git_worktree_enabled;
-        let is_idle = self.stage == ElaboratorStage::Idle;
 
         let amber = hsla(38.0 / 360.0, 0.92, 0.50, 1.0);
         let red = hsla(0.0, 0.78, 0.55, 1.0);
@@ -1318,7 +1419,7 @@ impl StoryElaboratorView {
                                     Button::new("elab-fetch-ticket-preview")
                                         .ghost()
                                         .xsmall()
-                                        .disabled(self.fetching_ticket || !is_idle)
+                                        .disabled(self.fetching_ticket)
                                         .loading(self.fetching_ticket)
                                         .label("Fetch")
                                         .on_click(cx.listener(move |this, _, window, cx| {
@@ -1347,12 +1448,11 @@ impl StoryElaboratorView {
                                 div()
                                     .flex_1()
                                     .min_w_0()
-                                    .child(Input::new(&self.repo_path_input).disabled(!is_idle)),
+                                    .child(Input::new(&self.repo_path_input)),
                             )
                             .child(
                                 Button::new("elab-browse-repo")
                                     .small()
-                                    .disabled(!is_idle)
                                     .icon(Icon::new(LucideIcon::FolderOpen).small())
                                     .label("Browse")
                                     .on_click(cx.listener(|this, _, window, cx| {
@@ -1378,7 +1478,7 @@ impl StoryElaboratorView {
                                 .text_color(theme.foreground)
                                 .child("Git Branch"),
                         )
-                        .child(Input::new(&self.branch_input).disabled(!is_idle))
+                        .child(Input::new(&self.branch_input))
                         .child(
                             div()
                                 .text_xs()
@@ -1397,11 +1497,7 @@ impl StoryElaboratorView {
                             .text_color(theme.foreground)
                             .child("Additional Context (Optional)"),
                     )
-                    .child(
-                        Textarea::new(&self.additional_context_input)
-                            .h(px(96.))
-                            .disabled(!is_idle),
-                    ),
+                    .child(Textarea::new(&self.additional_context_input).h(px(96.))),
             )
             .child(
                 v_flex()
@@ -1413,21 +1509,7 @@ impl StoryElaboratorView {
                             .text_color(theme.foreground)
                             .child("Copilot Model"),
                     )
-                    .child(if is_idle {
-                        self.model_dropdown.clone().into_any_element()
-                    } else {
-                        div()
-                            .px_3()
-                            .py_2()
-                            .rounded(theme.radius)
-                            .border_1()
-                            .border_color(theme.border)
-                            .bg(theme.background)
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(format!("Locked for session: {}", self.selected_model))
-                            .into_any_element()
-                    }),
+                    .child(self.model_dropdown.clone()),
             )
             .when_some(self.validation_error.clone(), |col, err| {
                 col.child(
@@ -1462,7 +1544,7 @@ impl StoryElaboratorView {
                 )
             })
             .child(
-                div().pt_1().child(if is_idle {
+                div().pt_1().child(
                     Button::new("elab-start")
                         .primary()
                         .w_full()
@@ -1471,89 +1553,222 @@ impl StoryElaboratorView {
                         .label("Start Elaboration")
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.handle_start_elaboration(window, cx);
-                        }))
-                } else {
-                    Button::new("elab-cancel")
-                        .danger()
-                        .w_full()
-                        .icon(Icon::new(LucideIcon::Square).small())
-                        .label("Cancel Session")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.stop_and_reset(true, window, cx);
-                        }))
-                }),
+                        })),
+                ),
             )
             .when_some(self.fetched_ticket.clone(), |col, ticket| {
-                let id_label = ticket.id.unwrap_or_default();
-                let preview = strip_html_for_preview(&ticket.description);
-                let ac_preview = ticket
-                    .acceptance_criteria
-                    .as_deref()
-                    .map(strip_html_for_preview)
-                    .filter(|s| !s.is_empty());
+                col.child(self.render_fetched_ticket_card(ticket, &theme))
+            })
+    }
 
-                col.child(
+    fn render_context_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let worktree_enabled = self.app_state.read(cx).settings.git_worktree_enabled;
+        let ticket_id = self
+            .fetched_ticket
+            .as_ref()
+            .and_then(|t| t.id.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| self.active_ticket_id.clone())
+            .or_else(|| self.selected_ticket_id.clone());
+        let title_line = self
+            .fetched_ticket
+            .as_ref()
+            .map(|t| t.title.clone())
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| match ticket_id.as_deref() {
+                Some(id) if self.fetching_ticket => format!("Fetching ticket #{id}..."),
+                Some(id) => format!("Ticket #{id}"),
+                None => "Story Elaboration".to_string(),
+            });
+        let repo_raw = self.repo_path_input.read(cx).value().trim().to_string();
+        let repo_name = display_repo_name(&repo_raw);
+        let has_repo = !repo_raw.is_empty();
+        let branch_display = {
+            let raw = self.branch_input.read(cx).value().trim().to_string();
+            if raw.is_empty() {
+                "develop".to_string()
+            } else {
+                raw
+            }
+        };
+        let additional_context = self
+            .additional_context_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let is_running = self.stage == ElaboratorStage::Elaborating && self.is_generating;
+        let chevron = if self.context_expanded {
+            LucideIcon::ChevronUp
+        } else {
+            LucideIcon::ChevronDown
+        };
+
+        v_flex()
+            .w_full()
+            .border_b_1()
+            .border_color(theme.border)
+            .bg(theme.sidebar)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_4()
+                    .px_6()
+                    .py_2p5()
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1()
+                            .child(
+                                h_flex()
+                                    .flex_wrap()
+                                    .items_center()
+                                    .gap_2()
+                                    .when_some(ticket_id.clone(), |row, id| {
+                                        row.child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(FontWeight::BOLD)
+                                                .text_color(theme.primary)
+                                                .child(format!("#{id}")),
+                                        )
+                                    })
+                                    .child(if has_repo {
+                                        render_context_pill(
+                                            LucideIcon::Folder,
+                                            repo_name,
+                                            false,
+                                            cx,
+                                        )
+                                        .into_any_element()
+                                    } else {
+                                        render_context_pill(
+                                            LucideIcon::Ticket,
+                                            "Ticket only",
+                                            false,
+                                            cx,
+                                        )
+                                        .into_any_element()
+                                    })
+                                    .when(has_repo && worktree_enabled, |row| {
+                                        row.child(render_context_pill(
+                                            LucideIcon::GitMerge,
+                                            branch_display.clone(),
+                                            true,
+                                            cx,
+                                        ))
+                                    })
+                                    .child(render_context_pill(
+                                        LucideIcon::Cpu,
+                                        self.selected_model.clone(),
+                                        false,
+                                        cx,
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .truncate()
+                                    .child(title_line),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .flex_shrink_0()
+                            .child(
+                                Button::new("elab-toggle-context")
+                                    .ghost()
+                                    .small()
+                                    .icon(Icon::new(chevron).small())
+                                    .label(if self.context_expanded {
+                                        "Hide Details"
+                                    } else {
+                                        "Details"
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.context_expanded = !this.context_expanded;
+                                        cx.notify();
+                                    })),
+                            )
+                            .when(is_running, |row| {
+                                row.child(
+                                    Button::new("elab-cancel")
+                                        .danger()
+                                        .small()
+                                        .icon(Icon::new(LucideIcon::Square).small())
+                                        .label("Cancel")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.stop_and_reset(true, window, cx);
+                                        })),
+                                )
+                            }),
+                    ),
+            )
+            .when(self.context_expanded, |bar| {
+                bar.child(
                     v_flex()
-                        .p_3p5()
-                        .gap_2()
-                        .rounded(theme.radius_lg)
-                        .border_1()
+                        .gap_3()
+                        .px_6()
+                        .py_3()
+                        .border_t_1()
                         .border_color(theme.border)
                         .bg(theme.background)
-                        .child(
-                            h_flex()
-                                .items_center()
-                                .justify_between()
-                                .gap_2()
-                                .child(
-                                    h_flex()
-                                        .items_center()
-                                        .gap_1p5()
-                                        .text_xs()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(theme.muted_foreground)
-                                        .child(Icon::new(LucideIcon::Ticket).xsmall())
-                                        .child("FETCHED TICKET"),
-                                )
-                                .when(!id_label.is_empty(), |row| {
-                                    row.child(
-                                        div()
-                                            .px_1p5()
-                                            .py_0p5()
-                                            .rounded(theme.radius)
-                                            .bg(theme.secondary)
+                        .when(has_repo, |col| {
+                            col.child(
+                                h_flex()
+                                    .flex_wrap()
+                                    .items_center()
+                                    .gap_4()
+                                    .child(
+                                        h_flex()
+                                            .items_center()
+                                            .gap_1p5()
                                             .text_xs()
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .child(format!("#{id_label}")),
+                                            .child(
+                                                div()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(theme.muted_foreground)
+                                                    .child("Repository:"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .font_family(theme.mono_font_family.clone())
+                                                    .text_color(theme.foreground)
+                                                    .child(repo_raw),
+                                            ),
                                     )
-                                }),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(theme.foreground)
-                                .child(ticket.title),
-                        )
-                        .child(
-                            div()
-                                .max_h(px(140.))
-                                .overflow_y_scrollbar()
-                                .p_2p5()
-                                .rounded(theme.radius)
-                                .bg(theme.sidebar)
-                                .border_1()
-                                .border_color(theme.border)
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(if preview.is_empty() {
-                                    "(Ticket description is empty)".to_string()
-                                } else {
-                                    preview
-                                }),
-                        )
-                        .when_some(ac_preview, |card, ac| {
-                            card.child(
+                                    .when(worktree_enabled, |row| {
+                                        row.child(
+                                            h_flex()
+                                                .items_center()
+                                                .gap_1p5()
+                                                .text_xs()
+                                                .child(
+                                                    div()
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .text_color(theme.muted_foreground)
+                                                        .child("Branch:"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .font_family(theme.mono_font_family.clone())
+                                                        .text_color(theme.foreground)
+                                                        .child(branch_display),
+                                                ),
+                                        )
+                                    }),
+                            )
+                        })
+                        .when(!additional_context.is_empty(), |col| {
+                            col.child(
                                 v_flex()
                                     .gap_1()
                                     .child(
@@ -1561,22 +1776,32 @@ impl StoryElaboratorView {
                                             .text_xs()
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(theme.muted_foreground)
-                                            .child("Acceptance Criteria"),
+                                            .child("Additional Context"),
                                     )
                                     .child(
                                         div()
-                                            .max_h(px(90.))
+                                            .max_h(px(100.))
                                             .overflow_y_scrollbar()
-                                            .p_2()
+                                            .p_2p5()
                                             .rounded(theme.radius)
-                                            .bg(theme.sidebar)
                                             .border_1()
                                             .border_color(theme.border)
+                                            .bg(theme.sidebar)
                                             .text_xs()
-                                            .text_color(theme.muted_foreground)
-                                            .child(ac),
+                                            .text_color(theme.foreground)
+                                            .child(additional_context),
                                     ),
                             )
+                        })
+                        .child(if let Some(ticket) = self.fetched_ticket.clone() {
+                            self.render_fetched_ticket_card(ticket, &theme)
+                                .into_any_element()
+                        } else {
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child("Fetching ticket details...")
+                                .into_any_element()
                         }),
                 )
             })
@@ -1745,7 +1970,7 @@ impl StoryElaboratorView {
                         h_flex()
                             .items_center()
                             .gap_2()
-                            .max_w(px(640.))
+                            .max_w(px(760.))
                             .px_3()
                             .py_1p5()
                             .rounded(theme.radius)
@@ -1837,7 +2062,7 @@ impl StoryElaboratorView {
                     .justify_start()
                     .child(
                         v_flex()
-                            .max_w(px(620.))
+                            .max_w(px(760.))
                             .p_4()
                             .gap_1p5()
                             .rounded(theme.radius_lg)
@@ -2289,8 +2514,8 @@ impl Render for StoryElaboratorView {
                             )),
                     ),
             )
-            .child(
-                div().flex_1().min_h_0().w_full().child(
+            .child(div().flex_1().min_h_0().w_full().child(
+                if self.stage == ElaboratorStage::Idle {
                     h_resizable("story-elaborator-split")
                         .child(
                             resizable_panel()
@@ -2298,9 +2523,36 @@ impl Render for StoryElaboratorView {
                                 .size_range(px(320.)..px(540.))
                                 .child(self.render_left_pane(cx)),
                         )
-                        .child(resizable_panel().child(self.render_right_pane(cx))),
-                ),
-            )
+                        .child(resizable_panel().child(self.render_right_pane(cx)))
+                        .into_any_element()
+                } else {
+                    let view_for_dismiss = cx.entity();
+                    v_flex()
+                        .size_full()
+                        .child(self.render_context_bar(cx))
+                        .when_some(self.validation_error.clone(), |col, err| {
+                            col.child(render_active_error_banner(
+                                "elab-dismiss-active-error",
+                                err,
+                                move |_, cx| {
+                                    view_for_dismiss.update(cx, |this, cx| {
+                                        this.validation_error = None;
+                                        cx.notify();
+                                    });
+                                },
+                                cx,
+                            ))
+                        })
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h_0()
+                                .w_full()
+                                .child(self.render_right_pane(cx)),
+                        )
+                        .into_any_element()
+                },
+            ))
     }
 }
 

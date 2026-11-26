@@ -12,8 +12,8 @@ use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _
 use gpui_kit::{
     App, AppContext as _, ClipboardItem, Context, Entity, FontWeight, InteractiveElement as _,
     IntoElement, ParentElement as _, PathPromptOptions, Render, ScrollHandle,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, prelude::FluentBuilder as _,
-    px, rgb,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, hsla,
+    prelude::FluentBuilder as _, px, rgb,
 };
 
 use crate::app_state::{ActiveView, AppState};
@@ -22,8 +22,9 @@ use crate::features::tshirt_estimator::service::{
 };
 use crate::infrastructure::notifications::NotificationService;
 use crate::ui::components::{
-    ModelDropdown, ModelDropdownEvent, ModelDropdownMode, ResetState, normalize_default_model,
-    open_reset_confirm_modal, open_timeout_modal, render_tool_reset_button,
+    ModelDropdown, ModelDropdownEvent, ModelDropdownMode, ResetState, display_repo_name,
+    normalize_default_model, open_reset_confirm_modal, open_timeout_modal, render_context_pill,
+    render_tool_reset_button, summarize_single_line,
 };
 
 #[derive(Debug, Clone)]
@@ -44,8 +45,11 @@ pub struct TShirtEstimatorView {
     user_overrode_model: bool,
     stage: EstimatorStage,
     validation_error: Option<String>,
+    status_notice: Option<String>,
     status_logs: Vec<String>,
     logs_expanded: bool,
+    context_expanded: bool,
+    is_cancelling: bool,
     copied: bool,
     copy_generation: u64,
     estimation_gen: u64,
@@ -136,8 +140,11 @@ impl TShirtEstimatorView {
             user_overrode_model: false,
             stage: EstimatorStage::Idle,
             validation_error: None,
+            status_notice: None,
             status_logs: Vec::new(),
             logs_expanded: false,
+            context_expanded: false,
+            is_cancelling: false,
             copied: false,
             copy_generation: 0,
             estimation_gen: 0,
@@ -167,6 +174,7 @@ impl TShirtEstimatorView {
                                     input.set_value(path_str, window, cx);
                                 });
                                 this.validation_error = None;
+                                this.status_notice = None;
                                 cx.notify();
                             });
                         });
@@ -226,8 +234,11 @@ impl TShirtEstimatorView {
         };
 
         self.validation_error = None;
+        self.status_notice = None;
         self.status_logs.clear();
         self.logs_expanded = false;
+        self.context_expanded = false;
+        self.is_cancelling = false;
         self.copied = false;
         self.stage = EstimatorStage::Estimating;
         self.estimation_gen = self.estimation_gen.wrapping_add(1);
@@ -281,6 +292,7 @@ impl TShirtEstimatorView {
                                 let usage = result.usage.clone();
                                 let model_id = this.selected_model.clone();
                                 this.active_handle = None;
+                                this.is_cancelling = false;
                                 this.stage = EstimatorStage::Completed(result);
                                 app_state.update(cx, |state, cx| {
                                     state.set_task_status(ActiveView::TShirtEstimator, None);
@@ -304,6 +316,7 @@ impl TShirtEstimatorView {
                             }
                             EstimationStreamEvent::TimedOut { timeout_secs } => {
                                 this.active_handle = None;
+                                this.is_cancelling = false;
                                 this.stage = EstimatorStage::Error(format!(
                                     "Estimation timed out after {timeout_secs} seconds without Copilot output."
                                 ));
@@ -316,7 +329,10 @@ impl TShirtEstimatorView {
                             }
                             EstimationStreamEvent::Cancelled => {
                                 this.active_handle = None;
+                                this.is_cancelling = false;
+                                this.context_expanded = false;
                                 this.stage = EstimatorStage::Idle;
+                                this.status_notice = Some("Estimation cancelled.".to_string());
                                 app_state.update(cx, |state, cx| {
                                     state.set_task_status(ActiveView::TShirtEstimator, None);
                                     cx.notify();
@@ -325,6 +341,7 @@ impl TShirtEstimatorView {
                             }
                             EstimationStreamEvent::Error(msg) => {
                                 this.active_handle = None;
+                                this.is_cancelling = false;
                                 this.stage = EstimatorStage::Error(msg);
                                 app_state.update(cx, |state, cx| {
                                     state.set_task_status(ActiveView::TShirtEstimator, None);
@@ -356,7 +373,11 @@ impl TShirtEstimatorView {
     }
 
     fn cancel_estimation(&mut self, cx: &mut Context<Self>) {
+        if self.is_cancelling {
+            return;
+        }
         if let Some(handle) = self.active_handle.as_ref() {
+            self.is_cancelling = true;
             handle.cancel();
             self.status_logs.push("Cancelling estimation...".to_string());
             self.terminal_scroll_handle.scroll_to_bottom();
@@ -375,6 +396,7 @@ impl TShirtEstimatorView {
                     || self.user_overrode_model
                     || matches!(self.stage, EstimatorStage::Error(_))
                     || self.validation_error.is_some()
+                    || self.status_notice.is_some()
                     || !self.status_logs.is_empty();
                 if has_dirty_inputs {
                     ResetState::DirtyInputsOnly
@@ -435,8 +457,11 @@ impl TShirtEstimatorView {
 
         self.stage = EstimatorStage::Idle;
         self.validation_error = None;
+        self.status_notice = None;
         self.status_logs.clear();
         self.logs_expanded = false;
+        self.context_expanded = false;
+        self.is_cancelling = false;
         self.copied = false;
         self.app_state.update(cx, |state, cx| {
             state.set_task_status(ActiveView::TShirtEstimator, None);
@@ -472,8 +497,9 @@ impl TShirtEstimatorView {
 
     fn render_left_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let is_estimating = matches!(self.stage, EstimatorStage::Estimating);
         let worktree_enabled = self.app_state.read(cx).settings.git_worktree_enabled;
+        let red = hsla(0.0, 0.78, 0.55, 1.0);
+        let green = hsla(152.0 / 360.0, 0.76, 0.40, 1.0);
 
         v_flex()
             .size_full()
@@ -491,11 +517,7 @@ impl TShirtEstimatorView {
                             .text_color(theme.foreground)
                             .child("Proposed Change Description"),
                     )
-                    .child(
-                        Textarea::new(&self.description_input)
-                            .h(px(190.))
-                            .disabled(is_estimating),
-                    ),
+                    .child(Textarea::new(&self.description_input).h(px(190.))),
             )
             .child(
                 v_flex()
@@ -515,11 +537,10 @@ impl TShirtEstimatorView {
                                 div()
                                     .flex_1()
                                     .min_w_0()
-                                    .child(Input::new(&self.repo_path_input).disabled(is_estimating)),
+                                    .child(Input::new(&self.repo_path_input)),
                             )
                             .child(
                                 Button::new("browse-tshirt-repo")
-                                    .disabled(is_estimating)
                                     .icon(Icon::new(LucideIcon::FolderOpen).small())
                                     .label("Browse")
                                     .on_click(cx.listener(|this, _, window, cx| {
@@ -539,7 +560,7 @@ impl TShirtEstimatorView {
                                 .text_color(theme.foreground)
                                 .child("Git Branch"),
                         )
-                        .child(Input::new(&self.branch_input).disabled(is_estimating))
+                        .child(Input::new(&self.branch_input))
                         .child(
                             div()
                                 .text_xs()
@@ -561,7 +582,6 @@ impl TShirtEstimatorView {
                     .child(self.model_dropdown.clone()),
             )
             .when_some(self.validation_error.clone(), |col, err| {
-                let red = gpui_kit::hsla(0.0, 0.78, 0.55, 1.0);
                 col.child(
                     h_flex()
                         .p_3()
@@ -577,17 +597,24 @@ impl TShirtEstimatorView {
                         .child(div().flex_1().child(err)),
                 )
             })
+            .when_some(self.status_notice.clone(), |col, note| {
+                col.child(
+                    h_flex()
+                        .p_3()
+                        .gap_2()
+                        .items_start()
+                        .rounded(theme.radius)
+                        .border_1()
+                        .border_color(green.opacity(0.4))
+                        .bg(green.opacity(0.08))
+                        .text_xs()
+                        .text_color(green)
+                        .child(Icon::new(LucideIcon::Info).small())
+                        .child(div().flex_1().child(note)),
+                )
+            })
             .child(
-                div().pt_2().child(if is_estimating {
-                    Button::new("cancel-tshirt-estimation")
-                        .danger()
-                        .w_full()
-                        .icon(Icon::new(LucideIcon::Square).small())
-                        .label("Cancel Estimation")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.cancel_estimation(cx);
-                        }))
-                } else {
+                div().pt_2().child(
                     Button::new("start-tshirt-estimation")
                         .primary()
                         .w_full()
@@ -595,9 +622,207 @@ impl TShirtEstimatorView {
                         .label("Start Estimation")
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.start_estimation(window, cx);
-                        }))
-                }),
+                        })),
+                ),
             )
+    }
+
+    fn render_context_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let is_estimating = matches!(self.stage, EstimatorStage::Estimating);
+        let worktree_enabled = self.app_state.read(cx).settings.git_worktree_enabled;
+        let repo_raw = self.repo_path_input.read(cx).value().trim().to_string();
+        let repo_name = display_repo_name(&repo_raw);
+        let branch_display = {
+            let raw = self.branch_input.read(cx).value().trim().to_string();
+            if raw.is_empty() {
+                "develop".to_string()
+            } else {
+                raw
+            }
+        };
+        let description_raw = self.description_input.read(cx).value().trim().to_string();
+        let description_summary = summarize_single_line(&description_raw, 140);
+        let chevron = if self.context_expanded {
+            LucideIcon::ChevronUp
+        } else {
+            LucideIcon::ChevronDown
+        };
+
+        v_flex()
+            .w_full()
+            .border_b_1()
+            .border_color(theme.border)
+            .bg(theme.sidebar)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_4()
+                    .px_6()
+                    .py_2p5()
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1()
+                            .child(
+                                h_flex()
+                                    .flex_wrap()
+                                    .items_center()
+                                    .gap_2()
+                                    .when(!repo_name.is_empty(), |row| {
+                                        row.child(render_context_pill(
+                                            LucideIcon::Folder,
+                                            repo_name,
+                                            false,
+                                            cx,
+                                        ))
+                                    })
+                                    .when(worktree_enabled, |row| {
+                                        row.child(render_context_pill(
+                                            LucideIcon::GitMerge,
+                                            branch_display.clone(),
+                                            true,
+                                            cx,
+                                        ))
+                                    })
+                                    .child(render_context_pill(
+                                        LucideIcon::Cpu,
+                                        self.selected_model.clone(),
+                                        false,
+                                        cx,
+                                    )),
+                            )
+                            .when(!description_summary.is_empty(), |col| {
+                                col.child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .truncate()
+                                        .child(description_summary),
+                                )
+                            }),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .flex_shrink_0()
+                            .child(
+                                Button::new("tshirt-toggle-context")
+                                    .ghost()
+                                    .small()
+                                    .icon(Icon::new(chevron).small())
+                                    .label(if self.context_expanded {
+                                        "Hide Details"
+                                    } else {
+                                        "Details"
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.context_expanded = !this.context_expanded;
+                                        cx.notify();
+                                    })),
+                            )
+                            .when(is_estimating, |row| {
+                                row.child(
+                                    Button::new("cancel-tshirt-estimation")
+                                        .danger()
+                                        .small()
+                                        .disabled(self.is_cancelling)
+                                        .loading(self.is_cancelling)
+                                        .icon(Icon::new(LucideIcon::Square).small())
+                                        .label(if self.is_cancelling {
+                                            "Cancelling..."
+                                        } else {
+                                            "Cancel"
+                                        })
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.cancel_estimation(cx);
+                                        })),
+                                )
+                            }),
+                    ),
+            )
+            .when(self.context_expanded, |bar| {
+                bar.child(
+                    v_flex()
+                        .gap_3()
+                        .px_6()
+                        .py_3()
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .bg(theme.background)
+                        .child(
+                            h_flex()
+                                .flex_wrap()
+                                .items_center()
+                                .gap_4()
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_1p5()
+                                        .text_xs()
+                                        .child(
+                                            div()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(theme.muted_foreground)
+                                                .child("Repository:"),
+                                        )
+                                        .child(
+                                            div()
+                                                .font_family(theme.mono_font_family.clone())
+                                                .text_color(theme.foreground)
+                                                .child(repo_raw),
+                                        ),
+                                )
+                                .when(worktree_enabled, |row| {
+                                    row.child(
+                                        h_flex()
+                                            .items_center()
+                                            .gap_1p5()
+                                            .text_xs()
+                                            .child(
+                                                div()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(theme.muted_foreground)
+                                                    .child("Branch:"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .font_family(theme.mono_font_family.clone())
+                                                    .text_color(theme.foreground)
+                                                    .child(branch_display),
+                                            ),
+                                    )
+                                }),
+                        )
+                        .child(
+                            v_flex()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(theme.muted_foreground)
+                                        .child("Proposed Change Description"),
+                                )
+                                .child(
+                                    div()
+                                        .max_h(px(160.))
+                                        .overflow_y_scrollbar()
+                                        .p_3()
+                                        .rounded(theme.radius)
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .bg(theme.sidebar)
+                                        .text_xs()
+                                        .text_color(theme.foreground)
+                                        .child(description_raw),
+                                ),
+                        ),
+                )
+            })
     }
 
     fn render_terminal_box(&self, min_h: Option<f32>, cx: &App) -> impl IntoElement {
@@ -1066,8 +1291,23 @@ impl Render for TShirtEstimatorView {
                         },
                     )),
             )
-            .child(
-                div().flex_1().min_h_0().w_full().child(
+            .child(div().flex_1().min_h_0().w_full().child(
+                if matches!(
+                    self.stage,
+                    EstimatorStage::Estimating | EstimatorStage::Completed(_)
+                ) {
+                    v_flex()
+                        .size_full()
+                        .child(self.render_context_bar(cx))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h_0()
+                                .w_full()
+                                .child(self.render_right_pane(cx)),
+                        )
+                        .into_any_element()
+                } else {
                     h_resizable("tshirt-estimator-split")
                         .child(
                             resizable_panel()
@@ -1075,8 +1315,9 @@ impl Render for TShirtEstimatorView {
                                 .size_range(px(290.)..px(540.))
                                 .child(self.render_left_pane(cx)),
                         )
-                        .child(resizable_panel().child(self.render_right_pane(cx))),
-                ),
-            )
+                        .child(resizable_panel().child(self.render_right_pane(cx)))
+                        .into_any_element()
+                },
+            ))
     }
 }

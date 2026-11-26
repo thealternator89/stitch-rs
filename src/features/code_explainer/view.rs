@@ -30,8 +30,10 @@ use crate::infrastructure::notifications::NotificationService;
 use crate::infrastructure::runtime::{runtime, spawn_tokio};
 use crate::types::{AppSettings, CopilotUsage};
 use crate::ui::components::{
-    ModelDropdown, ModelDropdownEvent, ModelDropdownMode, ResetState, normalize_default_model,
-    open_reset_confirm_modal, open_timeout_modal, render_tool_reset_button,
+    ModelDropdown, ModelDropdownEvent, ModelDropdownMode, ResetState, display_repo_name,
+    normalize_default_model, open_reset_confirm_modal, open_timeout_modal,
+    render_active_error_banner, render_context_pill, render_tool_reset_button,
+    summarize_single_line,
 };
 
 const TOOL_NAME: &str = "Code Explainer";
@@ -75,6 +77,7 @@ pub struct CodeExplainerView {
     selected_model: String,
     user_overrode_model: bool,
     stage: Stage,
+    context_expanded: bool,
     is_generating: bool,
     is_waiting_for_user: bool,
     session_run_id: u64,
@@ -195,6 +198,7 @@ impl CodeExplainerView {
             selected_model: initial_model,
             user_overrode_model: false,
             stage: Stage::Idle,
+            context_expanded: false,
             is_generating: false,
             is_waiting_for_user: false,
             session_run_id: 0,
@@ -312,6 +316,7 @@ impl CodeExplainerView {
         self.refinement_input
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.stage = Stage::Investigating;
+        self.context_expanded = false;
         self.is_generating = true;
         self.is_waiting_for_user = false;
         self.last_retry_turn = Some(RetryableTurn::Start);
@@ -504,7 +509,7 @@ impl CodeExplainerView {
                             {
                                 this.is_waiting_for_user = true;
                                 this.validation_error = Some(
-                                    "Copilot finished the turn without sending a structured question or the final documentation. Send a follow-up prompt below or Cancel Session."
+                                    "Copilot finished the turn without sending a structured question or the final documentation. Send a follow-up prompt below or click Reset to start over."
                                         .to_string(),
                                 );
                             }
@@ -580,6 +585,7 @@ impl CodeExplainerView {
             service.stop().await;
         });
         self.stage = Stage::Idle;
+        self.context_expanded = false;
         self.is_generating = false;
         self.is_waiting_for_user = false;
         cx.notify();
@@ -750,7 +756,6 @@ impl CodeExplainerView {
     fn render_left_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let worktree_enabled = self.app_state.read(cx).settings.git_worktree_enabled;
-        let is_idle = self.stage == Stage::Idle;
         let red = hsla(0.0, 0.78, 0.55, 1.0);
         let green = hsla(152.0 / 360.0, 0.76, 0.40, 1.0);
         let can_start = !self.request_input.read(cx).value().trim().is_empty()
@@ -788,12 +793,11 @@ impl CodeExplainerView {
                                 div()
                                     .flex_1()
                                     .min_w_0()
-                                    .child(Input::new(&self.repo_path_input).disabled(!is_idle)),
+                                    .child(Input::new(&self.repo_path_input)),
                             )
                             .child(
                                 Button::new("explain-browse-repo")
                                     .small()
-                                    .disabled(!is_idle)
                                     .icon(Icon::new(LucideIcon::FolderOpen).small())
                                     .label("Browse")
                                     .on_click(cx.listener(|this, _, window, cx| {
@@ -810,7 +814,7 @@ impl CodeExplainerView {
                     v_flex()
                         .gap_1p5()
                         .child(label("Git Branch (Optional)"))
-                        .child(Input::new(&self.branch_input).disabled(!is_idle))
+                        .child(Input::new(&self.branch_input))
                         .child(hint(
                             "If set, the branch is checked out in an isolated worktree. Leave blank to read the working copy as-is.",
                         )),
@@ -820,11 +824,7 @@ impl CodeExplainerView {
                 v_flex()
                     .gap_1p5()
                     .child(label("What should be explained?"))
-                    .child(
-                        Textarea::new(&self.request_input)
-                            .h(px(160.))
-                            .disabled(!is_idle),
-                    )
+                    .child(Textarea::new(&self.request_input).h(px(160.)))
                     .child(hint(
                         "Describe the feature or area in your own words. Tip: mention entry points (files, functions, endpoints, UI screens), key terms, and what you care about (e.g. calculations, data flow).",
                     )),
@@ -833,21 +833,7 @@ impl CodeExplainerView {
                 v_flex()
                     .gap_1p5()
                     .child(label("Copilot Model"))
-                    .child(if is_idle {
-                        self.model_dropdown.clone().into_any_element()
-                    } else {
-                        div()
-                            .px_3()
-                            .py_2()
-                            .rounded(theme.radius)
-                            .border_1()
-                            .border_color(theme.border)
-                            .bg(theme.background)
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(format!("Locked for session: {}", self.selected_model))
-                            .into_any_element()
-                    }),
+                    .child(self.model_dropdown.clone()),
             )
             .when_some(self.validation_error.clone(), |col, err| {
                 col.child(
@@ -881,26 +867,209 @@ impl CodeExplainerView {
                         .child(div().flex_1().child(note)),
                 )
             })
-            .child(div().pt_1().child(if is_idle {
-                Button::new("explain-start")
-                    .primary()
-                    .w_full()
-                    .disabled(!can_start)
-                    .icon(Icon::new(LucideIcon::Rocket).small())
-                    .label("Start Investigation")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.handle_start(window, cx);
-                    }))
-            } else {
-                Button::new("explain-cancel")
-                    .danger()
-                    .w_full()
-                    .icon(Icon::new(LucideIcon::Square).small())
-                    .label("Cancel Session")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.stop_and_reset(true, window, cx);
-                    }))
-            }))
+            .child(
+                div().pt_1().child(
+                    Button::new("explain-start")
+                        .primary()
+                        .w_full()
+                        .disabled(!can_start)
+                        .icon(Icon::new(LucideIcon::Rocket).small())
+                        .label("Start Investigation")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.handle_start(window, cx);
+                        })),
+                ),
+            )
+    }
+
+    fn render_context_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let worktree_enabled = self.app_state.read(cx).settings.git_worktree_enabled;
+        let repo_raw = self.repo_path_input.read(cx).value().trim().to_string();
+        let repo_name = display_repo_name(&repo_raw);
+        let branch_raw = self.branch_input.read(cx).value().trim().to_string();
+        let branch_label = if branch_raw.is_empty() {
+            "Working copy".to_string()
+        } else {
+            branch_raw
+        };
+        let request_raw = self.request_input.read(cx).value().trim().to_string();
+        let request_summary = summarize_single_line(&request_raw, 140);
+        let is_running = self.stage == Stage::Investigating && self.is_generating;
+        let chevron = if self.context_expanded {
+            LucideIcon::ChevronUp
+        } else {
+            LucideIcon::ChevronDown
+        };
+
+        v_flex()
+            .w_full()
+            .border_b_1()
+            .border_color(theme.border)
+            .bg(theme.sidebar)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_4()
+                    .px_6()
+                    .py_2p5()
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1()
+                            .child(
+                                h_flex()
+                                    .flex_wrap()
+                                    .items_center()
+                                    .gap_2()
+                                    .when(!repo_name.is_empty(), |row| {
+                                        row.child(render_context_pill(
+                                            LucideIcon::Folder,
+                                            repo_name,
+                                            false,
+                                            cx,
+                                        ))
+                                    })
+                                    .when(worktree_enabled, |row| {
+                                        row.child(render_context_pill(
+                                            LucideIcon::GitMerge,
+                                            branch_label.clone(),
+                                            true,
+                                            cx,
+                                        ))
+                                    })
+                                    .child(render_context_pill(
+                                        LucideIcon::Cpu,
+                                        self.selected_model.clone(),
+                                        false,
+                                        cx,
+                                    )),
+                            )
+                            .when(!request_summary.is_empty(), |col| {
+                                col.child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .truncate()
+                                        .child(request_summary),
+                                )
+                            }),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .flex_shrink_0()
+                            .child(
+                                Button::new("explain-toggle-context")
+                                    .ghost()
+                                    .small()
+                                    .icon(Icon::new(chevron).small())
+                                    .label(if self.context_expanded {
+                                        "Hide Details"
+                                    } else {
+                                        "Details"
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.context_expanded = !this.context_expanded;
+                                        cx.notify();
+                                    })),
+                            )
+                            .when(is_running, |row| {
+                                row.child(
+                                    Button::new("explain-cancel")
+                                        .danger()
+                                        .small()
+                                        .icon(Icon::new(LucideIcon::Square).small())
+                                        .label("Cancel")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.stop_and_reset(true, window, cx);
+                                        })),
+                                )
+                            }),
+                    ),
+            )
+            .when(self.context_expanded, |bar| {
+                bar.child(
+                    v_flex()
+                        .gap_3()
+                        .px_6()
+                        .py_3()
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .bg(theme.background)
+                        .child(
+                            h_flex()
+                                .flex_wrap()
+                                .items_center()
+                                .gap_4()
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_1p5()
+                                        .text_xs()
+                                        .child(
+                                            div()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(theme.muted_foreground)
+                                                .child("Project Directory:"),
+                                        )
+                                        .child(
+                                            div()
+                                                .font_family(theme.mono_font_family.clone())
+                                                .text_color(theme.foreground)
+                                                .child(repo_raw),
+                                        ),
+                                )
+                                .when(worktree_enabled, |row| {
+                                    row.child(
+                                        h_flex()
+                                            .items_center()
+                                            .gap_1p5()
+                                            .text_xs()
+                                            .child(
+                                                div()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(theme.muted_foreground)
+                                                    .child("Branch:"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .font_family(theme.mono_font_family.clone())
+                                                    .text_color(theme.foreground)
+                                                    .child(branch_label),
+                                            ),
+                                    )
+                                }),
+                        )
+                        .child(
+                            v_flex()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(theme.muted_foreground)
+                                        .child("What should be explained?"),
+                                )
+                                .child(
+                                    div()
+                                        .max_h(px(160.))
+                                        .overflow_y_scrollbar()
+                                        .p_3()
+                                        .rounded(theme.radius)
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .bg(theme.sidebar)
+                                        .text_xs()
+                                        .text_color(theme.foreground)
+                                        .child(request_raw),
+                                ),
+                        ),
+                )
+            })
     }
 
     fn render_right_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1063,7 +1232,7 @@ impl CodeExplainerView {
                         h_flex()
                             .items_center()
                             .gap_2()
-                            .max_w(px(640.))
+                            .max_w(px(760.))
                             .px_3()
                             .py_1p5()
                             .rounded(theme.radius)
@@ -1086,7 +1255,7 @@ impl CodeExplainerView {
                     .justify_start()
                     .child(
                         v_flex()
-                            .max_w(px(620.))
+                            .max_w(px(760.))
                             .p_4()
                             .gap_1p5()
                             .rounded(theme.radius_lg)
@@ -1485,8 +1654,8 @@ impl Render for CodeExplainerView {
                         },
                     )),
             )
-            .child(
-                div().flex_1().min_h_0().w_full().child(
+            .child(div().flex_1().min_h_0().w_full().child(
+                if self.stage == Stage::Idle {
                     h_resizable("code-explainer-split")
                         .child(
                             resizable_panel()
@@ -1494,9 +1663,36 @@ impl Render for CodeExplainerView {
                                 .size_range(px(320.)..px(540.))
                                 .child(self.render_left_pane(cx)),
                         )
-                        .child(resizable_panel().child(self.render_right_pane(cx))),
-                ),
-            )
+                        .child(resizable_panel().child(self.render_right_pane(cx)))
+                        .into_any_element()
+                } else {
+                    let view_for_dismiss = cx.entity();
+                    v_flex()
+                        .size_full()
+                        .child(self.render_context_bar(cx))
+                        .when_some(self.validation_error.clone(), |col, err| {
+                            col.child(render_active_error_banner(
+                                "explain-dismiss-active-error",
+                                err,
+                                move |_, cx| {
+                                    view_for_dismiss.update(cx, |this, cx| {
+                                        this.validation_error = None;
+                                        cx.notify();
+                                    });
+                                },
+                                cx,
+                            ))
+                        })
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h_0()
+                                .w_full()
+                                .child(self.render_right_pane(cx)),
+                        )
+                        .into_any_element()
+                },
+            ))
     }
 }
 
