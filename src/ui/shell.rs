@@ -20,7 +20,7 @@ use crate::app_state::{ActiveView, AppState, apply_theme, refresh_copilot_status
 use crate::types::{CopilotAuthStatus, ThemeMode};
 use crate::ui::components::render_usage_stats_toast;
 
-const REPORT_ISSUE_URL: &str = "https://github.com/thealternator89/stitch/issues";
+const REPORT_ISSUE_URL: &str = "https://github.com/thealternator89/stitch-rs/issues";
 const SIDEBAR_WIDTH: f32 = 224.0;
 const USAGE_TOAST_AUTO_DISMISS: Duration = Duration::from_secs(8);
 
