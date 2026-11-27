@@ -11,6 +11,7 @@ use crate::features::{
     history::UsageHistoryView,
     pr_reviewer::PrReviewerView,
     settings::{SettingsTab, SettingsView},
+    solution_designer::SolutionDesignerView,
     story_elaborator::StoryElaboratorView,
     story_writer::StoryWriterView,
     test_case_writer::TestCaseWriterView,
@@ -34,6 +35,7 @@ pub enum ActiveView {
     #[default]
     TShirtEstimator,
     CodeExplainer,
+    SolutionDesigner,
     StoryWriter,
     TestCaseWriter,
     StoryElaborator,
@@ -50,7 +52,11 @@ impl ActiveView {
         ),
         (
             LifecycleGroup::SolutionDesign,
-            &[ActiveView::StoryWriter, ActiveView::TestCaseWriter],
+            &[
+                ActiveView::SolutionDesigner,
+                ActiveView::StoryWriter,
+                ActiveView::TestCaseWriter,
+            ],
         ),
         (LifecycleGroup::Build, &[ActiveView::StoryElaborator]),
         (LifecycleGroup::Review, &[ActiveView::PrReviewer]),
@@ -63,6 +69,7 @@ impl ActiveView {
         match self {
             Self::TShirtEstimator => "T-Shirt Estimator",
             Self::CodeExplainer => "Code Explainer",
+            Self::SolutionDesigner => "Solution Designer",
             Self::StoryWriter => "Story Writer",
             Self::TestCaseWriter => "Test Case Writer",
             Self::StoryElaborator => "Story Elaborator",
@@ -79,6 +86,9 @@ impl ActiveView {
             }
             Self::CodeExplainer => {
                 "Investigate a project and document how a chosen feature works, is structured, and calculates."
+            }
+            Self::SolutionDesigner => {
+                "Run guided grill-me sessions to design high-level solution docs organized by project and area."
             }
             Self::StoryWriter => {
                 "Generate structured user stories from Confluence specifications and push to your tracker."
@@ -105,6 +115,7 @@ impl ActiveView {
         match self {
             Self::TShirtEstimator => LucideIcon::Shirt,
             Self::CodeExplainer => LucideIcon::BookOpen,
+            Self::SolutionDesigner => LucideIcon::Layers,
             Self::StoryWriter => LucideIcon::FileText,
             Self::TestCaseWriter => LucideIcon::ClipboardCheck,
             Self::StoryElaborator => LucideIcon::MessageSquareText,
@@ -141,6 +152,7 @@ pub struct AppState {
 
     pub tshirt_estimator: Entity<TShirtEstimatorView>,
     pub code_explainer: Entity<CodeExplainerView>,
+    pub solution_designer: Entity<SolutionDesignerView>,
     pub story_writer: Entity<StoryWriterView>,
     pub test_case_writer: Entity<TestCaseWriterView>,
     pub story_elaborator: Entity<StoryElaboratorView>,
@@ -194,6 +206,15 @@ impl AppState {
                     &settings,
                     copilot_service.clone(),
                     git_service.clone(),
+                    window,
+                    cx,
+                )
+            });
+            let solution_designer = cx.new(|cx| {
+                SolutionDesignerView::new(
+                    app_state_handle.clone(),
+                    &settings,
+                    copilot_service.clone(),
                     window,
                     cx,
                 )
@@ -268,6 +289,7 @@ impl AppState {
                 version_updated_from,
                 tshirt_estimator,
                 code_explainer,
+                solution_designer,
                 story_writer,
                 test_case_writer,
                 story_elaborator,

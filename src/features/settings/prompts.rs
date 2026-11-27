@@ -27,7 +27,8 @@ use crate::features::test_case_writer::prompts::{
 };
 use crate::infrastructure::runtime::spawn_tokio;
 use crate::types::{
-    AppSettings, CodeExplainerPrompts, StoryElaboratorPrompts, StoryWriterPrompts, TestCaseWriterPrompts,
+    AppSettings, CodeExplainerPrompts, SolutionDesignerPrompts, StoryElaboratorPrompts,
+    StoryWriterPrompts, TestCaseWriterPrompts,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -37,6 +38,7 @@ pub enum PromptsSubTab {
     TestCaseWriter,
     StoryElaborator,
     CodeExplainer,
+    SolutionDesigner,
 }
 
 impl PromptsSubTab {
@@ -45,6 +47,7 @@ impl PromptsSubTab {
         Self::TestCaseWriter,
         Self::StoryElaborator,
         Self::CodeExplainer,
+        Self::SolutionDesigner,
     ];
 
     fn id(self) -> &'static str {
@@ -53,6 +56,7 @@ impl PromptsSubTab {
             Self::TestCaseWriter => "prompts-subtab-test-case-writer",
             Self::StoryElaborator => "prompts-subtab-story-elaborator",
             Self::CodeExplainer => "prompts-subtab-code-explainer",
+            Self::SolutionDesigner => "prompts-subtab-solution-designer",
         }
     }
 
@@ -62,6 +66,7 @@ impl PromptsSubTab {
             Self::TestCaseWriter => "Test Case Writer",
             Self::StoryElaborator => "Story Elaborator",
             Self::CodeExplainer => "Code Explainer",
+            Self::SolutionDesigner => "Solution Designer",
         }
     }
 
@@ -71,6 +76,7 @@ impl PromptsSubTab {
             Self::TestCaseWriter => LucideIcon::ClipboardCheck,
             Self::StoryElaborator => LucideIcon::MessageSquareText,
             Self::CodeExplainer => LucideIcon::BookOpen,
+            Self::SolutionDesigner => LucideIcon::Layers,
         }
     }
 }
@@ -103,6 +109,7 @@ pub struct PromptsSettingsView {
     cached_tc_result: Option<Result<PromptValidationResult, String>>,
     elaborator_general_input: Entity<TextareaState>,
     explainer_general_input: Entity<TextareaState>,
+    solution_designer_general_input: Entity<TextareaState>,
     feedback: Option<PromptFeedback>,
     _subscriptions: Vec<Subscription>,
 }
@@ -118,6 +125,7 @@ impl PromptsSettingsView {
         let tc = &initial_settings.prompts.test_case_writer;
         let se = &initial_settings.prompts.story_elaborator;
         let ce = &initial_settings.prompts.code_explainer;
+        let sd = &initial_settings.prompts.solution_designer;
 
         let story_general_input = cx.new(|cx| {
             TextareaState::new(window, cx)
@@ -181,6 +189,12 @@ impl PromptsSettingsView {
             TextareaState::new(window, cx)
                 .placeholder("Optional general instructions inserted into the system instructions for Code Explainer (e.g., 'Write for new joiners. Always include a glossary and worked calculation examples.')")
                 .default_value(ce.general.clone())
+        });
+
+        let solution_designer_general_input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .placeholder("Optional general instructions inserted into Solution Designer prompts (e.g., 'Prefer event-driven boundaries, always include C4-style Mermaid diagrams and explicit non-goals.')")
+                .default_value(sd.general.clone())
         });
 
         let mut subs = Vec::new();
@@ -264,6 +278,22 @@ impl PromptsSettingsView {
         });
         subs.push(explainer_sub);
 
+        let sd_sub = cx.subscribe(&solution_designer_general_input, |this, _, event, cx| {
+            match event {
+                InputEvent::Blur => {
+                    if this.is_solution_designer_dirty(cx) {
+                        this.save_solution_designer_prompts(false, cx);
+                    }
+                }
+                InputEvent::Change => {
+                    this.feedback = None;
+                    cx.notify();
+                }
+                _ => {}
+            }
+        });
+        subs.push(sd_sub);
+
         let state_sub = cx.observe(&app_state, |_, _, cx| cx.notify());
         subs.push(state_sub);
 
@@ -288,6 +318,7 @@ impl PromptsSettingsView {
             cached_tc_result: None,
             elaborator_general_input,
             explainer_general_input,
+            solution_designer_general_input,
             feedback: None,
             _subscriptions: subs,
         }
@@ -1154,6 +1185,126 @@ impl PromptsSettingsView {
                     )),
             )
     }
+
+    fn current_solution_designer_prompts(&self, cx: &App) -> SolutionDesignerPrompts {
+        SolutionDesignerPrompts {
+            general: self
+                .solution_designer_general_input
+                .read(cx)
+                .value()
+                .trim()
+                .to_string(),
+        }
+    }
+
+    fn is_solution_designer_dirty(&self, cx: &App) -> bool {
+        let current = self.current_solution_designer_prompts(cx);
+        let saved = &self.app_state.read(cx).settings.prompts.solution_designer;
+        &current != saved
+    }
+
+    fn save_solution_designer_prompts(&mut self, show_saved_banner: bool, cx: &mut Context<Self>) {
+        let next = self.current_solution_designer_prompts(cx);
+        let res = self.app_state.update(cx, |state, cx| {
+            state.settings.prompts.solution_designer = next;
+            let save_res = state.save_settings();
+            cx.notify();
+            save_res
+        });
+        self.apply_save_outcome(
+            res,
+            show_saved_banner.then_some("Solution Designer custom prompt saved."),
+            "Failed to save custom prompt",
+            cx,
+        );
+    }
+
+    fn reset_solution_designer_defaults(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.solution_designer_general_input
+            .update(cx, |state, cx| {
+                state.set_value("", window, cx);
+            });
+        let res = self.app_state.update(cx, |state, cx| {
+            state.settings.prompts.solution_designer = SolutionDesignerPrompts::default();
+            let save_res = state.save_settings();
+            cx.notify();
+            save_res
+        });
+        self.apply_save_outcome(
+            res,
+            Some("Solution Designer prompt reset to default."),
+            "Failed to reset custom prompt",
+            cx,
+        );
+    }
+
+    fn render_solution_designer_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let is_dirty = self.is_solution_designer_dirty(cx);
+
+        v_flex()
+            .gap_4()
+            .child(
+                v_flex()
+                    .items_start()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child("Customize the guidelines and instructions sent to Copilot during Solution Designer interviews and document generation."),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .flex_wrap()
+                            .w_full()
+                            .justify_end()
+                            .child(
+                                Button::new("prompts-sd-reset")
+                                    .ghost()
+                                    .small()
+                                    .icon(Icon::new(LucideIcon::RotateCcw).small())
+                                    .label("Reset Defaults")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.reset_solution_designer_defaults(window, cx);
+                                    })),
+                            )
+                            .child({
+                                let btn = Button::new("prompts-sd-save")
+                                    .small()
+                                    .disabled(!is_dirty)
+                                    .icon(Icon::new(LucideIcon::Save).small())
+                                    .label("Save Changes")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.save_solution_designer_prompts(true, cx);
+                                    }));
+                                if is_dirty { btn.primary() } else { btn.ghost() }
+                            }),
+                    ),
+            )
+            .when_some(self.render_feedback_row(self.feedback.clone(), &theme), |col, banner| {
+                col.child(banner)
+            })
+            .child(
+                v_flex()
+                    .p_5()
+                    .gap_4()
+                    .rounded(theme.radius_lg)
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.sidebar)
+                    .child(render_prompt_field(
+                        "General Instructions",
+                        "Appended to Solution Designer system instructions to steer interview style, architectural preferences, and Markdown structure.",
+                        &self.solution_designer_general_input,
+                        120.0,
+                        &theme,
+                    )),
+            )
+    }
 }
 
 impl Render for PromptsSettingsView {
@@ -1170,6 +1321,9 @@ impl Render for PromptsSettingsView {
             }
             PromptsSubTab::CodeExplainer => {
                 self.render_code_explainer_panel(cx).into_any_element()
+            }
+            PromptsSubTab::SolutionDesigner => {
+                self.render_solution_designer_panel(cx).into_any_element()
             }
         };
 

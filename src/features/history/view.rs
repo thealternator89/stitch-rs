@@ -116,6 +116,8 @@ fn icon_for_tool(tool_name: &str) -> LucideIcon {
     let lower = tool_name.to_ascii_lowercase();
     if lower.contains("explainer") {
         LucideIcon::BookOpen
+    } else if lower.contains("solution") || lower.contains("design") {
+        LucideIcon::Layers
     } else if lower.contains("pr") || lower.contains("review") {
         LucideIcon::GitPullRequest
     } else if lower.contains("story writer") {

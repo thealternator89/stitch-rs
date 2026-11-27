@@ -101,6 +101,19 @@ impl SettingsStore {
                 }
             });
 
+        settings.solution_design_base_dir = settings
+            .solution_design_base_dir
+            .as_ref()
+            .and_then(|path| {
+                let s = path.to_string_lossy();
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(PathBuf::from(trimmed))
+                }
+            });
+
         settings.prompts.story_writer.general =
             settings.prompts.story_writer.general.trim().to_string();
         settings.prompts.story_writer.title =
@@ -143,6 +156,8 @@ impl SettingsStore {
             settings.prompts.story_elaborator.general.trim().to_string();
         settings.prompts.code_explainer.general =
             settings.prompts.code_explainer.general.trim().to_string();
+        settings.prompts.solution_designer.general =
+            settings.prompts.solution_designer.general.trim().to_string();
 
         for persona in &mut settings.pr_reviewer.personas {
             persona.name = persona.name.trim().to_string();
@@ -307,6 +322,7 @@ mod tests {
             copilot_model: "   ".to_string(),
             copilot_token: Some("   \t  ".to_string()),
             git_worktree_base_dir: Some(PathBuf::from("   ")),
+            solution_design_base_dir: Some(PathBuf::from("  /tmp/solution-designs  ")),
             ..Default::default()
         };
         settings.connectors.github.owner = "  octocat  ".to_string();
@@ -320,6 +336,7 @@ mod tests {
         settings.prompts.story_writer.notes = "  Risks  ".to_string();
         settings.prompts.test_case_writer.general = "  Edge cases  ".to_string();
         settings.prompts.story_elaborator.general = "  Plan steps  ".to_string();
+        settings.prompts.solution_designer.general = "  Prefer event-driven boundaries  ".to_string();
 
         SettingsStore::trim_settings(&mut settings);
 
@@ -330,6 +347,10 @@ mod tests {
         assert_eq!(settings.copilot_model, "auto");
         assert_eq!(settings.copilot_token, None);
         assert_eq!(settings.git_worktree_base_dir, None);
+        assert_eq!(
+            settings.solution_design_base_dir,
+            Some(PathBuf::from("/tmp/solution-designs"))
+        );
         assert_eq!(settings.connectors.github.owner, "octocat");
         assert_eq!(settings.connectors.github.token.as_deref(), Some("ghp_abc"));
         assert_eq!(settings.connectors.azure_dev_ops.pat, None);
@@ -344,6 +365,10 @@ mod tests {
         assert_eq!(settings.prompts.story_writer.notes, "Risks");
         assert_eq!(settings.prompts.test_case_writer.general, "Edge cases");
         assert_eq!(settings.prompts.story_elaborator.general, "Plan steps");
+        assert_eq!(
+            settings.prompts.solution_designer.general,
+            "Prefer event-driven boundaries"
+        );
     }
 
     #[test]
@@ -355,6 +380,7 @@ mod tests {
             theme: ThemeMode::Dark,
             git_worktree_enabled: true,
             git_worktree_base_dir: Some(PathBuf::from("  /tmp/stitch-worktrees  ")),
+            solution_design_base_dir: Some(PathBuf::from("  /tmp/stitch-designs  ")),
             copilot_model: "  claude-sonnet-4.5  ".to_string(),
             copilot_token: Some("  ghp_super_secret_token_123  ".to_string()),
             ..Default::default()
@@ -403,6 +429,10 @@ mod tests {
         assert_eq!(
             loaded.git_worktree_base_dir,
             Some(PathBuf::from("/tmp/stitch-worktrees"))
+        );
+        assert_eq!(
+            loaded.solution_design_base_dir,
+            Some(PathBuf::from("/tmp/stitch-designs"))
         );
         assert_eq!(loaded.copilot_model, "claude-sonnet-4.5");
         assert_eq!(loaded.copilot_token, None);

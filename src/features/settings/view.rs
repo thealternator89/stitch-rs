@@ -89,6 +89,8 @@ pub struct SettingsView {
     prompts_view: Entity<PromptsSettingsView>,
     pr_reviewer_view: Entity<PrReviewerSettingsView>,
     worktree_dir_input: Entity<InputState>,
+    solution_design_dir_input: Entity<InputState>,
+    last_synced_solution_design_dir: Option<PathBuf>,
     copilot_token_input: Entity<InputState>,
     default_model_dropdown: Entity<ModelDropdown>,
     token_feedback: Option<TokenFeedback>,
@@ -113,6 +115,12 @@ impl SettingsView {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
 
+        let initial_solution_design_dir_path = initial_settings.solution_design_base_dir.clone();
+        let initial_solution_design_dir = initial_solution_design_dir_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+
         let initial_token = initial_settings.copilot_token.clone().unwrap_or_default();
         let initial_model = initial_settings.copilot_model.clone();
 
@@ -120,6 +128,12 @@ impl SettingsView {
             InputState::new(window, cx)
                 .placeholder("Select or enter a directory for Git worktrees...")
                 .default_value(initial_worktree_dir)
+        });
+
+        let solution_design_dir_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Select or enter a base directory for Solution Designer projects...")
+                .default_value(initial_solution_design_dir)
         });
 
         let copilot_token_input = cx.new(|cx| {
@@ -140,7 +154,20 @@ impl SettingsView {
             )
         });
 
-        let state_sub = cx.observe(&app_state, |_, _, cx| cx.notify());
+        let state_sub = cx.observe_in(&app_state, window, |this, app_state, window, cx| {
+            let next_sd_dir = app_state.read(cx).settings.solution_design_base_dir.clone();
+            if next_sd_dir != this.last_synced_solution_design_dir {
+                this.last_synced_solution_design_dir = next_sd_dir.clone();
+                let next_str = next_sd_dir
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                this.solution_design_dir_input.update(cx, |input, cx| {
+                    input.set_value(next_str, window, cx);
+                });
+            }
+            cx.notify();
+        });
 
         let worktree_sub =
             cx.subscribe_in(&worktree_dir_input, window, |this, _, event, window, cx| {
@@ -148,6 +175,16 @@ impl SettingsView {
                     this.save_worktree_dir_from_input(window, cx);
                 }
             });
+
+        let solution_design_sub = cx.subscribe_in(
+            &solution_design_dir_input,
+            window,
+            |this, _, event, window, cx| {
+                if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
+                    this.save_solution_design_dir_from_input(window, cx);
+                }
+            },
+        );
 
         let token_sub =
             cx.subscribe_in(&copilot_token_input, window, |this, _, event, window, cx| {
@@ -186,6 +223,8 @@ impl SettingsView {
             prompts_view,
             pr_reviewer_view,
             worktree_dir_input,
+            solution_design_dir_input,
+            last_synced_solution_design_dir: initial_solution_design_dir_path,
             copilot_token_input,
             default_model_dropdown,
             token_feedback: None,
@@ -193,7 +232,13 @@ impl SettingsView {
             scanning_worktrees: false,
             cleaning_worktrees: false,
             worktree_cleanup_feedback: None,
-            _subscriptions: vec![state_sub, worktree_sub, token_sub, model_sub],
+            _subscriptions: vec![
+                state_sub,
+                worktree_sub,
+                solution_design_sub,
+                token_sub,
+                model_sub,
+            ],
         };
 
         view.scan_worktrees(initial_worktree_dir_path, window, cx);
@@ -455,6 +500,82 @@ impl SettingsView {
         self.scan_worktrees(None, window, cx);
     }
 
+    fn save_solution_design_dir_from_input(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let raw = self.solution_design_dir_input.read(cx).value().to_string();
+        let trimmed = raw.trim();
+        let next_dir = if trimmed.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(trimmed))
+        };
+
+        self.last_synced_solution_design_dir = next_dir.clone();
+        self.app_state.update(cx, |state, cx| {
+            if state.settings.solution_design_base_dir != next_dir {
+                state.settings.solution_design_base_dir = next_dir;
+                if let Err(err) = state.save_settings() {
+                    eprintln!("Warning: failed to save solution_design_base_dir: {err}");
+                }
+                cx.notify();
+            }
+        });
+    }
+
+    fn browse_solution_design_dir(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Select Solution Design Base Directory".into()),
+        });
+
+        let view = cx.entity();
+        window
+            .spawn(cx, async move |cx| {
+                if let Ok(Ok(Some(paths))) = receiver.await {
+                    if let Some(selected) = paths.into_iter().next() {
+                        let _ = cx.update(|window, cx| {
+                            view.update(cx, |this, cx| {
+                                let path_str = selected.to_string_lossy().to_string();
+                                this.last_synced_solution_design_dir = Some(selected.clone());
+                                this.solution_design_dir_input.update(cx, |input, cx| {
+                                    input.set_value(path_str, window, cx);
+                                });
+                                this.app_state.update(cx, |state, cx| {
+                                    state.settings.solution_design_base_dir = Some(selected);
+                                    if let Err(err) = state.save_settings() {
+                                        eprintln!(
+                                            "Warning: failed to save solution_design_base_dir: {err}"
+                                        );
+                                    }
+                                    cx.notify();
+                                });
+                            });
+                        });
+                    }
+                }
+            })
+            .detach();
+    }
+
+    fn clear_solution_design_dir(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.last_synced_solution_design_dir = None;
+        self.solution_design_dir_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+        });
+        self.app_state.update(cx, |state, cx| {
+            state.settings.solution_design_base_dir = None;
+            if let Err(err) = state.save_settings() {
+                eprintln!("Warning: failed to clear solution_design_base_dir: {err}");
+            }
+            cx.notify();
+        });
+    }
+
     fn save_copilot_token(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let raw = self.copilot_token_input.read(cx).value().to_string();
         let trimmed = raw.trim().to_string();
@@ -562,6 +683,7 @@ impl SettingsView {
         let current_mode = state.settings.theme;
         let worktree_enabled = state.settings.git_worktree_enabled;
         let has_worktree_dir = state.settings.git_worktree_base_dir.is_some();
+        let has_solution_design_dir = state.settings.solution_design_base_dir.is_some();
 
         let mode_button = |id: &'static str, mode: ThemeMode, icon: LucideIcon| {
             let is_active = current_mode == mode;
@@ -836,6 +958,62 @@ impl SettingsView {
                                         },
                                     ),
                             ),
+                    ),
+            )
+            // Solution Design Directory Card
+            .child(
+                v_flex()
+                    .p_5()
+                    .gap_4()
+                    .rounded(theme.radius_lg)
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.sidebar)
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Solution Design Directory"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child("Base folder where Solution Designer stores project subdirectories, Markdown documents, and .stitch.json metadata."),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(Input::new(&self.solution_design_dir_input)),
+                            )
+                            .child(
+                                Button::new("browse-solution-design-dir")
+                                    .icon(Icon::new(LucideIcon::FolderOpen).small())
+                                    .label("Browse...")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.browse_solution_design_dir(window, cx);
+                                    })),
+                            )
+                            .when(has_solution_design_dir, |row| {
+                                row.child(
+                                    Button::new("clear-solution-design-dir")
+                                        .ghost()
+                                        .icon(Icon::new(LucideIcon::X).small())
+                                        .label("Clear")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.clear_solution_design_dir(window, cx);
+                                        })),
+                                )
+                            }),
                     ),
             )
     }

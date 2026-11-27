@@ -48,6 +48,7 @@ pub struct AppSettings {
     pub theme: ThemeMode,
     pub git_worktree_enabled: bool,
     pub git_worktree_base_dir: Option<PathBuf>,
+    pub solution_design_base_dir: Option<PathBuf>,
     pub max_parallelism: Option<usize>,
     pub prompts: CustomPromptsConfig,
     pub pr_reviewer: PrReviewerSettingsConfig,
@@ -71,6 +72,7 @@ impl Default for AppSettings {
             theme: ThemeMode::Auto,
             git_worktree_enabled: false,
             git_worktree_base_dir: None,
+            solution_design_base_dir: None,
             max_parallelism: None,
             prompts: CustomPromptsConfig::default(),
             pr_reviewer: PrReviewerSettingsConfig::default(),
@@ -157,6 +159,7 @@ pub struct CustomPromptsConfig {
     pub test_case_writer: TestCaseWriterPrompts,
     pub story_elaborator: StoryElaboratorPrompts,
     pub code_explainer: CodeExplainerPrompts,
+    pub solution_designer: SolutionDesignerPrompts,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -188,6 +191,12 @@ pub struct StoryElaboratorPrompts {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct CodeExplainerPrompts {
+    pub general: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SolutionDesignerPrompts {
     pub general: String,
 }
 
