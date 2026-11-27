@@ -26,6 +26,7 @@ Stitch is an AI-powered desktop assistant for senior engineers, technical busine
 - **Accelerate Planning and Testing**: Generate user stories and test cases from tickets, then push them back to Azure DevOps or GitHub.
 - **Rapid T-Shirt Estimation**: Estimate the size (XS–XL) and complexity of a change by letting Copilot inspect your repo through isolated git worktrees.
 - **Instant Code Documentation**: Have Copilot investigate any part of a codebase and write structured, diagram-rich technical documentation you can save as Markdown.
+- **AI-Assisted Solution Design**: Run guided `/grill-me` interviews to scope new projects, break them into design areas, and iteratively draft high-level Markdown architecture docs on disk.
 
 ## Core Features
 
@@ -43,6 +44,11 @@ Stitch is an AI-powered desktop assistant for senior engineers, technical busine
 
 ### Solution Design
 
+- **Solution Designer**
+  - Organize greenfield or high-level solution design into project subdirectories under a configurable base folder on disk, tracked via `.stitch.json`.
+  - Start new projects with a concise **Ground Rules** scoping interview to establish shared constraints and generate `README.md` plus initial stub `.md` files for each design area.
+  - Pick any planned area (or add a new one) to run an opinionated `/grill-me` interview that writes the high-level design Markdown directly to disk and displays it in Stitch.
+  - Track area progress (`Planned`, `Drafted`, `Finalized`), refine existing docs, re-design via Q&A, reload from disk, or open the project folder.
 - **Story Writer**
   - Card-based UI for configuring story generation.
   - Confluence page search with autocomplete (CQL) for extra context.
@@ -87,7 +93,7 @@ Stitch is an AI-powered desktop assistant for senior engineers, technical busine
 
 - Securely store Azure DevOps / GitHub PATs and Confluence tokens in the OS keychain (macOS Keychain, Windows Credential Manager, Secret Service).
 - Customise base prompts and validate prompt complexity with Copilot.
-- Configure the git worktree base directory and project settings.
+- Configure the git worktree base directory, Solution Design base directory, and project settings.
 - Detects Copilot authentication problems and guides you through setup.
 
 ## Tech Stack
@@ -138,9 +144,9 @@ cargo clippy
     ├── types.rs                 # Shared types
     ├── infrastructure/          # Copilot, providers (Azure DevOps, GitHub, Confluence),
     │                            # git/worktrees, SQLite, settings, notifications, sleep guard
-    ├── features/                # Feature slices: tshirt_estimator, story_writer,
-    │                            # test_case_writer, story_elaborator, code_explainer,
-    │                            # pr_reviewer, history, settings
+    ├── features/                # Feature slices: tshirt_estimator, code_explainer,
+    │                            # solution_designer, story_writer, test_case_writer,
+    │                            # story_elaborator, pr_reviewer, history, settings
     └── ui/                      # Workspace shell and shared components
 ```
 
