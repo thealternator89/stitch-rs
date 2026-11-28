@@ -16,9 +16,14 @@ use gpui_kit::{
     Subscription, Window, div, hsla, img, prelude::FluentBuilder as _, px, relative,
 };
 
-use crate::app_state::{ActiveView, AppState, apply_theme, refresh_copilot_status};
+use crate::app_state::{
+    ActiveView, AppState, apply_theme, check_for_updates, refresh_copilot_status,
+};
+use crate::infrastructure::constants::APP_VERSION;
+use crate::infrastructure::runtime::spawn_tokio;
+use crate::infrastructure::updater::UpdateStatus;
 use crate::types::{CopilotAuthStatus, ThemeMode};
-use crate::ui::components::render_usage_stats_toast;
+use crate::ui::components::{open_update_modal, render_usage_stats_toast};
 
 const REPORT_ISSUE_URL: &str = "https://github.com/thealternator89/stitch-rs/issues";
 const SIDEBAR_WIDTH: f32 = 224.0;
@@ -61,6 +66,49 @@ impl WorkspaceShell {
         });
 
         refresh_copilot_status(app_state.clone(), false, true, window, cx);
+
+        let (updater_service, update_settings) = {
+            let state = app_state.read(cx);
+            (
+                state.updater_service.clone(),
+                state.settings.updates.clone(),
+            )
+        };
+        if updater_service.is_disabled() {
+            updater_service.log_dev_disabled_startup(&update_settings);
+        } else {
+            let updater_for_cleanup = updater_service.clone();
+            drop(spawn_tokio(async move {
+                let _ = updater_for_cleanup.cleanup_stale_installers();
+            }));
+
+            let app_state_for_updates = app_state.clone();
+            window
+                .spawn(cx, async move |cx| {
+                    cx.background_executor().timer(Duration::from_secs(8)).await;
+                    loop {
+                        let keep_going = cx
+                            .update(|window, cx| {
+                                if app_state_for_updates.read(cx).settings.updates.auto_check {
+                                    check_for_updates(
+                                        app_state_for_updates.clone(),
+                                        false,
+                                        window,
+                                        cx,
+                                    );
+                                }
+                            })
+                            .is_ok();
+                        if !keep_going {
+                            break;
+                        }
+                        cx.background_executor()
+                            .timer(Duration::from_secs(4 * 60 * 60))
+                            .await;
+                    }
+                })
+                .detach();
+        }
 
         Self {
             app_state,
@@ -300,15 +348,95 @@ impl WorkspaceShell {
             })
             .child(div().text_xs().child(auth_label));
 
-        let version_label = format!("Version {}", env!("CARGO_PKG_VERSION"));
+        let version_label = format!("Version {APP_VERSION}");
         let version_updated_from = state.version_updated_from.clone();
+        let update_status = state.update_status.clone();
         let app_state_for_version = self.app_state.clone();
+        let app_state_for_update_pill = self.app_state.clone();
         let green = hsla(152.0 / 360.0, 0.76, 0.40, 1.0);
         let green_bg = hsla(152.0 / 360.0, 0.76, 0.40, 0.14);
+        let blue = hsla(217.0 / 360.0, 0.91, 0.60, 1.0);
+        let blue_bg = hsla(217.0 / 360.0, 0.91, 0.60, 0.14);
+
+        let update_pill = match update_status {
+            UpdateStatus::Downloading {
+                downloaded_bytes,
+                total_bytes,
+                ..
+            } => {
+                let label = match total_bytes {
+                    Some(total) if total > 0 => {
+                        let pct = ((downloaded_bytes as f64 / total as f64) * 100.0)
+                            .round()
+                            .clamp(0.0, 100.0) as u64;
+                        format!("Downloading update {pct}%")
+                    }
+                    _ => "Downloading update...".to_string(),
+                };
+                Some(
+                    h_flex()
+                        .id("footer-update-downloading-pill")
+                        .items_center()
+                        .gap_1()
+                        .px_1p5()
+                        .py_0p5()
+                        .rounded(px(4.))
+                        .bg(cx.theme().secondary)
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .cursor_pointer()
+                        .hover(|s| s.bg(cx.theme().secondary_hover))
+                        .on_click(move |_, window, cx| {
+                            open_update_modal(app_state_for_update_pill.clone(), window, cx);
+                        })
+                        .child(Spinner::new().xsmall())
+                        .child(label),
+                )
+            }
+            UpdateStatus::ReadyToInstall { info, .. } => Some(
+                h_flex()
+                    .id("footer-update-ready-pill")
+                    .items_center()
+                    .gap_1()
+                    .px_1p5()
+                    .py_0p5()
+                    .rounded(px(4.))
+                    .bg(blue_bg)
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(blue)
+                    .cursor_pointer()
+                    .on_click(move |_, window, cx| {
+                        open_update_modal(app_state_for_update_pill.clone(), window, cx);
+                    })
+                    .child(Icon::new(LucideIcon::Download).xsmall().text_color(blue))
+                    .child(format!("Update v{} ready", info.version)),
+            ),
+            UpdateStatus::Available { info, .. } => Some(
+                h_flex()
+                    .id("footer-update-available-pill")
+                    .items_center()
+                    .gap_1()
+                    .px_1p5()
+                    .py_0p5()
+                    .rounded(px(4.))
+                    .bg(blue_bg)
+                    .text_xs()
+                    .text_color(blue)
+                    .cursor_pointer()
+                    .on_click(move |_, window, cx| {
+                        open_update_modal(app_state_for_update_pill.clone(), window, cx);
+                    })
+                    .child(Icon::new(LucideIcon::Download).xsmall().text_color(blue))
+                    .child(format!("Update v{} available", info.version)),
+            ),
+            _ => None,
+        };
 
         let right_slot = h_flex()
             .items_center()
             .gap_2()
+            .when_some(update_pill, |row, pill| row.child(pill))
             .when_some(version_updated_from, |row, prev_ver| {
                 row.child(
                     h_flex()

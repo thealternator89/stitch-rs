@@ -42,6 +42,7 @@
 Name "${PRODUCT_NAME}"
 OutFile "${OUTPUT_FILE}"
 InstallDir "$LOCALAPPDATA\Programs\${APP_DIR_NAME}"
+InstallDirRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_DIR_NAME}" "InstallLocation"
 RequestExecutionLevel user
 SetCompressor /SOLID lzma
 
@@ -76,6 +77,20 @@ ShowInstDetails nevershow
 Section "MainSection" SEC01
   ; Terminate running instance and any child Copilot runtime processes before replacing files
   nsExec::Exec 'taskkill /F /T /IM ${EXECUTABLE_NAME}'
+  nsExec::Exec 'taskkill /F /IM copilot-runtime.exe'
+
+  ; Wait briefly for Windows file handles to release before overwriting the binary
+  StrCpy $R0 0
+  wait_exe_unlock:
+    IfFileExists "$INSTDIR\${EXECUTABLE_NAME}" 0 exe_unlocked
+    ClearErrors
+    Delete "$INSTDIR\${EXECUTABLE_NAME}"
+    IfErrors 0 exe_unlocked
+    IntOp $R0 $R0 + 1
+    IntCmp $R0 10 exe_unlocked 0 exe_unlocked
+    Sleep 300
+    Goto wait_exe_unlock
+  exe_unlocked:
 
   ; Set output destination and copy executable and icon
   SetOutPath "$INSTDIR"

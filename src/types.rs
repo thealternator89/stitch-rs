@@ -55,6 +55,27 @@ pub struct AppSettings {
     pub repo_paths: HashMap<String, PathBuf>,
     pub author_personas: HashMap<String, String>,
     pub last_run_version: Option<String>,
+    pub updates: UpdateSettings,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct UpdateSettings {
+    #[serde(default = "default_true")]
+    pub auto_check: bool,
+    #[serde(default = "default_true")]
+    pub auto_download: bool,
+    pub skipped_version: Option<String>,
+}
+
+impl Default for UpdateSettings {
+    fn default() -> Self {
+        Self {
+            auto_check: true,
+            auto_download: true,
+            skipped_version: None,
+        }
+    }
 }
 
 impl Default for AppSettings {
@@ -79,6 +100,7 @@ impl Default for AppSettings {
             repo_paths: HashMap::new(),
             author_personas: HashMap::new(),
             last_run_version: None,
+            updates: UpdateSettings::default(),
         }
     }
 }

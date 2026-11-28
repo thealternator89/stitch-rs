@@ -16,14 +16,20 @@ use gpui_kit::{
     Subscription, Window, div, hsla, prelude::FluentBuilder as _, px,
 };
 
-use crate::app_state::{ActiveView, AppState, refresh_copilot_status};
+use crate::app_state::{
+    ActiveView, AppState, check_for_updates, install_ready_update, refresh_copilot_status,
+};
 use crate::features::settings::connectors::ConnectorsSettingsView;
 use crate::features::settings::pr_reviewer::PrReviewerSettingsView;
 use crate::features::settings::prompts::PromptsSettingsView;
+use crate::infrastructure::constants::APP_VERSION;
 use crate::infrastructure::git::GitService;
 use crate::infrastructure::runtime::spawn_tokio;
+use crate::infrastructure::updater::UpdateStatus;
 use crate::types::{AppSettings, CopilotAuthStatus, ThemeMode};
-use crate::ui::components::{ModelDropdown, ModelDropdownEvent, ModelDropdownMode};
+use crate::ui::components::{
+    ModelDropdown, ModelDropdownEvent, ModelDropdownMode, open_update_modal,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SettingsTab {
@@ -684,6 +690,12 @@ impl SettingsView {
         let worktree_enabled = state.settings.git_worktree_enabled;
         let has_worktree_dir = state.settings.git_worktree_base_dir.is_some();
         let has_solution_design_dir = state.settings.solution_design_base_dir.is_some();
+        let update_status = state.update_status.clone();
+        let auto_check_updates = state.settings.updates.auto_check;
+        let auto_download_updates = state.settings.updates.auto_download;
+        let skipped_update_version = state.settings.updates.skipped_version.clone();
+        let last_update_check = state.last_update_check;
+        let can_auto_install_updates = state.updater_service.can_auto_install();
 
         let mode_button = |id: &'static str, mode: ThemeMode, icon: LucideIcon| {
             let is_active = current_mode == mode;
@@ -701,6 +713,52 @@ impl SettingsView {
         };
 
         let app_state_for_switch = self.app_state.clone();
+        let app_state_for_auto_check = self.app_state.clone();
+        let app_state_for_auto_download = self.app_state.clone();
+        let app_state_for_check_btn = self.app_state.clone();
+        let app_state_for_view_update = self.app_state.clone();
+        let app_state_for_install_update = self.app_state.clone();
+        let app_state_for_clear_skip = self.app_state.clone();
+
+        let is_updater_disabled = matches!(update_status, UpdateStatus::Disabled { .. });
+        let is_checking_updates = matches!(update_status, UpdateStatus::Checking);
+        let is_downloading_update = matches!(update_status, UpdateStatus::Downloading { .. });
+        let is_installing_update = matches!(update_status, UpdateStatus::Installing { .. });
+
+        let update_status_text = match &update_status {
+            UpdateStatus::Disabled { reason } => reason.clone(),
+            UpdateStatus::Idle => match last_update_check {
+                Some(ts) => format!("Last checked at {}", ts.format("%H:%M UTC")),
+                None => "Not checked yet.".to_string(),
+            },
+            UpdateStatus::Checking => "Checking for updates...".to_string(),
+            UpdateStatus::UpToDate { checked_at } => {
+                format!("Up to date (checked at {}).", checked_at.format("%H:%M UTC"))
+            }
+            UpdateStatus::Available { info, .. } => {
+                format!("Update v{} is available.", info.version)
+            }
+            UpdateStatus::Downloading {
+                info,
+                downloaded_bytes,
+                total_bytes,
+            } => match total_bytes {
+                Some(total) if *total > 0 => {
+                    let pct = ((*downloaded_bytes as f64 / *total as f64) * 100.0)
+                        .round()
+                        .clamp(0.0, 100.0) as u64;
+                    format!("Downloading v{} ({pct}%)...", info.version)
+                }
+                _ => format!("Downloading v{}...", info.version),
+            },
+            UpdateStatus::ReadyToInstall { info, .. } => {
+                format!("Update v{} is ready to install.", info.version)
+            }
+            UpdateStatus::Installing { info } => {
+                format!("Preparing v{} installer...", info.version)
+            }
+            UpdateStatus::Error { message, .. } => format!("Update check failed: {message}"),
+        };
 
         v_flex()
             .gap_5()
@@ -1015,6 +1073,249 @@ impl SettingsView {
                                 )
                             }),
                     ),
+            )
+            // Application Updates Card
+            .child(
+                v_flex()
+                    .p_5()
+                    .gap_4()
+                    .rounded(theme.radius_lg)
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.sidebar)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                v_flex()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child("Application Updates"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(theme.muted_foreground)
+                                            .child("Check GitHub Releases for new versions of Stitch."),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded(theme.radius)
+                                    .bg(theme.background)
+                                    .border_1()
+                                    .border_color(theme.border)
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(format!("Version {APP_VERSION}")),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_3()
+                            .p_3()
+                            .rounded(theme.radius)
+                            .bg(theme.background)
+                            .border_1()
+                            .border_color(theme.border)
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .when(
+                                        is_checking_updates
+                                            || is_downloading_update
+                                            || is_installing_update,
+                                        |row| row.child(Spinner::new().xsmall()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(theme.muted_foreground)
+                                            .child(update_status_text),
+                                    ),
+                            )
+                            .child(match &update_status {
+                                UpdateStatus::ReadyToInstall { .. } => Button::new(
+                                    "settings-restart-install-update",
+                                )
+                                .primary()
+                                .small()
+                                .icon(Icon::new(LucideIcon::RefreshCw).xsmall())
+                                .label("Restart & Install")
+                                .on_click(move |_, window, cx| {
+                                    install_ready_update(
+                                        app_state_for_install_update.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                }),
+                                UpdateStatus::Available { .. }
+                                | UpdateStatus::Downloading { .. } => {
+                                    Button::new("settings-view-update")
+                                        .outline()
+                                        .small()
+                                        .icon(Icon::new(LucideIcon::Download).xsmall())
+                                        .label("View Update")
+                                        .on_click(move |_, window, cx| {
+                                            open_update_modal(
+                                                app_state_for_view_update.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        })
+                                }
+                                _ => Button::new("settings-check-updates")
+                                    .small()
+                                    .disabled(
+                                        is_updater_disabled
+                                            || is_checking_updates
+                                            || is_installing_update,
+                                    )
+                                    .loading(is_checking_updates)
+                                    .icon(Icon::new(LucideIcon::RefreshCw).xsmall())
+                                    .label(if is_checking_updates {
+                                        "Checking..."
+                                    } else {
+                                        "Check for Updates"
+                                    })
+                                    .on_click(move |_, window, cx| {
+                                        check_for_updates(
+                                            app_state_for_check_btn.clone(),
+                                            true,
+                                            window,
+                                            cx,
+                                        );
+                                    }),
+                            }),
+                    )
+                    .child(div().h(px(1.)).w_full().bg(theme.border))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_4()
+                            .w_full()
+                            .child(
+                                v_flex()
+                                    .gap_0p5()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .child("Automatically check for updates"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(theme.muted_foreground)
+                                            .child("Periodically check GitHub Releases in the background."),
+                                    ),
+                            )
+                            .child(
+                                div().flex_shrink_0().child(
+                                    Switch::new("updates-auto-check-switch")
+                                        .checked(auto_check_updates)
+                                        .on_change(move |checked, _, cx| {
+                                            app_state_for_auto_check.update(cx, |state, cx| {
+                                                state.settings.updates.auto_check = *checked;
+                                                if let Err(err) = state.save_settings() {
+                                                    eprintln!(
+                                                        "Warning: failed to save updates.auto_check: {err}"
+                                                    );
+                                                }
+                                                cx.notify();
+                                            });
+                                        }),
+                                ),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_4()
+                            .w_full()
+                            .child(
+                                v_flex()
+                                    .gap_0p5()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .child("Automatically download updates in background"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(theme.muted_foreground)
+                                            .child(if can_auto_install_updates {
+                                                "Download and verify new installers automatically before prompting to restart."
+                                            } else {
+                                                "Download and verify new installers automatically (auto-install is currently Windows-only)."
+                                            }),
+                                    ),
+                            )
+                            .child(
+                                div().flex_shrink_0().child(
+                                    Switch::new("updates-auto-download-switch")
+                                        .checked(auto_download_updates)
+                                        .on_change(move |checked, _, cx| {
+                                            app_state_for_auto_download.update(cx, |state, cx| {
+                                                state.settings.updates.auto_download = *checked;
+                                                if let Err(err) = state.save_settings() {
+                                                    eprintln!(
+                                                        "Warning: failed to save updates.auto_download: {err}"
+                                                    );
+                                                }
+                                                cx.notify();
+                                            });
+                                        }),
+                                ),
+                            ),
+                    )
+                    .when_some(skipped_update_version, |card, skipped_ver| {
+                        card.child(div().h(px(1.)).w_full().bg(theme.border))
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(theme.muted_foreground)
+                                            .child(format!("Skipped version v{skipped_ver}")),
+                                    )
+                                    .child(
+                                        Button::new("clear-skipped-update-version")
+                                            .ghost()
+                                            .xsmall()
+                                            .label("Clear")
+                                            .on_click(move |_, _, cx| {
+                                                app_state_for_clear_skip.update(cx, |state, cx| {
+                                                    state.clear_skipped_update_version();
+                                                    cx.notify();
+                                                });
+                                            }),
+                                    ),
+                            )
+                    }),
             )
     }
 

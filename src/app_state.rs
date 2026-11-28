@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use gpui_kit::assets::IconName as LucideIcon;
 use gpui_kit::component::{Theme, WindowExt as _};
 use gpui_kit::{App, AppContext as _, Entity, Window};
@@ -18,11 +19,15 @@ use crate::features::{
     test_case_writer::TestCaseWriterView,
     tshirt_estimator::TShirtEstimatorView,
 };
+use crate::infrastructure::constants::APP_VERSION;
 use crate::infrastructure::copilot::CopilotService;
 use crate::infrastructure::database::UsageDatabase;
 use crate::infrastructure::git::GitService;
 use crate::infrastructure::runtime::spawn_tokio;
 use crate::infrastructure::settings::SettingsStore;
+use crate::infrastructure::updater::{
+    CheckResult, DownloadProgress, UpdateReleaseInfo, UpdateStatus, UpdaterMode, UpdaterService,
+};
 use crate::types::{
     AppSettings, CopilotAuthInfo, CopilotAuthStatus, CopilotModelInfo, CopilotUsage,
     LifecycleGroup, ThemeMode, resolve_billing_multiplier,
@@ -145,6 +150,9 @@ pub struct AppState {
     pub copilot_service: Arc<CopilotService>,
     pub git_service: Arc<GitService>,
     pub usage_db: Arc<UsageDatabase>,
+    pub updater_service: Arc<UpdaterService>,
+    pub update_status: UpdateStatus,
+    pub last_update_check: Option<DateTime<Utc>>,
     pub copilot_auth: CopilotAuthStatus,
     pub copilot_models: Vec<CopilotModelInfo>,
     pub models_loading: bool,
@@ -179,6 +187,13 @@ impl AppState {
             let mut settings = settings_store.load();
             let copilot_service = Arc::new(CopilotService::new());
             let git_service = Arc::new(GitService::new());
+            let updater_service = Arc::new(UpdaterService::new());
+            let update_status = match updater_service.mode() {
+                UpdaterMode::Disabled { reason } => UpdateStatus::Disabled {
+                    reason: reason.clone(),
+                },
+                _ => UpdateStatus::Idle,
+            };
             let usage_db = Arc::new(
                 UsageDatabase::new().unwrap_or_else(|err| {
                     eprintln!(
@@ -189,7 +204,7 @@ impl AppState {
             );
 
             // Check & update version status on startup
-            let current_version = env!("CARGO_PKG_VERSION").to_string();
+            let current_version = APP_VERSION.to_string();
             let version_updated_from = match settings.last_run_version.as_deref() {
                 Some(prev) if prev != current_version => Some(prev.to_string()),
                 _ => None,
@@ -294,6 +309,9 @@ impl AppState {
                 copilot_service,
                 git_service,
                 usage_db,
+                updater_service,
+                update_status,
+                last_update_check: None,
                 copilot_auth: CopilotAuthStatus::Checking,
                 copilot_models: Vec::new(),
                 models_loading: false,
@@ -562,6 +580,23 @@ impl AppState {
         self.version_updated_from = None;
     }
 
+    pub fn skip_update_version(&mut self, version: String) {
+        self.settings.updates.skipped_version = Some(version);
+        if let Err(err) = self.save_settings() {
+            eprintln!("Warning: failed to save skipped_version: {err}");
+        }
+        if !self.updater_service.is_disabled() {
+            self.update_status = UpdateStatus::Idle;
+        }
+    }
+
+    pub fn clear_skipped_update_version(&mut self) {
+        self.settings.updates.skipped_version = None;
+        if let Err(err) = self.save_settings() {
+            eprintln!("Warning: failed to clear skipped_version: {err}");
+        }
+    }
+
     /// Returns a summary string for the Footer Status Bar if any background task is active.
     pub fn active_task_summary(&self) -> Option<String> {
         let count = self.active_tasks.len();
@@ -735,6 +770,266 @@ pub fn refresh_copilot_status(
                     });
                 }
             }
+        })
+        .detach();
+}
+
+/// Checks GitHub Releases for a newer Stitch version, optionally auto-downloading on Windows.
+pub fn check_for_updates(
+    app_state: Entity<AppState>,
+    is_manual: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let (service, auto_download, skipped_version, should_skip_check) =
+        app_state.update(cx, |state, cx| {
+            if state.updater_service.is_disabled() {
+                return (
+                    state.updater_service.clone(),
+                    false,
+                    None,
+                    true,
+                );
+            }
+            let busy = matches!(
+                state.update_status,
+                UpdateStatus::Checking
+                    | UpdateStatus::Downloading { .. }
+                    | UpdateStatus::Installing { .. }
+            ) || (!is_manual
+                && matches!(state.update_status, UpdateStatus::ReadyToInstall { .. }));
+            if busy {
+                return (state.updater_service.clone(), false, None, true);
+            }
+            if is_manual {
+                state.update_status = UpdateStatus::Checking;
+                cx.notify();
+            }
+            (
+                state.updater_service.clone(),
+                state.settings.updates.auto_download,
+                state.settings.updates.skipped_version.clone(),
+                false,
+            )
+        });
+
+    if should_skip_check {
+        return;
+    }
+
+    window
+        .spawn(cx, async move |cx| {
+            let service_for_check = service.clone();
+            let result = match spawn_tokio(async move { service_for_check.check_for_update().await })
+                .await
+            {
+                Ok(res) => res,
+                Err(err) => Err(anyhow::anyhow!("update check task failed: {err}")),
+            };
+
+            let checked_at = Utc::now();
+            let mut auto_download_target: Option<UpdateReleaseInfo> = None;
+
+            let _ = cx.update(|window, cx| {
+                app_state.update(cx, |state, cx| {
+                    state.last_update_check = Some(checked_at);
+                    match result {
+                        Ok(CheckResult::UpToDate) => {
+                            state.update_status = UpdateStatus::UpToDate { checked_at };
+                        }
+                        Ok(CheckResult::UpdateAvailable(info)) => {
+                            let is_skipped = !is_manual
+                                && skipped_version.as_deref() == Some(info.version.as_str());
+                            if is_skipped {
+                                state.update_status = UpdateStatus::UpToDate { checked_at };
+                            } else {
+                                let can_auto_install =
+                                    service.can_auto_install() && info.asset.is_some();
+                                if can_auto_install && auto_download {
+                                    auto_download_target = Some(info);
+                                } else {
+                                    state.update_status = UpdateStatus::Available {
+                                        info,
+                                        can_auto_install,
+                                    };
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            if is_manual {
+                                state.update_status = UpdateStatus::Error {
+                                    message: err.to_string(),
+                                    info: None,
+                                    checked_at,
+                                };
+                            } else {
+                                eprintln!("[updater] Background update check failed: {err}");
+                                if matches!(state.update_status, UpdateStatus::Checking) {
+                                    state.update_status = UpdateStatus::Idle;
+                                }
+                            }
+                        }
+                    }
+                    cx.notify();
+                });
+
+                if let Some(info) = auto_download_target {
+                    download_update(app_state.clone(), info, window, cx);
+                }
+            });
+        })
+        .detach();
+}
+
+/// Streams and SHA-256-verifies the platform installer into the local updates cache.
+pub fn download_update(
+    app_state: Entity<AppState>,
+    info: UpdateReleaseInfo,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let service = app_state.update(cx, |state, cx| {
+        if matches!(
+            state.update_status,
+            UpdateStatus::Downloading { .. } | UpdateStatus::Installing { .. }
+        ) {
+            return None;
+        }
+        state.update_status = UpdateStatus::Downloading {
+            info: info.clone(),
+            downloaded_bytes: 0,
+            total_bytes: info.asset.as_ref().and_then(|a| a.size),
+        };
+        cx.notify();
+        Some(state.updater_service.clone())
+    });
+
+    let Some(service) = service else {
+        return;
+    };
+
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<DownloadProgress>();
+    let info_for_progress = info.clone();
+    let app_state_for_progress = app_state.clone();
+
+    window
+        .spawn(cx, async move |cx| {
+            while let Some(progress) = progress_rx.recv().await {
+                let _ = cx.update(|_, cx| {
+                    app_state_for_progress.update(cx, |state, cx| {
+                        if matches!(state.update_status, UpdateStatus::Downloading { .. }) {
+                            state.update_status = UpdateStatus::Downloading {
+                                info: info_for_progress.clone(),
+                                downloaded_bytes: progress.downloaded_bytes,
+                                total_bytes: progress.total_bytes,
+                            };
+                            cx.notify();
+                        }
+                    });
+                });
+            }
+        })
+        .detach();
+
+    window
+        .spawn(cx, async move |cx| {
+            let info_for_dl = info.clone();
+            let result = match spawn_tokio(async move {
+                service.download_and_verify(&info_for_dl, progress_tx).await
+            })
+            .await
+            {
+                Ok(res) => res,
+                Err(err) => Err(anyhow::anyhow!("update download task failed: {err}")),
+            };
+
+            let _ = cx.update(|_, cx| {
+                app_state.update(cx, |state, cx| {
+                    match result {
+                        Ok(installer_path) => {
+                            state.update_status = UpdateStatus::ReadyToInstall {
+                                info,
+                                installer_path,
+                            };
+                        }
+                        Err(err) => {
+                            state.update_status = UpdateStatus::Error {
+                                message: err.to_string(),
+                                info: Some(info),
+                                checked_at: Utc::now(),
+                            };
+                        }
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+}
+
+/// Stops Copilot runtime processes, launches the verified silent NSIS installer, and quits Stitch.
+pub fn install_ready_update(app_state: Entity<AppState>, window: &mut Window, cx: &mut App) {
+    let ready = app_state.update(cx, |state, cx| {
+        if let UpdateStatus::ReadyToInstall {
+            info,
+            installer_path,
+        } = &state.update_status
+        {
+            let info = info.clone();
+            let installer_path = installer_path.clone();
+            let copilot_service = state.copilot_service.clone();
+            let updater_service = state.updater_service.clone();
+            state.update_status = UpdateStatus::Installing { info: info.clone() };
+            cx.notify();
+            Some((info, installer_path, copilot_service, updater_service))
+        } else {
+            None
+        }
+    });
+
+    let Some((info, installer_path, copilot_service, updater_service)) = ready else {
+        return;
+    };
+
+    let Some(expected_sha256) = info.asset.as_ref().map(|a| a.sha256.clone()) else {
+        app_state.update(cx, |state, cx| {
+            state.update_status = UpdateStatus::Error {
+                message: "Missing installer checksum metadata.".to_string(),
+                info: Some(info),
+                checked_at: Utc::now(),
+            };
+            cx.notify();
+        });
+        return;
+    };
+
+    window
+        .spawn(cx, async move |cx| {
+            let result = match spawn_tokio(async move {
+                copilot_service.shutdown().await;
+                updater_service.spawn_windows_installer(&installer_path, &expected_sha256)
+            })
+            .await
+            {
+                Ok(res) => res,
+                Err(err) => Err(anyhow::anyhow!("update install task failed: {err}")),
+            };
+
+            let _ = cx.update(|_, cx| match result {
+                Ok(()) => {
+                    cx.quit();
+                }
+                Err(err) => {
+                    app_state.update(cx, |state, cx| {
+                        state.update_status = UpdateStatus::Error {
+                            message: err.to_string(),
+                            info: Some(info),
+                            checked_at: Utc::now(),
+                        };
+                        cx.notify();
+                    });
+                }
+            });
         })
         .detach();
 }

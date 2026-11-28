@@ -1,3 +1,7 @@
+pub const APP_VERSION: &str = env!("STITCH_APP_VERSION");
+pub const UPDATE_MANIFEST_URL: &str =
+    "https://github.com/thealternator89/stitch-rs/releases/latest/download/update-manifest.json";
+
 pub const STITCH_ATTRIBUTION: &str =
     "Stitch<sup>[^](https://github.com/thealternator89/stitch/#readme)</sup>";
 pub const COPILOT_ATTRIBUTION: &str =

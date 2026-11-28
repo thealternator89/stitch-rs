@@ -15,6 +15,7 @@ use github_copilot_sdk::types::{SessionConfig, Tool, WorkingDirectoryTrust};
 use github_copilot_sdk::{CliProgram, Client, ClientInfo, ClientOptions};
 use tokio::sync::{Mutex, watch};
 
+use crate::infrastructure::constants::APP_VERSION;
 use crate::types::{CopilotAuthInfo, CopilotModelInfo, CopilotUsage};
 
 pub use tools::{
@@ -101,7 +102,7 @@ impl CopilotService {
         let mut options = ClientOptions::new().with_client_info(
             ClientInfo::new()
                 .with_application_name("Stitch")
-                .with_application_version(env!("CARGO_PKG_VERSION")),
+                .with_application_version(APP_VERSION),
         );
 
         let has_explicit_cli_env =
@@ -373,7 +374,6 @@ impl CopilotService {
     }
 
     /// Gracefully stops the underlying Copilot SDK client if running.
-    #[allow(dead_code)]
     pub async fn shutdown(&self) {
         self.invalidate_cache().await;
     }

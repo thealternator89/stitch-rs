@@ -74,13 +74,17 @@ jobs:
           $isVersionTag = 'false'
           $isPrerelease = 'false'
 
-          $semverPattern = '^v?(([0-9]+)\.([0-9]+)\.([0-9]+)(?:-((?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)$'
+          $semverPattern = '^v?((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-((?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)$'
 
-          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -cmatch $semverPattern) {
-            $version = $Matches[1]
-            $isVersionTag = 'true'
-            if (-not [string]::IsNullOrEmpty($Matches[5])) {
-              $isPrerelease = 'true'
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            if ($env:GITHUB_REF_NAME -cmatch $semverPattern) {
+              $version = $Matches[1]
+              $isVersionTag = 'true'
+              if (-not [string]::IsNullOrEmpty($Matches[5])) {
+                $isPrerelease = 'true'
+              }
+            } else {
+              throw "Invalid release tag '$($env:GITHUB_REF_NAME)': must be valid SemVer without leading zeros (e.g. '2027.1.5', not '2027.01.05')."
             }
           }
 
@@ -102,6 +106,7 @@ jobs:
         shell: pwsh
         env:
           IS_VERSION_TAG: ${{ steps.version.outputs.is_version_tag }}
+          STITCH_APP_VERSION: ${{ steps.version.outputs.version }}
         run: |
           if ($env:IS_VERSION_TAG -eq 'true') {
             Write-Host "Version tag detected: enabling fat LTO and single codegen unit"
@@ -135,11 +140,44 @@ jobs:
               Write-Host "$($item.Name): $sizeMb MB ($($item.Length) bytes)"
           }
 
+      - name: Generate update manifest
+        shell: pwsh
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
+          IS_VERSION_TAG: ${{ steps.version.outputs.is_version_tag }}
+        run: |
+          $outPath = Join-Path (Get-Location) "target\x86_64-pc-windows-msvc\release\Stitch-Setup.exe"
+          $manifestPath = Join-Path (Get-Location) "target\x86_64-pc-windows-msvc\release\update-manifest.json"
+          $setupItem = Get-Item $outPath
+          $sha256 = (Get-FileHash -Algorithm SHA256 $outPath).Hash.ToLowerInvariant()
+          $tag = if ($env:IS_VERSION_TAG -eq 'true') { $env:GITHUB_REF_NAME } else { $env:APP_VERSION }
+          $repoUrl = "https://github.com/$($env:GITHUB_REPOSITORY)"
+          $manifest = [ordered]@{
+            schemaVersion = 1
+            version = $env:APP_VERSION
+            tag = $tag
+            publishedAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            releaseUrl = "$repoUrl/releases/tag/$tag"
+            platforms = [ordered]@{
+              "windows-x86_64" = [ordered]@{
+                asset = "Stitch-Setup.exe"
+                url = "$repoUrl/releases/download/$tag/Stitch-Setup.exe"
+                sha256 = $sha256
+                size = [int64]$setupItem.Length
+              }
+            }
+          }
+          $json = $manifest | ConvertTo-Json -Depth 5
+          [System.IO.File]::WriteAllText($manifestPath, $json, [System.Text.UTF8Encoding]::new($false))
+          Write-Host "Generated update-manifest.json (sha256=$sha256, size=$($setupItem.Length))"
+
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
         with:
           name: stitch-rs-windows-x86_64
-          path: target/x86_64-pc-windows-msvc/release/Stitch-Setup.exe
+          path: |
+            target/x86_64-pc-windows-msvc/release/Stitch-Setup.exe
+            target/x86_64-pc-windows-msvc/release/update-manifest.json
           if-no-files-found: error
 
       - name: Publish Release Asset
@@ -147,4 +185,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           prerelease: ${{ steps.version.outputs.is_prerelease == 'true' }}
-          files: target/x86_64-pc-windows-msvc/release/Stitch-Setup.exe
+          files: |
+            target/x86_64-pc-windows-msvc/release/Stitch-Setup.exe
+            target/x86_64-pc-windows-msvc/release/update-manifest.json

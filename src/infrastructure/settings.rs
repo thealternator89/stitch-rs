@@ -167,6 +167,20 @@ impl SettingsStore {
                 .trim()
                 .to_string();
         }
+
+        settings.updates.skipped_version = settings
+            .updates
+            .skipped_version
+            .take()
+            .and_then(|raw| {
+                let trimmed = raw.trim();
+                let stripped = trimmed.strip_prefix('v').unwrap_or(trimmed).trim();
+                if stripped.is_empty() {
+                    None
+                } else {
+                    Some(stripped.to_string())
+                }
+            });
     }
 
     /// Loads `AppSettings` from disk and reads `copilot_token` from the OS Keychain.
@@ -453,6 +467,35 @@ mod tests {
         assert_eq!(loaded.sources.issues, "azureDevOps");
         assert_eq!(loaded.sources.code, "github");
         assert_eq!(loaded.sources.docs, "atlassian");
+        assert!(loaded.updates.auto_check);
+        assert!(loaded.updates.auto_download);
+        assert_eq!(loaded.updates.skipped_version, None);
+
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn update_settings_trim_and_round_trip() {
+        let path = temp_settings_path("updates");
+        let store = SettingsStore::with_path_no_keychain(path.clone());
+
+        let mut settings = AppSettings::default();
+        settings.updates.auto_check = false;
+        settings.updates.auto_download = false;
+        settings.updates.skipped_version = Some("  v2027.1.5  ".to_string());
+
+        store.save(&mut settings).expect("save settings");
+        assert_eq!(
+            settings.updates.skipped_version.as_deref(),
+            Some("2027.1.5")
+        );
+
+        let loaded = store.load();
+        assert!(!loaded.updates.auto_check);
+        assert!(!loaded.updates.auto_download);
+        assert_eq!(loaded.updates.skipped_version.as_deref(), Some("2027.1.5"));
 
         if let Some(parent) = path.parent() {
             let _ = std::fs::remove_dir_all(parent);
