@@ -27,6 +27,7 @@ Stitch is an AI-powered desktop assistant for senior engineers, technical busine
 - **Rapid T-Shirt Estimation**: Estimate the size (XS–XL) and complexity of a change by letting Copilot inspect your repo through isolated git worktrees.
 - **Instant Code Documentation**: Have Copilot investigate any part of a codebase and write structured, diagram-rich technical documentation you can save as Markdown.
 - **AI-Assisted Solution Design**: Run guided `/grill-me` interviews to scope new projects, break them into design areas, and iteratively draft high-level Markdown architecture docs on disk.
+- **AI-Assisted Diagram Building**: Describe a diagram or attach a project directory for read-only investigation, iterate via a one-sided change feed with automatic Mermaid syntax validation, undo/redo snapshots, and export as `.mmd`, `.svg`, or `.png`.
 
 ## Core Features
 
@@ -49,6 +50,12 @@ Stitch is an AI-powered desktop assistant for senior engineers, technical busine
   - Start new projects with a concise **Ground Rules** scoping interview to establish shared constraints and generate `README.md` plus initial stub `.md` files for each design area.
   - Pick any planned area (or add a new one) to run an opinionated `/grill-me` interview that writes the high-level design Markdown directly to disk and displays it in Stitch.
   - Track area progress (`Planned`, `Drafted`, `Finalized`), refine existing docs, re-design via Q&A, reload from disk, or open the project folder.
+- **Diagram Builder**
+  - Start from a plain-text description and optionally attach a local project directory for read-only codebase investigation.
+  - Two-panel workspace with a live rendered Mermaid preview (zoom, pan, fit-to-view, Light/Dark theme toggle, and read-only Code inspection) alongside a one-sided change feed.
+  - Automatically validates Mermaid syntax and triggers up to 3 Copilot auto-fix attempts on parse/render errors (with manual Retry Fix and broken-source inspection if exhausted).
+  - In-memory snapshot history with Undo/Redo (`Cmd/Ctrl+Z` and `Shift+Cmd/Ctrl+Z`), keeping subsequent AI edits anchored to the active snapshot.
+  - Copy Mermaid syntax or PNG image to clipboard, and save diagrams to disk as `.mmd`, `.svg`, or `.png`.
 - **Story Writer**
   - Card-based UI for configuring story generation.
   - Confluence page search with autocomplete (CQL) for extra context.
@@ -104,6 +111,7 @@ Stitch is an AI-powered desktop assistant for senior engineers, technical busine
 - **Async:** `tokio`, `async-trait`
 - **HTTP / integrations:** `reqwest` (Azure DevOps, GitHub and Confluence REST APIs)
 - **Storage:** SQLite (usage history), JSON settings, [`keyring`](https://crates.io/crates/keyring) for secrets
+- **Diagrams:** [`rusty-mermaid`](https://crates.io/crates/rusty-mermaid), `resvg`
 - **Other:** `globset`, `directories`, `notify-rust`, `serde`
 
 ## Getting Started
@@ -145,8 +153,9 @@ cargo clippy
     ├── infrastructure/          # Copilot, providers (Azure DevOps, GitHub, Confluence),
     │                            # git/worktrees, SQLite, settings, notifications, sleep guard
     ├── features/                # Feature slices: tshirt_estimator, code_explainer,
-    │                            # solution_designer, story_writer, test_case_writer,
-    │                            # story_elaborator, pr_reviewer, history, settings
+    │                            # solution_designer, diagram_builder, story_writer,
+    │                            # test_case_writer, story_elaborator, pr_reviewer,
+    │                            # history, settings
     └── ui/                      # Workspace shell and shared components
 ```
 
