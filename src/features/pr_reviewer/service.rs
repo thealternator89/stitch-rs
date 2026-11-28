@@ -17,8 +17,8 @@ use crate::infrastructure::copilot::{
 };
 use crate::infrastructure::git::GitService;
 use crate::infrastructure::providers::{
-    build_code_review_provider, build_documentation_provider, build_issue_tracker_provider,
-    discover_known_docs,
+    CodeReviewProvider, build_code_review_provider, build_documentation_provider,
+    build_issue_tracker_provider, discover_known_docs,
 };
 use crate::infrastructure::sleep_guard::SleepGuard;
 use crate::types::{
@@ -762,6 +762,59 @@ fn phase_attaches(phase: &ReviewPhase, target: &str) -> bool {
         .any(|item| item.trim().eq_ignore_ascii_case(target))
 }
 
+/// Selects the best PR identifier to pass to `CodeReviewProvider::get_pr_details`.
+///
+/// Prefers a URL only when `provider.parse_pr_url` recognizes it, falling back to `pr.id`
+/// so on-prem/custom URLs still work with the configured org/project.
+pub(crate) fn pr_lookup_identifier<'a>(
+    provider: &dyn CodeReviewProvider,
+    pr: &'a PrMetadata,
+    explicit_pr_url_or_id: Option<&'a str>,
+) -> &'a str {
+    if let Some(explicit) = explicit_pr_url_or_id.map(str::trim).filter(|s| !s.is_empty()) {
+        if provider.parse_pr_url(explicit).is_some() {
+            return explicit;
+        }
+    }
+    if let Some(url) = pr.url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if provider.parse_pr_url(url).is_some() {
+            return url;
+        }
+    }
+    let id = pr.id.trim();
+    if !id.is_empty() {
+        return id;
+    }
+    explicit_pr_url_or_id.map(str::trim).unwrap_or("")
+}
+
+/// Fetches the full PR description via `get_pr_details`, falling back to `pr.description`
+/// if the provider is unavailable or the request fails/returns empty.
+pub(crate) async fn resolve_pr_description(
+    provider: Option<&dyn CodeReviewProvider>,
+    pr: &PrMetadata,
+    explicit_pr_url_or_id: Option<&str>,
+    remote_url: Option<&str>,
+) -> String {
+    let Some(provider) = provider else {
+        return pr.description.clone();
+    };
+    let lookup = pr_lookup_identifier(provider, pr, explicit_pr_url_or_id);
+    if lookup.is_empty() {
+        return pr.description.clone();
+    }
+    match provider.get_pr_details(lookup, remote_url).await {
+        Ok(fresh) if !fresh.description.is_empty() => fresh.description,
+        Ok(_) => pr.description.clone(),
+        Err(err) => {
+            eprintln!(
+                "Warning: failed to fetch full PR details for '{lookup}'; falling back to cached description: {err}"
+            );
+            pr.description.clone()
+        }
+    }
+}
+
 fn resolve_model_display_name(raw_model: &str, available_models: &[CopilotModelInfo]) -> String {
     let trimmed = raw_model.trim();
     if trimmed.is_empty() {
@@ -1237,6 +1290,23 @@ impl PrReviewerService {
         let any_phase_needs_story = enabled_phases
             .iter()
             .any(|phase| phase_attaches(phase, "story"));
+        let any_phase_needs_description = enabled_phases
+            .iter()
+            .any(|phase| phase_attaches(phase, "description"));
+
+        let pr_description = if any_phase_needs_description {
+            let code_provider = build_code_review_provider(&req.settings).ok();
+            let remote_url = self.git.get_remote_url(&effective_repo_path).await;
+            resolve_pr_description(
+                code_provider.as_deref(),
+                &req.pr,
+                None,
+                remote_url.as_deref(),
+            )
+            .await
+        } else {
+            req.pr.description.clone()
+        };
 
         let (linked_stories_content, known_docs) = if any_phase_needs_story {
             self.resolve_story_context(req, &effective_repo_path, doc_provider.as_ref())
@@ -1290,7 +1360,7 @@ impl PrReviewerService {
         let known_docs_arc = Arc::new(known_docs);
         let persona_arc = Arc::new(persona_guidelines);
         let custom_instructions_arc = Arc::new(req.custom_instructions.clone());
-        let pr_description_arc = Arc::new(req.pr.description.clone());
+        let pr_description_arc = Arc::new(pr_description);
         let available_models_arc = Arc::new(req.available_models.clone());
 
         let mut join_set = JoinSet::new();
@@ -1608,10 +1678,18 @@ impl PrReviewerService {
 
         let effective_repo_path = self.effective_repo_path(&req.repo_path).await;
         let mut tools = vec![create_report_intent_tool()];
+        let mut pr_description = req.pr.description.clone();
 
-        if !req.pr_url_or_id.trim().is_empty() {
-            if let Ok(provider) = build_code_review_provider(&req.settings) {
-                let remote_url = self.git.get_remote_url(&req.repo_path).await;
+        if let Ok(provider) = build_code_review_provider(&req.settings) {
+            let remote_url = self.git.get_remote_url(&req.repo_path).await;
+            pr_description = resolve_pr_description(
+                Some(provider.as_ref()),
+                &req.pr,
+                Some(&req.pr_url_or_id),
+                remote_url.as_deref(),
+            )
+            .await;
+            if !req.pr_url_or_id.trim().is_empty() {
                 let tx_status = tx.clone();
                 let status_cb: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |status| {
                     let _ = tx_status.send(PrCriticStreamEvent::Status(status));
@@ -1644,7 +1722,7 @@ impl PrReviewerService {
 
         let prompt = build_critic_prompt(
             &req.comments,
-            &req.pr.description,
+            &pr_description,
             &persona_guidelines,
             &critic_instruction,
         );
@@ -2103,5 +2181,187 @@ mod tests {
         });
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    struct MockCodeReviewProvider {
+        result: Result<PrMetadata, String>,
+        seen_lookups: std::sync::Mutex<Vec<(String, Option<String>)>>,
+    }
+
+    impl MockCodeReviewProvider {
+        fn ok(pr: PrMetadata) -> Self {
+            Self {
+                result: Ok(pr),
+                seen_lookups: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn err(msg: &str) -> Self {
+            Self {
+                result: Err(msg.to_string()),
+                seen_lookups: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CodeReviewProvider for MockCodeReviewProvider {
+        fn parse_pr_url(&self, url: &str) -> Option<crate::types::ParsedPrUrl> {
+            crate::infrastructure::providers::AzureDevOpsCodeReviewClient::new("org", "pat", "proj")
+                .parse_pr_url(url)
+        }
+
+        fn parse_remote_url(&self, _url: &str) -> Option<crate::types::ParsedRemoteUrl> {
+            None
+        }
+
+        async fn get_pr_details(
+            &self,
+            pr_url_or_id: &str,
+            remote_url: Option<&str>,
+        ) -> anyhow::Result<PrMetadata> {
+            self.seen_lookups
+                .lock()
+                .expect("lock")
+                .push((pr_url_or_id.to_string(), remote_url.map(str::to_string)));
+            match &self.result {
+                Ok(pr) => Ok(pr.clone()),
+                Err(msg) => anyhow::bail!("{msg}"),
+            }
+        }
+
+        async fn get_project_prs(
+            &self,
+            _search_type: crate::types::PrSearchType,
+        ) -> anyhow::Result<Vec<PrMetadata>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_linked_tickets(
+            &self,
+            _pr_id: &str,
+            _repository_id: Option<&str>,
+        ) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_pr_comment_threads(
+            &self,
+            _pr_url_or_id: &str,
+            _remote_url: Option<&str>,
+        ) -> anyhow::Result<Vec<crate::types::ExistingPrCommentThread>> {
+            Ok(Vec::new())
+        }
+
+        async fn post_pr_comment(
+            &self,
+            _pr_url_or_id: &str,
+            _comment: &PostPrCommentRequest,
+            _remote_url: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn pr_lookup_identifier_prefers_parseable_urls_and_falls_back_to_pr_id() {
+        let ado = crate::infrastructure::providers::AzureDevOpsCodeReviewClient::new(
+            "acme", "pat", "Core",
+        );
+        let pr_with_dev_url = PrMetadata {
+            id: "42".to_string(),
+            url: Some(
+                "https://dev.azure.com/acme/Core/_git/repo/pullrequest/42".to_string(),
+            ),
+            ..Default::default()
+        };
+        assert_eq!(
+            pr_lookup_identifier(&ado, &pr_with_dev_url, None),
+            "https://dev.azure.com/acme/Core/_git/repo/pullrequest/42"
+        );
+
+        let explicit_cross_proj =
+            "https://dev.azure.com/acme/OtherProj/_git/repo/pullrequest/42";
+        assert_eq!(
+            pr_lookup_identifier(&ado, &pr_with_dev_url, Some(explicit_cross_proj)),
+            explicit_cross_proj
+        );
+
+        let pr_onprem = PrMetadata {
+            id: "77".to_string(),
+            url: Some("https://ado.internal.corp/tfs/Coll/Proj/_git/repo/pullrequest/77".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(pr_lookup_identifier(&ado, &pr_onprem, None), "77");
+
+        let gh = crate::infrastructure::providers::GitHubCodeReviewClient::new("tok", "octocat");
+        let gh_pr = PrMetadata {
+            id: "99".to_string(),
+            url: Some("https://github.com/octocat/stitch-rs/pull/99".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            pr_lookup_identifier(&gh, &gh_pr, None),
+            "https://github.com/octocat/stitch-rs/pull/99"
+        );
+    }
+
+    #[test]
+    fn resolve_pr_description_fetches_full_description_and_falls_back_on_error_or_empty() {
+        let cached_pr = PrMetadata {
+            id: "42".to_string(),
+            description: "Truncated...".to_string(),
+            url: Some(
+                "https://dev.azure.com/acme/Core/_git/repo/pullrequest/42".to_string(),
+            ),
+            ..Default::default()
+        };
+
+        crate::infrastructure::runtime::runtime().block_on(async {
+            let full_provider = MockCodeReviewProvider::ok(PrMetadata {
+                id: "42".to_string(),
+                description: "Full untruncated PR description with acceptance notes.".to_string(),
+                ..Default::default()
+            });
+            let resolved = resolve_pr_description(
+                Some(&full_provider),
+                &cached_pr,
+                None,
+                Some("https://dev.azure.com/acme/Core/_git/repo"),
+            )
+            .await;
+            assert_eq!(
+                resolved,
+                "Full untruncated PR description with acceptance notes."
+            );
+            assert_eq!(
+                full_provider.seen_lookups.lock().expect("lock").as_slice(),
+                &[(
+                    "https://dev.azure.com/acme/Core/_git/repo/pullrequest/42".to_string(),
+                    Some("https://dev.azure.com/acme/Core/_git/repo".to_string()),
+                )]
+            );
+
+            let err_provider = MockCodeReviewProvider::err("network timeout");
+            assert_eq!(
+                resolve_pr_description(Some(&err_provider), &cached_pr, None, None).await,
+                "Truncated..."
+            );
+
+            let empty_provider = MockCodeReviewProvider::ok(PrMetadata {
+                id: "42".to_string(),
+                description: String::new(),
+                ..Default::default()
+            });
+            assert_eq!(
+                resolve_pr_description(Some(&empty_provider), &cached_pr, None, None).await,
+                "Truncated..."
+            );
+
+            assert_eq!(
+                resolve_pr_description(None, &cached_pr, None, None).await,
+                "Truncated..."
+            );
+        });
     }
 }

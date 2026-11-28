@@ -29,7 +29,8 @@ use crate::features::pr_reviewer::phase_loader::{
 };
 use crate::features::pr_reviewer::service::{
     CheckoutError, CheckoutResult, PrCriticRequest, PrCriticStreamEvent, PrReviewRequest,
-    PrReviewStreamEvent, PrReviewerService, VerifiedRepoPath, verify_repo_path,
+    PrReviewStreamEvent, PrReviewerService, VerifiedRepoPath, pr_lookup_identifier,
+    verify_repo_path,
 };
 use crate::features::settings::SettingsTab;
 use crate::infrastructure::copilot::CopilotService;
@@ -684,7 +685,7 @@ impl PrReviewerView {
                         this.is_loading_prs = false;
                         match res {
                             Ok(Ok(pr)) => {
-                                this.select_pr(pr, window, cx);
+                                this.select_pr(pr, false, window, cx);
                             }
                             Ok(Err(err)) => {
                                 this.pr_list_error = Some(err.to_string());
@@ -736,7 +737,13 @@ impl PrReviewerView {
         });
     }
 
-    fn select_pr(&mut self, pr: PrMetadata, window: &mut Window, cx: &mut Context<Self>) {
+    fn select_pr(
+        &mut self,
+        pr: PrMetadata,
+        fetch_full_details: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let was_reviewing = if let Some(cancel_tx) = self.review_cancel_tx.take() {
             let _ = cancel_tx.send(true);
             true
@@ -758,9 +765,12 @@ impl PrReviewerView {
         self.review_gen = self.review_gen.wrapping_add(1);
         self.post_gen = self.post_gen.wrapping_add(1);
 
-        let needs_details =
-            pr.source_branch.trim().is_empty() || pr.target_branch.trim().is_empty();
-        let pr_lookup = pr.url.clone().unwrap_or_else(|| pr.id.clone());
+        let needs_details = fetch_full_details
+            || pr.source_branch.trim().is_empty()
+            || pr.target_branch.trim().is_empty();
+        let has_pr_lookup = !pr.id.trim().is_empty()
+            || pr.url.as_deref().is_some_and(|u| !u.trim().is_empty());
+        let initial_author_key = pr_author_key(&pr);
 
         let (remembered_path, settings) = {
             let state = self.app_state.read(cx);
@@ -808,18 +818,23 @@ impl PrReviewerView {
         });
 
         self.pr_detail_gen = self.pr_detail_gen.wrapping_add(1);
-        if needs_details && !pr_lookup.trim().is_empty() {
+        if needs_details && has_pr_lookup {
             let detail_gen = self.pr_detail_gen;
             self.loading_pr_details = true;
             cx.notify();
 
+            let pr_for_details = pr.clone();
             let settings_for_details = settings.clone();
             let view = cx.entity();
             window
                 .spawn(cx, async move |cx| {
                     let res = spawn_tokio(async move {
                         let provider = build_code_review_provider(&settings_for_details)?;
-                        provider.get_pr_details(&pr_lookup, None).await
+                        let lookup = pr_lookup_identifier(provider.as_ref(), &pr_for_details, None);
+                        if lookup.is_empty() {
+                            anyhow::bail!("PR identifier is empty.");
+                        }
+                        provider.get_pr_details(lookup, None).await
                     })
                     .await;
 
@@ -829,14 +844,26 @@ impl PrReviewerView {
                                 return;
                             }
                             this.loading_pr_details = false;
-                            if let Ok(Ok(full_pr)) = res {
-                                this.apply_remembered_author_persona(
-                                    &full_pr,
-                                    &settings,
-                                    window,
-                                    cx,
-                                );
-                                this.selected_pr = Some(full_pr);
+                            match res {
+                                Ok(Ok(full_pr)) => {
+                                    if pr_author_key(&full_pr) != initial_author_key {
+                                        let current_settings =
+                                            this.app_state.read(cx).settings.clone();
+                                        this.apply_remembered_author_persona(
+                                            &full_pr,
+                                            &current_settings,
+                                            window,
+                                            cx,
+                                        );
+                                    }
+                                    this.selected_pr = Some(full_pr);
+                                }
+                                Ok(Err(err)) => {
+                                    eprintln!("Warning: failed to fetch full PR details: {err}");
+                                }
+                                Err(err) => {
+                                    eprintln!("Warning: PR detail fetch task failed: {err}");
+                                }
                             }
                             cx.notify();
                         });
@@ -995,7 +1022,7 @@ impl PrReviewerView {
     }
 
     fn handle_start_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.is_reviewing {
+        if self.is_reviewing || self.loading_pr_details {
             return;
         }
         let Some(pr) = self
@@ -2495,7 +2522,7 @@ impl PrReviewerView {
                                                 }
                                             })
                                             .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.select_pr(pr_click.clone(), window, cx);
+                                                this.select_pr(pr_click.clone(), true, window, cx);
                                             }))
                                             .child(
                                                 h_flex()

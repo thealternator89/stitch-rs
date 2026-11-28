@@ -48,7 +48,6 @@ pub trait IssueTrackerProvider: Send + Sync {
 /// External code-review / Pull Request provider (e.g., Azure DevOps Repos, GitHub PRs).
 #[async_trait]
 pub trait CodeReviewProvider: Send + Sync {
-    #[allow(dead_code)]
     fn parse_pr_url(&self, url: &str) -> Option<ParsedPrUrl>;
     fn parse_remote_url(&self, url: &str) -> Option<ParsedRemoteUrl>;
     async fn get_pr_details(
