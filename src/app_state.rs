@@ -8,6 +8,7 @@ use gpui_kit::{App, AppContext as _, Entity, Window};
 
 use crate::features::{
     code_explainer::CodeExplainerView,
+    diagram_builder::DiagramBuilderView,
     history::UsageHistoryView,
     pr_reviewer::PrReviewerView,
     settings::{SettingsTab, SettingsView},
@@ -36,6 +37,7 @@ pub enum ActiveView {
     TShirtEstimator,
     CodeExplainer,
     SolutionDesigner,
+    DiagramBuilder,
     StoryWriter,
     TestCaseWriter,
     StoryElaborator,
@@ -54,6 +56,7 @@ impl ActiveView {
             LifecycleGroup::SolutionDesign,
             &[
                 ActiveView::SolutionDesigner,
+                ActiveView::DiagramBuilder,
                 ActiveView::StoryWriter,
                 ActiveView::TestCaseWriter,
             ],
@@ -70,6 +73,7 @@ impl ActiveView {
             Self::TShirtEstimator => "T-Shirt Estimator",
             Self::CodeExplainer => "Code Explainer",
             Self::SolutionDesigner => "Solution Designer",
+            Self::DiagramBuilder => "Diagram Builder",
             Self::StoryWriter => "Story Writer",
             Self::TestCaseWriter => "Test Case Writer",
             Self::StoryElaborator => "Story Elaborator",
@@ -89,6 +93,9 @@ impl ActiveView {
             }
             Self::SolutionDesigner => {
                 "Run guided grill-me sessions to design high-level solution docs organized by project and area."
+            }
+            Self::DiagramBuilder => {
+                "Build, iterate on, and export Mermaid diagrams with AI assistance."
             }
             Self::StoryWriter => {
                 "Generate structured user stories from Confluence specifications and push to your tracker."
@@ -116,6 +123,7 @@ impl ActiveView {
             Self::TShirtEstimator => LucideIcon::Shirt,
             Self::CodeExplainer => LucideIcon::BookOpen,
             Self::SolutionDesigner => LucideIcon::Layers,
+            Self::DiagramBuilder => LucideIcon::Route,
             Self::StoryWriter => LucideIcon::FileText,
             Self::TestCaseWriter => LucideIcon::ClipboardCheck,
             Self::StoryElaborator => LucideIcon::MessageSquareText,
@@ -153,6 +161,7 @@ pub struct AppState {
     pub tshirt_estimator: Entity<TShirtEstimatorView>,
     pub code_explainer: Entity<CodeExplainerView>,
     pub solution_designer: Entity<SolutionDesignerView>,
+    pub diagram_builder: Entity<DiagramBuilderView>,
     pub story_writer: Entity<StoryWriterView>,
     pub test_case_writer: Entity<TestCaseWriterView>,
     pub story_elaborator: Entity<StoryElaboratorView>,
@@ -212,6 +221,15 @@ impl AppState {
             });
             let solution_designer = cx.new(|cx| {
                 SolutionDesignerView::new(
+                    app_state_handle.clone(),
+                    &settings,
+                    copilot_service.clone(),
+                    window,
+                    cx,
+                )
+            });
+            let diagram_builder = cx.new(|cx| {
+                DiagramBuilderView::new(
                     app_state_handle.clone(),
                     &settings,
                     copilot_service.clone(),
@@ -290,6 +308,7 @@ impl AppState {
                 tshirt_estimator,
                 code_explainer,
                 solution_designer,
+                diagram_builder,
                 story_writer,
                 test_case_writer,
                 story_elaborator,

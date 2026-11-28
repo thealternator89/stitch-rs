@@ -243,6 +243,7 @@ impl WorkspaceShell {
             ActiveView::TShirtEstimator => state.tshirt_estimator.clone().into_any_element(),
             ActiveView::CodeExplainer => state.code_explainer.clone().into_any_element(),
             ActiveView::SolutionDesigner => state.solution_designer.clone().into_any_element(),
+            ActiveView::DiagramBuilder => state.diagram_builder.clone().into_any_element(),
             ActiveView::StoryWriter => state.story_writer.clone().into_any_element(),
             ActiveView::TestCaseWriter => state.test_case_writer.clone().into_any_element(),
             ActiveView::StoryElaborator => state.story_elaborator.clone().into_any_element(),

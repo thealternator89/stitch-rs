@@ -330,13 +330,26 @@ impl CopilotService {
         prompt: &str,
         cancel_rx: watch::Receiver<bool>,
     ) -> Result<(String, CopilotUsage), StreamError> {
+        Self::send_and_collect_text_with_status(session, prompt, cancel_rx, |_| {}).await
+    }
+
+    /// Sends a prompt to an active Copilot session and collects the plain-text response
+    /// while forwarding live tool/intent status updates.
+    pub async fn send_and_collect_text_with_status<F>(
+        session: &Session,
+        prompt: &str,
+        cancel_rx: watch::Receiver<bool>,
+        mut on_status: F,
+    ) -> Result<(String, CopilotUsage), StreamError>
+    where
+        F: FnMut(String) + Send,
+    {
         let mut accumulated = String::new();
 
         let (last_assistant_message, usage) =
-            collect_session_turn(session, prompt, cancel_rx, |chunk| {
-                if let TurnChunk::Delta(delta) = chunk {
-                    accumulated.push_str(&delta);
-                }
+            collect_session_turn(session, prompt, cancel_rx, |chunk| match chunk {
+                TurnChunk::Delta(delta) => accumulated.push_str(&delta),
+                TurnChunk::Status(status) => on_status(status),
             })
             .await?;
 

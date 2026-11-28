@@ -1,4 +1,5 @@
 pub mod code_explainer;
+pub mod diagram_builder;
 pub mod history;
 pub mod placeholder;
 pub mod pr_reviewer;
