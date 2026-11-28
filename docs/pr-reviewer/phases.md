@@ -1,0 +1,120 @@
+# Writing Review Phases
+
+Review phases are individual, isolated review steps that check the PR against
+specific guidelines. They are represented by Markdown files (`.md`) inside the
+`~/.stitch/pr-reviewer/phases/` directory.
+
+---
+
+## File Format
+
+Each phase file consists of a YAML frontmatter block at the top, enclosed in
+triple dashes (`---`), followed by the Markdown body.
+
+Here is an example phase file
+(`~/.stitch/pr-reviewer/phases/010-definition-of-done.md`):
+
+```markdown
+---
+title: Definition of Done
+group: Quality
+include: '**/*.{ts,tsx,js,jsx}'
+exclude: '**/*.test.{ts,tsx}'
+attach: ['description']
+template: standard-phase.md
+---
+
+Make sure all functions and components adhere to our team's core quality
+standards:
+
+1. Every new component must have associated stories or test cases.
+2. Ensure there are no unused imports, variables, or commented-out code.
+3. Every file must export a single primary component or utility.
+```
+
+---
+
+## Frontmatter Properties
+
+The frontmatter properties customize how the phase is processed and displayed in
+Stitch:
+
+| Property   | Type       | Description                                                                                               | Default                                      |
+| :--------- | :--------- | :-------------------------------------------------------------------------------------------------------- | :------------------------------------------- |
+| `title`    | `string`   | The display title of the review phase in the UI.                                                          | Filename (e.g., `010-definition-of-done.md`) |
+| `group`    | `string`   | Categorizes the phase under a group in the UI.                                                            | `"Ungrouped"`                                |
+| `include`  | `string \| string[]` | Glob pattern(s) (parsed by `globset`) specifying which files must be in the PR diff for this phase to run. | None (runs on all files)                     |
+| `exclude`  | `string \| string[]` | Glob pattern(s) specifying files that should be ignored during this phase.                                | None                                         |
+| `model`    | `string`   | Model key override (e.g., `gpt-4o`, `gemini-1.5-flash`) to execute this specific phase with.              | None (uses review-level default model)       |
+| `attach`   | `string \| string[]` | Data source(s) to attach to the prompt context. Supported: `description`, `story` (e.g., `["description", "story"]`). | None                             |
+| `template` | `string`   | The filename of a template inside `~/.stitch/pr-reviewer/templates/` to wrap this phase's guidelines.     | None                                         |
+
+---
+
+## File Filtering (Include/Exclude)
+
+Glob patterns are used to target phases to specific types of changes. This
+prevents the LLM from executing irrelevant review phases (e.g., running database
+migration rules on frontend React code).
+
+- **`include: "**/\*.cs"`\*\*: Only run the phase if the PR has changes in C#
+  files.
+- **`exclude: "**/\*.test.ts"`\*\*: Do not include test files in the scope of
+  changes reviewed by this phase.
+
+If no files in the PR match the `include` glob (or if all matching files are
+filtered out by the `exclude` glob), the phase will be skipped entirely.
+
+---
+
+## Phase Model Overrides (`model`)
+
+By default, all phases are executed using the default model configured for the review. If a specific phase requires a different model (for instance, a more capable model for complex logical validation, or a faster/cheaper model for simple style checks), you can override it using the `model` frontmatter property.
+
+- **Available Models**: The model key specified must be currently available. You can view all available model keys at the bottom of the **GitHub Copilot** settings page.
+- **Handling Unavailable Models**: If a model is not found in the list of available models, Stitch will display a danger badge indicating `"Model not available"` on that phase in the UI. The checkbox for that phase will be unchecked and disabled, and the phase will be excluded from the review run.
+
+---
+
+## Context Attachment (`attach`)
+
+If your phase needs additional information from the pull request (such as
+checking if the code changes meet the PR requirements or user story), you can configure
+attachment sources:
+
+- **`description`**: Stitch will fetch the full pull request description via the Azure
+  DevOps or GitHub API and append it to the reviewer's prompt context, allowing the LLM to
+  compare the changes against the stated goals of the PR.
+- **`story`**: Stitch will fetch the stories/work items / issues linked to the pull request in Azure DevOps or GitHub.
+  - The contents (Title, Description, and Acceptance Criteria) of the linked stories / issues are appended to the prompt context.
+  - Any documentation/Confluence links within the stories / issues are automatically extracted and listed.
+  - The `request_documentation` tool is registered with Copilot during this phase, enabling the LLM to request and read the full contents of these documentation pages as needed.
+  - If `attach: story` is set but there are no linked stories associated with the PR, this phase will be skipped automatically.
+
+---
+
+## The Markdown Body
+
+The markdown body specifies the guidelines the LLM should check. Because Stitch
+performs multi-phase reviews, you should keep guidelines highly focused:
+
+> [!IMPORTANT]
+> Keep your guidelines narrow. Stitch instructs the LLM to ignore any issues
+> that do not fall directly under the current phase guidelines. Doing so
+> prevents duplicate, noisy comments from multiple phases.
+
+---
+
+## The Critic Phase
+
+When enabled, the **Critic Phase** acts as a lead reviewer and consolidation step after all automated review phases complete.
+
+- **Deduplication & Scope Validation**: Evaluates all proposed comments to verify that they are within PR scope, sound, and not duplicates.
+- **Inspect Existing PR Comments (`get_existing_comments`)**: For Azure DevOps and GitHub PRs, the Critic has access to the `get_existing_comments` tool to query existing discussions:
+  - File-based comments can be queried by file with either line ranges or keywords.
+  - General PR comments can be queried by keywords (without specifying a file).
+  - Inspects whether existing threads are active or marked as resolved.
+- **Reply Suggestions & Deduplication Rules**: Rather than proposing a new duplicate thread, the Critic inspects existing discussions and only suggests replying to an existing thread (`action: "reply"`) if:
+  1. The issue persists and the existing thread is marked as resolved (replying automatically reactivates the thread in Azure DevOps), OR
+  2. The Critic can add further useful information or new context not already covered in an active thread.
+     Otherwise, if the issue has already been raised in an active thread and no new information is being added (or if it was resolved and already addressed), the Critic discards the proposed comment by rejecting it with the reason `"Already raised"`.
