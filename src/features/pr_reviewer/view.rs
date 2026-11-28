@@ -11,7 +11,6 @@ use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::text::TextView;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IndexPath, Sizable as _, Size, Theme, WindowExt as _,
     h_flex, v_flex,
@@ -38,6 +37,7 @@ use crate::infrastructure::git::GitService;
 use crate::infrastructure::notifications::NotificationService;
 use crate::infrastructure::providers::build_code_review_provider;
 use crate::infrastructure::runtime::{runtime, spawn_tokio};
+use crate::ui::components::MarkdownView;
 use crate::types::{
     AppSettings, CodeContextLine, CopilotModelInfo, CopilotUsage, PhaseProgress, PhaseRunStatus,
     PostPrCommentRequest, PrDiffFile, PrDiffStatus, PrMetadata, PrSearchType, ReviewComment,
@@ -4635,7 +4635,7 @@ impl PrReviewerView {
                                     )
                                     .child(
                                         div().text_sm().text_color(theme.foreground).child(
-                                            TextView::markdown(md_id, comment.comment.clone())
+                                            MarkdownView::new(md_id, comment.comment.clone())
                                                 .selectable(true),
                                         ),
                                     )
@@ -4909,7 +4909,7 @@ impl PrReviewerView {
                                                                             .text_sm()
                                                                             .text_color(theme.foreground)
                                                                             .child(
-                                                                                TextView::markdown(
+                                                                                MarkdownView::new(
                                                                                     md_id,
                                                                                     comment.comment.clone(),
                                                                                 )

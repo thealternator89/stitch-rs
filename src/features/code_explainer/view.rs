@@ -8,7 +8,6 @@ use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, Textar
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::text::TextView;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Sizable as _, Size, Theme, h_flex, v_flex,
 };
@@ -30,8 +29,8 @@ use crate::infrastructure::notifications::NotificationService;
 use crate::infrastructure::runtime::{runtime, spawn_tokio};
 use crate::types::{AppSettings, CopilotUsage};
 use crate::ui::components::{
-    ModelDropdown, ModelDropdownEvent, ModelDropdownMode, ResetState, display_repo_name,
-    normalize_default_model, open_reset_confirm_modal, open_timeout_modal,
+    MarkdownView, ModelDropdown, ModelDropdownEvent, ModelDropdownMode, ResetState,
+    display_repo_name, normalize_default_model, open_reset_confirm_modal, open_timeout_modal,
     render_active_error_banner, render_context_pill, render_tool_reset_button,
     summarize_single_line,
 };
@@ -1274,7 +1273,7 @@ impl CodeExplainerView {
                             )
                             .child(
                                 div().text_sm().text_color(theme.foreground).child(
-                                    TextView::markdown(("explain-msg", *uid), text.clone())
+                                    MarkdownView::new(("explain-msg", *uid), text.clone())
                                         .selectable(true),
                                 ),
                             ),
@@ -1458,7 +1457,7 @@ impl CodeExplainerView {
                             .border_color(theme.border)
                             .bg(theme.sidebar)
                             .child(
-                                TextView::markdown(
+                                MarkdownView::new(
                                     ("explain-final-doc", self.doc_version),
                                     self.doc_markdown.clone(),
                                 )

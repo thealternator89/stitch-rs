@@ -7,7 +7,7 @@ use rusty_mermaid::{Theme as MermaidTheme, to_svg};
 const RASTER_SCALE: f32 = 2.0;
 const MAX_RASTER_DIM: f32 = 8192.0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DiagramTheme {
     Light,
     Dark,

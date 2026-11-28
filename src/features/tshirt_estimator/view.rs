@@ -7,7 +7,6 @@ use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, Textar
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::text::TextView;
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::{
     App, AppContext as _, ClipboardItem, Context, Entity, FontWeight, InteractiveElement as _,
@@ -22,9 +21,9 @@ use crate::features::tshirt_estimator::service::{
 };
 use crate::infrastructure::notifications::NotificationService;
 use crate::ui::components::{
-    ModelDropdown, ModelDropdownEvent, ModelDropdownMode, ResetState, display_repo_name,
-    normalize_default_model, open_reset_confirm_modal, open_timeout_modal, render_context_pill,
-    render_tool_reset_button, summarize_single_line,
+    MarkdownView, ModelDropdown, ModelDropdownEvent, ModelDropdownMode, ResetState,
+    display_repo_name, normalize_default_model, open_reset_confirm_modal, open_timeout_modal,
+    render_context_pill, render_tool_reset_button, summarize_single_line,
 };
 
 #[derive(Debug, Clone)]
@@ -1106,7 +1105,7 @@ impl TShirtEstimatorView {
                                                     .child("REASONING & COMPLEXITY ANALYSIS"),
                                             )
                                             .child(
-                                                TextView::markdown(
+                                                MarkdownView::new(
                                                     "tshirt-reasoning-md",
                                                     result.reasoning.clone(),
                                                 )

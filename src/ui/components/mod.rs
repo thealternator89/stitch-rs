@@ -1,5 +1,6 @@
 pub mod auth_modal;
 pub mod autocomplete_input;
+pub mod markdown_view;
 pub mod model_dropdown;
 pub mod session_context;
 pub mod timeout_modal;
@@ -9,6 +10,7 @@ pub mod usage_toast;
 pub use autocomplete_input::{
     AutocompleteEvent, AutocompleteInput, AutocompleteOption, DirectIdMode,
 };
+pub use markdown_view::MarkdownView;
 #[allow(unused_imports)]
 pub use model_dropdown::{ModelDropdown, ModelDropdownEvent, ModelDropdownMode};
 pub use session_context::{

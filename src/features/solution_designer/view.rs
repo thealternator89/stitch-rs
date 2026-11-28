@@ -9,7 +9,6 @@ use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, Textar
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::text::TextView;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Sizable as _, Size, Theme, h_flex, v_flex,
 };
@@ -37,9 +36,9 @@ use crate::infrastructure::notifications::NotificationService;
 use crate::infrastructure::runtime::spawn_tokio;
 use crate::types::{AppSettings, CopilotUsage};
 use crate::ui::components::{
-    ModelDropdown, ModelDropdownEvent, ModelDropdownMode, ResetState, normalize_default_model,
-    open_reset_confirm_modal, open_timeout_modal, render_active_error_banner,
-    render_tool_reset_button,
+    MarkdownView, ModelDropdown, ModelDropdownEvent, ModelDropdownMode, ResetState,
+    normalize_default_model, open_reset_confirm_modal, open_timeout_modal,
+    render_active_error_banner, render_tool_reset_button,
 };
 
 const TOOL_NAME: &str = "Solution Designer";
@@ -2084,7 +2083,7 @@ impl SolutionDesignerView {
                             )
                             .child(
                                 div().text_sm().text_color(theme.foreground).child(
-                                    TextView::markdown(("sd-msg", *uid), text.clone())
+                                    MarkdownView::new(("sd-msg", *uid), text.clone())
                                         .selectable(true),
                                 ),
                             ),
@@ -2828,7 +2827,7 @@ impl SolutionDesignerView {
                             .border_color(theme.border)
                             .bg(theme.sidebar)
                             .child(
-                                TextView::markdown(
+                                MarkdownView::new(
                                     ("sd-doc", self.doc_version),
                                     self.doc_markdown.clone(),
                                 )

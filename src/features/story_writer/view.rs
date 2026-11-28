@@ -6,7 +6,6 @@ use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, Textar
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::text::TextView;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Sizable as _, Size, Theme, h_flex, v_flex,
 };
@@ -26,8 +25,8 @@ use crate::infrastructure::providers::{build_documentation_provider, build_issue
 use crate::infrastructure::runtime::spawn_tokio;
 use crate::types::{AppSettings, CopilotUsage, DocPageData, StoryData, TicketData};
 use crate::ui::components::{
-    AutocompleteEvent, AutocompleteInput, AutocompleteOption, DirectIdMode, ModelDropdown,
-    ModelDropdownEvent, ModelDropdownMode, ResetState, normalize_default_model,
+    AutocompleteEvent, AutocompleteInput, AutocompleteOption, DirectIdMode, MarkdownView,
+    ModelDropdown, ModelDropdownEvent, ModelDropdownMode, ResetState, normalize_default_model,
     open_reset_confirm_modal, open_timeout_modal, render_tool_reset_button,
 };
 
@@ -1900,7 +1899,7 @@ impl StoryWriterView {
                                     .border_color(theme.border)
                                     .bg(theme.sidebar)
                                     .child(
-                                        TextView::markdown(
+                                        MarkdownView::new(
                                             ("story-ac", card_id),
                                             item.story.acceptance_criteria.clone(),
                                         )

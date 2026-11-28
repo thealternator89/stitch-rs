@@ -3,7 +3,6 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::text::TextView;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Sizable as _, Size, WindowExt as _, h_flex, v_flex,
 };
@@ -26,6 +25,7 @@ use crate::features::test_case_writer::prompts::{
     DEFAULT_TC_PRECONDITIONS_PROMPT, DEFAULT_TC_STEPS_PROMPT, SYSTEM_TC_PRIORITY_PROMPT,
 };
 use crate::infrastructure::runtime::spawn_tokio;
+use crate::ui::components::MarkdownView;
 use crate::types::{
     AppSettings, CodeExplainerPrompts, SolutionDesignerPrompts, StoryElaboratorPrompts,
     StoryWriterPrompts, TestCaseWriterPrompts,
@@ -1509,7 +1509,7 @@ impl Render for PromptValidationModalView {
                             .border_color(theme.border)
                             .bg(theme.sidebar)
                             .child(
-                                TextView::markdown(
+                                MarkdownView::new(
                                     "prompt-validation-md",
                                     result.markdown_body.clone(),
                                 )
